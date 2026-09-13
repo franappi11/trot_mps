@@ -10,11 +10,12 @@ import pytest
 @pytest.mark.parametrize(
     "precision,environment,import_jax_first,expected",
     [
-        (None, None, False, "highest"),
-        (None, None, True, "highest"),
+        (None, None, False, "default"),
+        (None, None, True, "default"),
         ("default", None, False, "default"),
         ("high", None, False, "high"),
         (None, "default", False, "default"),
+        (None, "highest", False, "highest"),
         ("default", "highest", False, "default"),
         ("highest", "default", True, "highest"),
     ],

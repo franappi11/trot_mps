@@ -69,6 +69,14 @@ trot/
 
 ## Calculation flow
 
+Matrix products use JAX's faster `"default"` precision policy. To request
+`"highest"` precision globally, call
+`trot.config.configure_once(matmul_precision="highest")` before importing
+`trot.afqmc`, or set `JAX_DEFAULT_MATMUL_PRECISION=highest` before starting
+Python. An explicit argument overrides the environment setting. This policy
+controls matrix-product arithmetic independently of mixed-precision array
+storage; selecting `"highest"` does not promote float32 arrays to float64.
+
 A simulation has three stages: **staging**, **job assembly**, and
 **QMC execution**.
 

@@ -76,14 +76,15 @@ class AfqmcConfig:
       - False : force CPU
     matmul_precision:
       JAX matrix-product precision, independent of array storage dtypes.
-      Defaults to "highest"; "default" selects JAX's faster platform default.
+      Defaults to "default", JAX's faster platform policy. Select "highest"
+      for more accurate matrix products without changing array storage dtypes.
     """
 
     use_gpu: bool | None = None
     single_precision: bool = False
     disable_tf32: bool = False  # Disable TF32 on gpu if true
     quiet: bool = True  # suppress prints
-    matmul_precision: str = "highest"
+    matmul_precision: str = "default"
 
 
 afqmc_config = AfqmcConfig()
@@ -103,8 +104,8 @@ def configure_once(
     Configure JAX once, subsequent calls do nothing.
     Use GPU if available by default.
 
-    Matrix products use "highest" precision by default. Pass
-    ``matmul_precision="default"`` for the faster platform default, or another
+    Matrix products use JAX's faster platform default. Pass
+    ``matmul_precision="highest"`` for more accurate matrix products, or another
     JAX-supported precision setting. An explicit argument takes precedence
     over ``JAX_DEFAULT_MATMUL_PRECISION``, which otherwise overrides the
     ``afqmc_config`` default. This does not change array storage dtypes.
@@ -169,7 +170,7 @@ def setup_jax(
     single_precision: bool,
     disable_tf32: bool,
     quiet: bool,
-    matmul_precision: str = "highest",
+    matmul_precision: str = "default",
 ) -> None:
     """
     Configure JAX runtime.
