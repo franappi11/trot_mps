@@ -53,7 +53,7 @@ class QmcParams(QmcParamsBase):
     n_eql_blocks: int = 20
     error_method: Literal["gamma", "blocking"] = "gamma"
     # Frozen CISD/UCISD and PT component pair samplers use local Cholesky
-    # strata on a pure model mesh. False retains the original global sampler.
+    # strata on model or combined data/model meshes. False retains global sampling.
     local_cholesky_sampling: bool = field(default=True, kw_only=True)
 
 

@@ -21,7 +21,7 @@ from trot.meas.pair_sampling import (
     local_cholesky_component_head, local_cholesky_tail, with_local_cholesky_sampling,
 )
 from trot.meas.pt2ccsd import project_first_order_energy_terms
-from trot.sharding import plan_cholesky_layout, replicate, shard_cholesky_layout
+from trot.sharding import plan_cholesky_layout, replicate, shard_cholesky_layout, shard_first_axis
 from trot.trial.ptccsd_modes import PtccsdThoulessModeTrial
 from trot.trial.ptuccsd_modes import PtuccsdThoulessModeTrial
 from tests.test_cholesky_pair_sampling import assert_small_collectives, model_mesh
@@ -43,6 +43,7 @@ class TableContext:
 
 class TableCommon(NamedTuple):
     theta: object
+    walker_indices: object
 
 
 def table_specs(ctx):
@@ -50,33 +51,35 @@ def table_specs(ctx):
 
 
 def table_head(common, indices, h, ctx, trial, *, n_chunks):
-    return h.chol[indices].transpose(1, 0, 2)
+    return h.chol[indices][:, common.walker_indices].transpose(1, 0, 2)
 
 
 def table_pairs(common, iw, ig, h, ctx, trial, *, n_chunks):
-    return h.chol[ig, iw]
+    return h.chol[ig, common.walker_indices[iw]]
 
 
-def table_inputs(n, head):
-    mesh = model_mesh()
+def table_inputs(n, head, n_data=1, n_model=4):
+    mesh = model_mesh(n_model, n_data)
     rng = np.random.default_rng(371)
     table = rng.normal(size=(n, 8, 2)) + 1j * rng.normal(size=(n, 8, 2))
     tail = np.setdiff1d(np.arange(n), head)
     p = np.arange(1, len(tail)+1, dtype=float)
     p = p/p.sum() if p.size else p
-    layout = plan_cholesky_layout(n, 4, head, tail, p)
+    layout = plan_cholesky_layout(n, n_model, head, tail, p)
     sampling = rm.PtccsdModePairSamplingCfg(len(head), 17, head_chol_batch_size=2,
         walker_guide_policy="head_rms", track_half_sample_diagnostic=True)
     ctx = with_local_cholesky_sampling(TableContext(None, None, None, sampling), layout, mesh)
     zero = replicate(np.asarray(0.), mesh)
     h = HamChol(zero, replicate(np.zeros((8, 8)), mesh), shard_cholesky_layout(table, mesh, layout))
-    common = TableCommon(replicate(np.zeros(8, dtype=complex), mesh))
+    common = TableCommon(shard_first_axis(np.zeros(8, dtype=complex), mesh),
+                         shard_first_axis(np.arange(8), mesh))
     return table, layout, common, h, ctx, zero
 
 
 @pytest.mark.parametrize("n,head", [(9, [0, 4, 7]), (3, [1, 2]), (7, []), (7, list(range(7)))])
-def test_component_head_moments_and_small_collectives(n, head):
-    table, layout, common, h, ctx, t = table_inputs(n, head)
+@pytest.mark.parametrize("n_data,n_model", [(1, 4), (2, 2), (4, 1)])
+def test_component_head_moments_and_small_collectives(n, head, n_data, n_model):
+    table, layout, common, h, ctx, t = table_inputs(n, head, n_data, n_model)
     theta = replicate(np.asarray(.3+.7j), ctx.model_sampling.mesh)
     f = jax.jit(lambda common, theta, h, c, t: local_cholesky_component_head(
         common, theta, h, c, t, terms_fn=table_head, project_fn=project_first_order_energy_terms,
@@ -93,15 +96,20 @@ def test_component_head_moments_and_small_collectives(n, head):
 
 @pytest.mark.parametrize("n,head,weights_kind", [(9, [0, 4, 7], "complex"),
     (3, [1, 2], "complex"), (7, [], "cancel"), (7, [0], "zero")])
-def test_complex_tail_mean_covariance_and_half_sample_noise(n, head, weights_kind):
-    table, layout, common, h, ctx, t = table_inputs(n, head)
+@pytest.mark.parametrize("n_data,n_model", [(1, 4), (2, 2), (4, 1)])
+def test_complex_tail_mean_covariance_and_half_sample_noise(n, head, weights_kind, n_data, n_model):
+    table, layout, common, h, ctx, t = table_inputs(n, head, n_data, n_model)
     pi = np.array([1+.2j, -.3+.4j, .7-1j, .8+.6j, -.2-.7j, 2+.1j, 0, 1j])
     if weights_kind == "cancel":
         pi = np.array([1, -1, 1j, -1j, 2, -2, 2j, -2j])
     q = np.arange(1, 9, dtype=float); q /= q.sum()
     if weights_kind == "zero":
         pi[:] = 0
-    args = (common, replicate(pi, ctx.model_sampling.mesh), replicate(q, ctx.model_sampling.mesh),
+    if n == 3:
+        pi[:4] = 0  # Empty walker strata, alongside empty Cholesky strata.
+        q[:4] = 0
+        q /= q.sum()
+    args = (common, shard_first_axis(pi, ctx.model_sampling.mesh), shard_first_axis(q, ctx.model_sampling.mesh),
             jax.random.PRNGKey(92), h, ctx, t)
     f = jax.jit(lambda common, pi, q, key, h, c, t: jnp.stack(local_cholesky_tail(
         common, pi, q, key, h, c, t, pair_fn=table_pairs,
@@ -115,18 +123,24 @@ def test_complex_tail_mean_covariance_and_half_sample_noise(n, head, weights_kin
     samples = np.asarray(jax.jit(draw_many)(args, jax.random.split(jax.random.PRNGKey(38), 8192)))
     exact = np.zeros(2, complex)
     covariance = np.zeros((4, 4))
-    for d, pd in enumerate(layout.local_tail_prob):
-        if pd.sum() == 0:
+    for data_id, walkers in enumerate(np.split(np.arange(8), n_data)):
+        walkers = walkers[q[walkers] > 0]
+        if walkers.size == 0:
             continue
-        ids = layout.permutation.reshape(4, -1)[d, pd > 0]
-        prob = (pd[pd > 0]/pd.sum())[:, None] * q[None, :]
-        values = pi[None, :, None]*table[ids] / prob[:, :, None]
-        mean = (prob[:, :, None]*values).sum(axis=(0, 1))
-        exact += mean
-        real_values = np.concatenate((values.real, values.imag), axis=-1).reshape(-1, 4)
-        real_mean = np.r_[mean.real, mean.imag]
-        centered = real_values - real_mean
-        covariance += (centered.T * prob.ravel()) @ centered / (5 if d == 0 else 4)
+        qd = q[walkers]/q[walkers].sum()
+        for model_id, pd in enumerate(layout.local_tail_prob):
+            if pd.sum() == 0:
+                continue
+            d = data_id*n_model+model_id
+            ids = layout.permutation.reshape(n_model, -1)[model_id, pd > 0]
+            prob = (pd[pd > 0]/pd.sum())[:, None] * qd[None, :]
+            values = pi[None, walkers, None]*table[ids][:, walkers] / prob[:, :, None]
+            mean = (prob[:, :, None]*values).sum(axis=(0, 1))
+            exact += mean
+            real_values = np.concatenate((values.real, values.imag), axis=-1).reshape(-1, 4)
+            real_mean = np.r_[mean.real, mean.imag]
+            centered = real_values - real_mean
+            covariance += (centered.T * prob.ravel()) @ centered / (5 if d == 0 else 4)
     values = np.concatenate((samples.real, samples.imag), axis=-1)
     if weights_kind == "zero":
         np.testing.assert_array_equal(samples, 0)
@@ -171,8 +185,23 @@ def host_inputs(kind, mixed):
     return h, trial, walkers, weights
 
 
-def prepare(kind, mixed, n_model, head_size, *, abstract=False, memory_mode="high"):
-    mesh = model_mesh(n_model)
+def test_complex_joint_strata_with_one_pair_each_and_no_diagnostic():
+    table, _, common, h, ctx, t = table_inputs(2, [], n_data=2, n_model=2)
+    ctx = replace(ctx, component_sampling=replace(ctx.component_sampling,
+        pair_sample_size=4, track_half_sample_diagnostic=False))
+    mesh = ctx.model_sampling.mesh
+    pi = np.zeros(8, complex); pi[[1, 5]] = [.2+.7j, -.8+.2j]
+    q = np.zeros(8); q[[1, 5]] = [.07, .93]
+    f = jax.jit(lambda common, pi, q, h, ctx, t: local_cholesky_tail(
+        common, pi, q, jax.random.PRNGKey(4), h, ctx, t,
+        pair_fn=table_pairs, context_specs_fn=table_specs, n_chunks=3, components=True))
+    estimate, noise = f(common, shard_first_axis(pi, mesh), shard_first_axis(q, mesh), h, ctx, t)
+    np.testing.assert_allclose(estimate, (table.sum(axis=0)*pi[:, None]).sum(axis=0), atol=1e-14)
+    np.testing.assert_array_equal(noise, 0)
+
+
+def prepare(kind, mixed, n_model, head_size, *, abstract=False, memory_mode="high", n_data=1):
+    mesh = model_mesh(n_model, n_data)
     module = rm if kind == "rcc" else um
     h, t, w, weights = host_inputs(kind, mixed)
     head = np.array([1, 4, 0, 6, 3, 5, 2])[:head_size]
@@ -180,7 +209,8 @@ def prepare(kind, mixed, n_model, head_size, *, abstract=False, memory_mode="hig
     p = np.arange(1, tail.size+1, dtype=float); p = p/p.sum() if p.size else p
     layout = plan_cholesky_layout(7, n_model, head, tail, p)
     h = HamChol(replicate(h.h0, mesh), replicate(h.h1, mesh), shard_cholesky_layout(h.chol, mesh, layout))
-    t, w, weights = jax.tree.map(lambda a: replicate(a, mesh), (t, w, weights))
+    t = jax.tree.map(lambda a: replicate(a, mesh), t)
+    w, weights = jax.tree.map(lambda a: shard_first_axis(a, mesh), (w, weights))
     cls = rm.PtccsdModeMeasCfg if kind == "rcc" else um.PtuccsdModeMeasCfg
     cfg = cls(memory_mode=memory_mode, mixed_real_dtype=jnp.float32 if mixed else jnp.float64,
         mixed_complex_dtype=jnp.complex64 if mixed else jnp.complex128,
@@ -205,11 +235,11 @@ def functions(kind):
 
 @pytest.mark.parametrize("kind", ["rcc", "ucc"])
 @pytest.mark.parametrize("mixed", [False, True])
-@pytest.mark.parametrize("n_model", [1, 4])
+@pytest.mark.parametrize("n_data,n_model", [(1, 1), (1, 4), (2, 2)])
 @pytest.mark.parametrize("memory_mode", ["high", "low"])
-def test_abstract_pt_local_trace_and_frozen_guards(kind, mixed, n_model, memory_mode):
+def test_abstract_pt_local_trace_and_frozen_guards(kind, mixed, n_data, n_model, memory_mode):
     module, mesh, layout, h, ctx, t, w, weights = prepare(
-        kind, mixed, n_model, 3, abstract=True, memory_mode=memory_mode)
+        kind, mixed, n_model, 3, abstract=True, memory_mode=memory_mode, n_data=n_data)
     _, block = functions(kind)
     for chunks in (1, 5):
         result = jax.eval_shape(lambda w, wt, key, h, c, t: block(w, wt, key, chunks, h, c, t),
@@ -227,11 +257,13 @@ def test_abstract_pt_local_trace_and_frozen_guards(kind, mixed, n_model, memory_
 
 @pytest.mark.parametrize("kind", ["rcc", "ucc"])
 @pytest.mark.parametrize("mixed", [False, True])
-@pytest.mark.parametrize("n_model,head_size", [(1, 3), (4, 3), (4, 0), (4, 7), (4, 6)])
-def test_gpu_pt_local_matches_explicit_complex_component_sum(kind, mixed, n_model, head_size):
+@pytest.mark.parametrize("n_data,n_model,head_size", [
+    (1, 1, 3), (1, 4, 3), (1, 4, 0), (1, 4, 7), (1, 4, 6),
+    (2, 2, 3), (2, 2, 0), (2, 2, 7), (2, 2, 6)])
+def test_gpu_pt_local_matches_explicit_complex_component_sum(kind, mixed, n_data, n_model, head_size):
     if jax.default_backend() != "gpu":
         pytest.skip("Numerical AFQMC kernels require GPUs")
-    module, mesh, layout, h, ctx, t, w, weights = prepare(kind, mixed, n_model, head_size)
+    module, mesh, layout, h, ctx, t, w, weights = prepare(kind, mixed, n_model, head_size, n_data=n_data)
     common_fn, block = functions(kind)
     common = jax.jit(wk.vmap_chunked(common_fn, 1, in_axes=(0, None, None, None)))(w, h, ctx, t)
     terms = np.asarray(jax.jit(lambda common, h, c, t: module._local_cholesky_head_terms(
@@ -260,25 +292,31 @@ def test_gpu_pt_local_matches_explicit_complex_component_sum(kind, mixed, n_mode
             expected = np.sum(wt[:, None]*exact_components, axis=0)
             noise = np.zeros(2, complex)
             if abs_total and layout.tail_indices.size:
-                count, rem = divmod(17, n_model); capacity = count+bool(rem)
+                count, rem = divmod(17, n_data*n_model); capacity = count+bool(rem)
                 width = layout.local_tail_prob.shape[1]
-                for d, pd in enumerate(layout.local_tail_prob):
-                    if pd.sum() == 0:
+                for data_id, walkers in enumerate(np.split(np.arange(12), n_data)):
+                    if q[walkers].sum() == 0:
                         continue
-                    pd = pd/pd.sum()
-                    kw, kg = jax.random.split(jax.random.fold_in(key, d))
-                    uw, ug = (np.asarray(jax.random.uniform(k, (capacity,), dtype=jnp.float64)) for k in (kw, kg))
-                    iw = np.searchsorted(np.cumsum(q), uw*np.sum(q), side="right")
-                    ig = np.searchsorted(np.cumsum(pd), ug*np.sum(pd), side="right")
-                    values = wt[iw, None]*terms[iw, d*width+ig]/(q[iw, None]*pd[ig, None])
-                    values = values[:count+(d < rem)]
-                    expected[1:] += values.mean(axis=0)
-                    first = len(values)//2; second = len(values)-first
-                    noise += np.sqrt(first*second)/len(values)*(values[:first].mean(axis=0)-values[first:].mean(axis=0))
+                    qd = q[walkers]/q[walkers].sum() if n_data > 1 else q
+                    for model_id, pd in enumerate(layout.local_tail_prob):
+                        if pd.sum() == 0:
+                            continue
+                        d = data_id*n_model+model_id
+                        pd = pd/pd.sum()
+                        kw, kg = jax.random.split(jax.random.fold_in(key, d))
+                        uw, ug = (np.asarray(jax.random.uniform(k, (capacity,), dtype=jnp.float64)) for k in (kw, kg))
+                        iw = np.searchsorted(np.cumsum(qd), uw*np.sum(qd), side="right")
+                        ig = np.searchsorted(np.cumsum(pd), ug*np.sum(pd), side="right")
+                        global_iw = walkers[iw]
+                        values = wt[global_iw, None]*terms[global_iw, model_id*width+ig]/(qd[iw, None]*pd[ig, None])
+                        values = values[:count+(d < rem)]
+                        expected[1:] += values.mean(axis=0)
+                        first = len(values)//2; second = len(values)-first
+                        noise += np.sqrt(first*second)/len(values)*(values[:first].mean(axis=0)-values[first:].mean(axis=0))
             noise = noise/safe_den
             projected_noise = noise[1]+(1-expected[0]/safe_den)*noise[0]
             for fn in functions_by_chunks.values():
-                result = fn(w, replicate(wt, mesh), key, h, c, t)
+                result = fn(w, shard_first_axis(wt, mesh), key, h, c, t)
                 np.testing.assert_allclose(result.weight, den, rtol=tol, atol=tol)
                 np.testing.assert_allclose(result.numerator, expected, rtol=tol, atol=tol)
                 np.testing.assert_allclose(result.diagnostics[d_pt_component_sampling_noise_real], projected_noise.real, rtol=tol, atol=tol)

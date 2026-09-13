@@ -64,8 +64,8 @@ def test_second_sampler_keeps_own_head_and_proposal_with_padding():
         np.testing.assert_array_equal(indices[valid], expected)
 
 
-def synthetic_runtime(kind="cisd", model=4):
-    mesh = model_mesh(model)
+def synthetic_runtime(kind="cisd", model=4, n_data=1):
+    mesh = model_mesh(model, n_data)
     rows = lambda scale=1: shard_model_axis(scale*np.arange(1., 13.)[:, None, None]*np.ones((12, 2, 2)), mesh)
     one = replicate(np.asarray(1.), mesh)
     h1 = replicate(np.array([[3., 5.], [7., 9.]]), mesh)
@@ -98,13 +98,15 @@ def synthetic_runtime(kind="cisd", model=4):
 
 
 @pytest.mark.parametrize("kind", ["cisd", "ucc", "ptr", "ptu"])
-def test_default_installs_consistent_context_and_propagator_layout(kind):
-    mesh, h, p, c = synthetic_runtime(kind)
+@pytest.mark.parametrize("n_data,n_model", [(1, 4), (2, 2)])
+def test_default_installs_consistent_context_and_propagator_layout(kind, n_data, n_model):
+    mesh, h, p, c = synthetic_runtime(kind, n_model, n_data)
     assert QmcParams().local_cholesky_sampling
     runtime = QmcRuntime(h, p, c)
     h2, p2, (c2,) = prepare_local_cholesky_sampling(h, p, (c,), runtime=runtime)
     perm = np.asarray(h2.chol[:, 0, 0], dtype=int)-1
     assert c2.model_sampling is not None
+    assert c2.model_sampling.mesh.shape == mesh.shape
     assert h2.h1 is h.h1 and p2.exp_h1_half is p.exp_h1_half and p2.h0_prop is p.h0_prop
     np.testing.assert_array_equal(np.asarray(p2.chol_flat).reshape(12, -1), np.asarray(p.chol_flat)[perm])
     assert p2.chol_flat is h2.chol
@@ -127,9 +129,10 @@ def test_default_installs_consistent_context_and_propagator_layout(kind):
 
 @pytest.mark.parametrize("ptkind", ["ptr", "ptu"])
 @pytest.mark.parametrize("guide_policy", ["local", "global", "deterministic"])
-def test_mixed_guide_and_pt_keep_distinct_sampling_policies(ptkind, guide_policy):
-    _, h, p, guide = synthetic_runtime("cisd" if ptkind == "ptr" else "ucc")
-    mesh, _, _, pt = synthetic_runtime(ptkind)
+@pytest.mark.parametrize("n_data,n_model", [(1, 4), (2, 2)])
+def test_mixed_guide_and_pt_keep_distinct_sampling_policies(ptkind, guide_policy, n_data, n_model):
+    _, h, p, guide = synthetic_runtime("cisd" if ptkind == "ptr" else "ucc", n_model, n_data)
+    mesh, _, _, pt = synthetic_runtime(ptkind, n_model, n_data)
     if guide_policy == "global":
         guide = replace(guide, energy_sampling=replace(guide.energy_sampling, pair_sample_size=3))
     elif guide_policy == "deterministic":
@@ -137,7 +140,7 @@ def test_mixed_guide_and_pt_keep_distinct_sampling_policies(ptkind, guide_policy
     runtime = QmcRuntime(h, p, guide, pt)
     h2, p2, (g2, e2) = prepare_local_cholesky_sampling(h, p, (guide, pt), runtime=runtime)
     perm = np.asarray(h2.chol[:, 0, 0], dtype=int)-1
-    expected_layout = plan_cholesky_layout(12, 4, pt.chol_head_indices, pt.chol_tail_indices, pt.chol_tail_prob)
+    expected_layout = plan_cholesky_layout(12, n_model, pt.chol_head_indices, pt.chol_tail_indices, pt.chol_tail_prob)
     np.testing.assert_array_equal(perm, expected_layout.permutation)
     assert (g2.model_sampling is not None) == (guide_policy == "local")
     assert e2.model_sampling is not None
@@ -152,12 +155,11 @@ def test_mixed_guide_and_pt_keep_distinct_sampling_policies(ptkind, guide_policy
         np.testing.assert_allclose(after.chol_tail_prob, before.chol_tail_prob)
 
 
-@pytest.mark.parametrize("reason", ["disabled", "deterministic", "one_gpu", "data", "hybrid", "budget", "custom"])
+@pytest.mark.parametrize("reason", ["disabled", "deterministic", "one_gpu", "data", "budget", "custom"])
 def test_ineligible_runs_keep_existing_objects(reason):
     mesh, h, p, c = synthetic_runtime(model=1 if reason == "one_gpu" else 4)
-    if reason in ("data", "hybrid"):
-        shape = (4, 1) if reason == "data" else (2, 2)
-        mesh = Mesh(np.array(jax.local_devices()[:4]).reshape(shape), ("data", "model"),
+    if reason == "data":
+        mesh = Mesh(np.array(jax.local_devices()[:4]).reshape(4, 1), ("data", "model"),
                     axis_types=(AxisType.Auto, AxisType.Auto))
         h = replace(h, chol=shard_model_axis(np.asarray(h.chol), mesh))
     if reason == "deterministic":
@@ -166,8 +168,18 @@ def test_ineligible_runs_keep_existing_objects(reason):
         c = replace(c, energy_sampling=replace(c.energy_sampling, pair_sample_size=3))
     if reason == "custom":
         p = object()
-    h2, p2, (c2,) = prepare_local_cholesky_sampling(h, p, (c,), enabled=reason != "disabled")
+    runtime = QmcRuntime(h, p, c)
+    h2, p2, (c2,) = prepare_local_cholesky_sampling(h, p, (c,), enabled=reason != "disabled", runtime=runtime)
     assert h2 is h and p2 is p and c2 is c
+
+
+@pytest.mark.parametrize("pairs,installed", [(7, False), (8, True)])
+def test_joint_mesh_budget_is_per_device_not_per_model_shard(pairs, installed):
+    _, h, p, c = synthetic_runtime(model=2, n_data=2)
+    c = replace(c, energy_sampling=replace(c.energy_sampling, pair_sample_size=pairs))
+    runtime = QmcRuntime(h, p, c)
+    _, _, (actual,) = prepare_local_cholesky_sampling(h, p, (c,), runtime=runtime)
+    assert (actual.model_sampling is not None) == installed
 
 
 def test_borrowed_inputs_do_not_silently_allocate_a_second_layout():

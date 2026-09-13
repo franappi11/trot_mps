@@ -18,7 +18,7 @@ from trot.meas import cisd_modes as cm, ucisd_k_modes as um
 from trot.meas.cisd import CisdMeasCfg
 from trot.meas.ucisd import UcisdMeasCfg
 from trot.meas.pair_sampling import local_cholesky_head, with_local_cholesky_sampling
-from trot.sharding import plan_cholesky_layout, replicate, shard_cholesky_layout
+from trot.sharding import plan_cholesky_layout, replicate, shard_cholesky_layout, shard_first_axis
 from trot.trial.cisd_modes import CisdModeTrial
 from trot.trial.ucisd_k_modes import UcisdKModeTrial
 
@@ -71,11 +71,12 @@ def common_fn(module):
     return lambda w, h, c, t: um._ucisd_k_energy_common(w, h, c, t, um._k_mode_apply_realimag)
 
 
-def prepare(kind, mixed, n_model, head_size, *, abstract=False):
-    if jax.local_device_count() < n_model:
-        pytest.skip(f"Requires {n_model} devices")
+def prepare(kind, mixed, n_model, head_size, *, abstract=False, n_data=1):
+    n_devices = n_data*n_model
+    if jax.local_device_count() < n_devices:
+        pytest.skip(f"Requires {n_devices} devices")
     module = cm if kind == "cisd" else um
-    mesh = Mesh(np.asarray(jax.local_devices()[:n_model]).reshape(1, n_model), ("data", "model"),
+    mesh = Mesh(np.asarray(jax.local_devices()[:n_devices]).reshape(n_data, n_model), ("data", "model"),
                 axis_types=(AxisType.Auto, AxisType.Auto))
     h, t, w, weights = host_inputs(kind, mixed)
     # Non-prefix head and nondivisible vector count exercise physical remapping.
@@ -85,7 +86,8 @@ def prepare(kind, mixed, n_model, head_size, *, abstract=False):
     p = p/p.sum() if p.size else p
     layout = plan_cholesky_layout(7, n_model, head, tail, p)
     h = HamChol(replicate(h.h0, mesh), replicate(h.h1, mesh), shard_cholesky_layout(h.chol, mesh, layout))
-    t, w, weights = jax.tree.map(lambda a: replicate(a, mesh), (t, w, weights))
+    t = jax.tree.map(lambda a: replicate(a, mesh), t)
+    w, weights = jax.tree.map(lambda a: shard_first_axis(a, mesh), (w, weights))
     cfg = context_cfg(kind, mixed)
     build = lambda h, t: module.build_meas_ctx(h, t, cfg=cfg, n_mode_chunks=3)
     if abstract and kind == "cisd":
@@ -107,10 +109,11 @@ def prepare(kind, mixed, n_model, head_size, *, abstract=False):
 
 @pytest.mark.parametrize("kind", ["cisd", "ucisd"])
 @pytest.mark.parametrize("mixed", [False, True])
-def test_abstract_local_energy_trace(kind, mixed):
+@pytest.mark.parametrize("n_data,n_model", [(1, 4), (2, 2)])
+def test_abstract_local_energy_trace(kind, mixed, n_data, n_model):
     # Traces the real contractions and their nested scans, without compiling or
     # executing an AFQMC energy kernel on the CPU.
-    module, mesh, layout, h, ctx, t, w, weights = prepare(kind, mixed, 4, 3, abstract=True)
+    module, mesh, layout, h, ctx, t, w, weights = prepare(kind, mixed, n_model, 3, abstract=True, n_data=n_data)
     args = (w, weights, np.ones(12, dtype=complex), np.array([0, 83], dtype=np.uint32),
             h, ctx, t, np.asarray(-2.), np.asarray(100.))
     for chunks in (1, 5):
@@ -125,11 +128,12 @@ def test_abstract_local_energy_trace(kind, mixed):
 
 @pytest.mark.parametrize("kind", ["cisd", "ucisd"])
 @pytest.mark.parametrize("mixed", [False, True])
-@pytest.mark.parametrize("n_model,head_size", [(1, 3), (4, 3), (4, 0), (4, 7)])
-def test_gpu_local_energy_matches_explicit_sample_sum(kind, mixed, n_model, head_size):
+@pytest.mark.parametrize("n_data,n_model,head_size", [
+    (1, 1, 3), (1, 4, 3), (1, 4, 0), (1, 4, 7), (2, 2, 3), (2, 2, 0), (2, 2, 7)])
+def test_gpu_local_energy_matches_explicit_sample_sum(kind, mixed, n_data, n_model, head_size):
     if jax.default_backend() != "gpu":
         pytest.skip("Numerical AFQMC kernel checks require GPUs")
-    module, mesh, layout, h, ctx, t, w, weights = prepare(kind, mixed, n_model, head_size)
+    module, mesh, layout, h, ctx, t, w, weights = prepare(kind, mixed, n_model, head_size, n_data=n_data)
     # The reference uses global contractions and independently assembles the
     # stratum estimator from its known sampled indices, including guarded weights.
     common = jax.jit(wk.vmap_chunked(common_fn(module), 1, in_axes=(0, None, None, None)))(w, h, ctx, t)
@@ -159,22 +163,28 @@ def test_gpu_local_energy_matches_explicit_sample_sum(kind, mixed, n_model, head
             q0 = accepted/accepted.sum()
             guide = accepted*np.sqrt(expected_squared)
             q = .1*q0+.9*(guide/guide.sum() if guide.sum() else q0)
-            count, rem = divmod(17, n_model)
+            count, rem = divmod(17, n_data*n_model)
             capacity = count+bool(rem)
             width = layout.local_tail_prob.shape[1]
-            for d, p in enumerate(layout.local_tail_prob):
-                if p.sum() == 0:
+            for data_id, walkers in enumerate(np.split(np.arange(12), n_data)):
+                if q[walkers].sum() == 0:
                     continue
-                p = p/p.sum()
-                kw, kg = jax.random.split(jax.random.fold_in(key, d))
-                uw, ug = (np.asarray(jax.random.uniform(k, (capacity,), dtype=jnp.float64)) for k in (kw, kg))
-                iw = np.searchsorted(np.cumsum(q), uw*np.sum(q), side="right")
-                ig = np.searchsorted(np.cumsum(p), ug*np.sum(p), side="right")
-                vals = accepted[iw]*terms[iw, d*width+ig].real/(q[iw]*p[ig])
-                vals = vals[:count+(d < rem)]
-                exact += vals.mean()
-                first = len(vals)//2; second = len(vals)-first
-                noise += np.sqrt(first*second)/len(vals)*(vals[:first].mean()-vals[first:].mean())
+                qd = q[walkers]/q[walkers].sum() if n_data > 1 else q
+                for model_id, p in enumerate(layout.local_tail_prob):
+                    if p.sum() == 0:
+                        continue
+                    d = data_id*n_model+model_id
+                    p = p/p.sum()
+                    kw, kg = jax.random.split(jax.random.fold_in(key, d))
+                    uw, ug = (np.asarray(jax.random.uniform(k, (capacity,), dtype=jnp.float64)) for k in (kw, kg))
+                    iw = np.searchsorted(np.cumsum(qd), uw*np.sum(qd), side="right")
+                    ig = np.searchsorted(np.cumsum(p), ug*np.sum(p), side="right")
+                    global_iw = walkers[iw]
+                    vals = accepted[global_iw]*terms[global_iw, model_id*width+ig].real/(qd[iw]*p[ig])
+                    vals = vals[:count+(d < rem)]
+                    exact += vals.mean()
+                    first = len(vals)//2; second = len(vals)-first
+                    noise += np.sqrt(first*second)/len(vals)*(vals[:first].mean()-vals[first:].mean())
         for chunks in (1, 5):
             f = jax.jit(lambda w, wt, h, c, t, key, clip: module.pair_sampled_block_energy(
                 w, wt, jnp.ones(12, dtype=complex), key, chunks, h, c, t, jnp.asarray(-2.), clip))

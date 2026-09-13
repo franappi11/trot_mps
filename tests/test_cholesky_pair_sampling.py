@@ -19,15 +19,15 @@ from trot.meas.cisd_modes import CisdModePairSamplingCfg
 from trot.meas.pair_sampling import (
     local_cholesky_head, local_cholesky_tail, with_local_cholesky_sampling,
 )
-from trot.sharding import plan_cholesky_layout, replicate, shard_cholesky_layout
+from trot.sharding import plan_cholesky_layout, replicate, shard_cholesky_layout, shard_first_axis
 
 jax.config.update("jax_enable_x64", True)
 
 
-def model_mesh(n=4):
-    if jax.local_device_count() < n:
-        pytest.skip(f"Requires {n} devices")
-    return Mesh(np.asarray(jax.local_devices()[:n]).reshape(1, n), ("data", "model"),
+def model_mesh(n=4, n_data=1):
+    if jax.local_device_count() < n * n_data:
+        pytest.skip(f"Requires {n * n_data} devices")
+    return Mesh(np.asarray(jax.local_devices()[:n * n_data]).reshape(n_data, n), ("data", "model"),
                 axis_types=(AxisType.Auto, AxisType.Auto))
 
 
@@ -86,6 +86,7 @@ class TableContext:
 
 class Common(NamedTuple):
     base: object
+    walker_indices: object
 
 
 def context_specs(ctx):
@@ -93,33 +94,35 @@ def context_specs(ctx):
 
 
 def head_terms(common, indices, h, ctx, trial, *, n_chunks):
-    return h.chol[indices, :, 0].T
+    return h.chol[indices][:, common.walker_indices, 0].T
 
 
 def pair_terms(common, iw, ig, h, ctx, trial, *, n_chunks):
-    return h.chol[ig, iw, 0]
+    return h.chol[ig, common.walker_indices[iw], 0]
 
 
-def table_inputs(n, head, *, budget=17, diagnostics=True):
-    mesh = model_mesh()
+def table_inputs(n, head, *, budget=17, diagnostics=True, n_data=1, n_model=4):
+    mesh = model_mesh(n_model, n_data)
     table = np.sin(np.arange(n * 8).reshape(n, 8)) + .3j
     tail = np.setdiff1d(np.arange(n), head)
     p = np.arange(1, len(tail) + 1, dtype=float)
     p = p / p.sum() if p.size else p
-    layout = plan_cholesky_layout(n, 4, head, tail, p)
+    layout = plan_cholesky_layout(n, n_model, head, tail, p)
     cfg = CisdModePairSamplingCfg(len(head), budget, head_chol_batch_size=2,
                                   track_half_sample_diagnostic=diagnostics)
     ctx = with_local_cholesky_sampling(TableContext(None, None, None, cfg), layout, mesh)
     zero = replicate(np.asarray(0.), mesh)
     h = HamChol(zero, replicate(np.zeros((8, 8)), mesh),
                 shard_cholesky_layout(table[:, :, None], mesh, layout))
-    common = Common(replicate(np.zeros(8, dtype=complex), mesh))
+    common = Common(shard_first_axis(np.zeros(8, dtype=complex), mesh),
+                    shard_first_axis(np.arange(8), mesh))
     return table, layout, common, h, ctx, zero
 
 
 @pytest.mark.parametrize("n,head", [(17, [0, 3, 4, 5, 10]), (9, list(range(9))), (7, []), (2, [1])])
-def test_local_head_complex_sum_squares_and_communication(n, head):
-    table, layout, common, h, ctx, t = table_inputs(n, head)
+@pytest.mark.parametrize("n_data,n_model", [(1, 4), (2, 2), (4, 1)])
+def test_local_head_complex_sum_squares_and_communication(n, head, n_data, n_model):
+    table, layout, common, h, ctx, t = table_inputs(n, head, n_data=n_data, n_model=n_model)
     f = jax.jit(lambda common, h, c, t: local_cholesky_head(
         common, h, c, t, terms_fn=head_terms, context_specs_fn=context_specs, n_chunks=3))
     compiled = f.lower(common, h, ctx, t).compile()
@@ -140,14 +143,17 @@ def assert_small_collectives(compiled, limit=8):
 
 @pytest.mark.parametrize("n,head,zero_weight", [(17, [0, 3, 4, 5, 10], False),
     (3, [1], False), (9, list(range(9)), False), (7, [0], True)])
-def test_tail_mean_variance_noise_and_empty_strata(n, head, zero_weight):
-    table, layout, common, h, ctx, t = table_inputs(n, head)
+@pytest.mark.parametrize("n_data,n_model", [(1, 4), (2, 2), (4, 1)])
+def test_tail_mean_variance_noise_and_empty_strata(n, head, zero_weight, n_data, n_model):
+    table, layout, common, h, ctx, t = table_inputs(n, head, n_data=n_data, n_model=n_model)
     pi = np.arange(1, 9, dtype=float); pi /= pi.sum()
     pi[1::3] = 0  # Guarded walkers keep zero weight, with no renormalization.
+    if n == 3:
+        pi[:4] = 0  # Empty data strata as well as empty model strata.
     q = pi * np.array([1, 4, 2, 1, 5, 2, 3, 1]); q /= q.sum()
     if zero_weight:
         pi[:] = 0
-    args = (common, replicate(pi, ctx.model_sampling.mesh), replicate(q, ctx.model_sampling.mesh),
+    args = (common, shard_first_axis(pi, ctx.model_sampling.mesh), shard_first_axis(q, ctx.model_sampling.mesh),
             jax.random.PRNGKey(42), h, ctx, t)
     f = jax.jit(lambda common, pi, q, key, h, c, t: jnp.stack(local_cholesky_tail(
         common, pi, q, key, h, c, t, pair_fn=pair_terms, context_specs_fn=context_specs, n_chunks=3)))
@@ -160,16 +166,21 @@ def test_tail_mean_variance_noise_and_empty_strata(n, head, zero_weight):
         return jax.lax.scan(step, None, keys)[1]
     samples = np.asarray(jax.jit(sample_many)(args, jax.random.split(jax.random.PRNGKey(93), 8192)))
     exact, variance = 0., 0.
-    original = layout.permutation.reshape(4, -1)
-    for d, pd in enumerate(layout.local_tail_prob):
-        if pd.sum() == 0 or pi.sum() == 0:
+    original = layout.permutation.reshape(n_model, -1)
+    for dw, walkers in enumerate(np.split(np.arange(8), n_data)):
+        walkers = walkers[q[walkers] > 0]
+        if not pi[walkers].sum():
             continue
-        ids = original[d, pd > 0]
-        probability = (pd[pd > 0] / pd.sum())[:, None] * q[None, q > 0]
-        values = table[ids][:, q > 0].real * pi[None, q > 0] / probability
-        mean = np.sum(probability * values)
-        exact += mean
-        variance += (np.sum(probability * values**2) - mean**2) / (5 if d == 0 else 4)
+        qw = q[walkers]/q[walkers].sum()
+        for dm, pd in enumerate(layout.local_tail_prob):
+            if pd.sum() == 0:
+                continue
+            ids = original[dm, pd > 0]
+            probability = (pd[pd > 0] / pd.sum())[:, None] * qw[None, :]
+            values = table[np.ix_(ids, walkers)].real * pi[None, walkers] / probability
+            mean = np.sum(probability * values)
+            exact += mean
+            variance += (np.sum(probability * values**2) - mean**2) / (5 if dw*n_model+dm == 0 else 4)
     if variance == 0:
         np.testing.assert_array_equal(samples, 0)
     else:
@@ -178,6 +189,22 @@ def test_tail_mean_variance_noise_and_empty_strata(n, head, zero_weight):
         np.testing.assert_allclose(samples.var(axis=0, ddof=1), variance, rtol=.07)
 
 
-def test_insufficient_pair_budget_rejected():
+@pytest.mark.parametrize("n_data,n_model", [(1, 4), (2, 2)])
+def test_insufficient_pair_budget_rejected(n_data, n_model):
     with pytest.raises(ValueError, match="at least 2 pairs"):
-        table_inputs(7, [0], budget=7)
+        table_inputs(7, [0], budget=7, n_data=n_data, n_model=n_model)
+
+
+def test_joint_strata_with_one_pair_each_and_no_diagnostic():
+    table, _, common, h, ctx, t = table_inputs(2, [], budget=4, diagnostics=False, n_data=2, n_model=2)
+    mesh = ctx.model_sampling.mesh
+    # One supported walker and one Cholesky per stratum make sampling exact.
+    # Proposal masses intentionally differ from the original population weights.
+    pi = np.zeros(8); pi[[1, 5]] = [.2, .8]
+    q = np.zeros(8); q[[1, 5]] = [.07, .93]
+    f = jax.jit(lambda common, pi, q, h, ctx, t: local_cholesky_tail(
+        common, pi, q, jax.random.PRNGKey(4), h, ctx, t,
+        pair_fn=pair_terms, context_specs_fn=context_specs, n_chunks=3))
+    estimate, noise = f(common, shard_first_axis(pi, mesh), shard_first_axis(q, mesh), h, ctx, t)
+    np.testing.assert_allclose(estimate, np.dot(table.real.sum(axis=0), pi), atol=1e-14)
+    assert noise == 0

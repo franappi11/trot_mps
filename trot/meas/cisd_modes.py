@@ -1073,7 +1073,7 @@ def pair_sampled_block_energy(
         raise ValueError("pair_sampled_block_energy requires an energy sampling config.")
 
     if meas_ctx.model_sampling is not None and sampling.sample_local_walkers:
-        raise ValueError("Local Cholesky sampling requires replicated walkers.")
+        raise ValueError("A Cholesky layout already handles local walkers; leave sample_local_walkers=False.")
     local_mesh = local_pair_mesh(walkers, sampling.sample_local_walkers)
     if local_mesh is not None:
         common, local_head, local_squared = local_common_and_head(

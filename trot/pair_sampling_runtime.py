@@ -96,7 +96,8 @@ def _install_local_cholesky_sampling(ham_data, prop_ctx, contexts, mesh, eligibl
                     chol_tail_indices=replicate(own_layout.tail_indices, mesh),
                     chol_tail_prob=replicate(own_layout.tail_prob, mesh))
         new_contexts.append(changed)
-    print(f"[sampling] local Cholesky sampling on {layout.n_model} model shards; "
+    print(f"[sampling] local Cholesky sampling on {layout.n_model} model shards "
+          f"and {mesh.shape.get('data', 1)} data shards; "
           f"balanced layout from {type(primary).__name__}; "
           f"local samplers={len(eligible)}.", flush=True)
     return ham_new, prop_new, tuple(new_contexts)
@@ -118,14 +119,15 @@ def _prepare_local_cholesky_sampling(ham_data, prop_ctx, contexts, *, enabled, o
     Drivers call this before the first block for fixed policies, or after
     retuning and before production for adaptive policies. Every context and
     the propagation arrays share one permutation. Walker state has no stored
-    Cholesky axis. Single-GPU, data-sharded, deterministic and opted-out runs
-    retain their existing objects. Explicitly installed layouts are preserved.
+    Cholesky axis. Combined data/model meshes condition both proposals locally.
+    Single-GPU, data-only, deterministic and opted-out runs retain their
+    existing objects. Explicitly installed layouts are preserved.
     """
     unchanged = (ham_data, prop_ctx, contexts)
     if not enabled or not isinstance(ham_data, HamChol) or not ham_data.chol.shape[0]:
         return unchanged
     mesh = cholesky_model_mesh(ham_data.chol)
-    if mesh is None or mesh.shape.get("data", 1) != 1 or not ham_data.chol.is_fully_addressable:
+    if mesh is None or not ham_data.chol.is_fully_addressable:
         return unchanged
     if any(getattr(ctx, "model_sampling", None) is not None for ctx in contexts):
         return unchanged
@@ -137,7 +139,8 @@ def _prepare_local_cholesky_sampling(ham_data, prop_ctx, contexts, *, enabled, o
         minimum = 2 if sampling.track_half_sample_diagnostic else 1
         if getattr(sampling, "sample_local_walkers", False):
             continue
-        if ctx.chol_tail_indices.size and sampling.pair_sample_size < minimum * mesh.shape["model"]:
+        n_strata = mesh.shape["model"] * mesh.shape.get("data", 1)
+        if ctx.chol_tail_indices.size and sampling.pair_sample_size < minimum * n_strata:
             print("[sampling] pair budget too small for local Cholesky strata; retaining global sampler.", flush=True)
             continue
         eligible.append(i)

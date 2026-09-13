@@ -1,4 +1,4 @@
-"""Sampling helpers for local walker or local Cholesky strata."""
+"""Sampling helpers for local walker, Cholesky, or joint mesh strata."""
 from __future__ import annotations
 
 import math
@@ -35,9 +35,8 @@ def with_local_cholesky_sampling(meas_ctx, layout: CholeskyLayout, mesh: Mesh):
     contexts from it. Global indices remain available for diagnostic probes.
     Automatic retuning is unsupported while this metadata is attached.
     """
-    if ("model" not in mesh.axis_names or mesh.shape["model"] != layout.n_model
-            or mesh.shape.get("data", 1) != 1):
-        raise ValueError("Local Cholesky sampling requires matching model shards and replicated walkers.")
+    if "model" not in mesh.axis_names or mesh.shape["model"] != layout.n_model:
+        raise ValueError("Local Cholesky sampling requires matching model shards.")
     sampling = (meas_ctx.component_sampling if hasattr(meas_ctx, "component_sampling")
                 else meas_ctx.energy_sampling)
     if sampling is None or getattr(sampling, "sample_local_walkers", False):
@@ -47,8 +46,9 @@ def with_local_cholesky_sampling(meas_ctx, layout: CholeskyLayout, mesh: Mesh):
     if meas_ctx.model_sampling is not None:
         raise ValueError("Rebuild the context before replacing a frozen Cholesky layout.")
     minimum = 2 if sampling.track_half_sample_diagnostic else 1
-    if layout.tail_indices.size and sampling.pair_sample_size < minimum * layout.n_model:
-        raise ValueError(f"Local Cholesky sampling requires at least {minimum} pairs per model shard.")
+    n_strata = layout.n_model * mesh.shape.get("data", 1)
+    if layout.tail_indices.size and sampling.pair_sample_size < minimum * n_strata:
+        raise ValueError(f"Local Cholesky sampling requires at least {minimum} pairs per mesh stratum.")
     sh = NamedSharding(mesh, P("model"))
     data = ModelPairSamplingData(
         jax.device_put(layout.local_head_indices, sh),
@@ -67,11 +67,19 @@ def _model_context_specs(meas_ctx, context_specs_fn):
         head_indices=P("model"), head_valid=P("model"), tail_prob=P("model")))
 
 
+def _local_cholesky_axes(mesh):
+    """Make both axes manual when walkers are distributed as well as Choleskies."""
+    if mesh.shape.get("data", 1) > 1:
+        return ("data", "model"), P("data")
+    return ("model",), P()
+
+
 def local_cholesky_head(common, ham_data, meas_ctx, trial_data, *, terms_fn, context_specs_fn, n_chunks):
     """Sum local head terms and squared real terms before global guard/proposal construction."""
     data = meas_ctx.model_sampling
     if data is None:
         raise ValueError("Missing local Cholesky sampler metadata.")
+    axes, walker_spec = _local_cholesky_axes(data.mesh)
     if data.head_indices.shape[1] == 0:
         return (jnp.zeros_like(common.base, dtype=jnp.complex128),
                 jnp.zeros_like(common.base.real, dtype=jnp.float64))
@@ -87,8 +95,9 @@ def local_cholesky_head(common, ham_data, meas_ctx, trial_data, *, terms_fn, con
         pad = (-width) % batch
         indices = jnp.pad(indices, (0, pad)).reshape(-1, batch)
         valid = jnp.pad(valid, (0, pad)).reshape(-1, batch)
-        # Carry model-axis variance through nested scans.
-        zero = jnp.zeros_like(indices, shape=common.base.shape, dtype=jnp.complex128)
+        # The carry varies over both local walkers and local Choleskies.
+        zero = (jnp.zeros_like(indices, shape=common.base.shape, dtype=jnp.complex128)
+                + jnp.zeros_like(common.base, dtype=jnp.complex128))
 
         def step(carry, xs):
             idx, keep = xs
@@ -102,9 +111,9 @@ def local_cholesky_head(common, ham_data, meas_ctx, trial_data, *, terms_fn, con
         return lax.psum(total, "model"), lax.psum(squared, "model")
 
     return jax.shard_map(
-        local, mesh=data.mesh, axis_names={"model"},
-        in_specs=(P(), (P(), P(), P("model")), _model_context_specs(meas_ctx, context_specs_fn), P()),
-        out_specs=(P(), P()),
+        local, mesh=data.mesh, axis_names=set(axes),
+        in_specs=(walker_spec, (P(), P(), P("model")), _model_context_specs(meas_ctx, context_specs_fn), P()),
+        out_specs=(walker_spec, walker_spec),
     )(common, (ham_data.h0, ham_data.h1, ham_data.chol), meas_ctx, trial_data)
 
 
@@ -119,8 +128,9 @@ def local_cholesky_component_head(common, theta_reference, ham_data, meas_ctx, t
     data = meas_ctx.model_sampling
     if data is None:
         raise ValueError("Missing local Cholesky sampler metadata.")
+    axes, walker_spec = _local_cholesky_axes(data.mesh)
     shape = (common.theta.shape[0], 2)
-    zero = jnp.zeros(shape, dtype=jnp.complex128)
+    zero = jnp.zeros_like(common.theta, shape=shape, dtype=jnp.complex128)
     if data.head_indices.shape[1] == 0:
         return zero, zero[:, 0].real, zero[:, 0].real, zero[:, 0].real
     sampling = meas_ctx.component_sampling
@@ -134,8 +144,10 @@ def local_cholesky_component_head(common, theta_reference, ham_data, meas_ctx, t
         pad = (-width) % batch
         indices = jnp.pad(indices, (0, pad)).reshape(-1, batch)
         valid = jnp.pad(valid, (0, pad)).reshape(-1, batch)
-        # The scan carry must retain the manual model-axis variation.
-        total = jnp.zeros_like(indices, shape=shape, dtype=jnp.complex128)
+        # Determine the shape inside the map: only this data shard's walkers.
+        local_shape = (common.theta.shape[0], 2)
+        total = (jnp.zeros_like(indices, shape=local_shape, dtype=jnp.complex128)
+                 + jnp.zeros_like(common.theta, shape=local_shape, dtype=jnp.complex128))
         moment = total[:, 0].real
 
         def step(carry, xs):
@@ -156,18 +168,19 @@ def local_cholesky_component_head(common, theta_reference, ham_data, meas_ctx, t
         return jax.tree.map(lambda a: lax.psum(a, "model"), sums)
 
     return jax.shard_map(
-        local, mesh=data.mesh, axis_names={"model"},
-        in_specs=(P(), P(), (P(), P(), P("model")), _model_context_specs(meas_ctx, context_specs_fn), P()),
-        out_specs=(P(), P(), P(), P()),
+        local, mesh=data.mesh, axis_names=set(axes),
+        in_specs=(walker_spec, P(), (P(), P(), P("model")), _model_context_specs(meas_ctx, context_specs_fn), P()),
+        out_specs=(walker_spec, walker_spec, walker_spec, walker_spec),
     )(common, theta_reference, (ham_data.h0, ham_data.h1, ham_data.chol), meas_ctx, trial_data)
 
 
 def local_cholesky_tail(common, pi, q, rng_key, ham_data, meas_ctx, trial_data,
                         *, pair_fn, context_specs_fn, n_chunks, components=False):
-    """Unbiased local-tail strata with replicated walkers and a fixed total budget.
+    """Unbiased local-tail strata with a fixed total budget across both mesh axes.
 
-    Draw w~q globally and gamma~p/P_d locally. Average pi[w]*Re(term)/(q[w]*p_d)
-    within each device, then sum device estimates (not their average).
+    Condition q on this data shard and p on this model shard. Average
+    pi[w]*Re(term)/(q_local[w]*p_local[g]) within each device, then sum
+    device estimates. With data=1, q and the random streams are unchanged.
     pi retains its original normalized population weight and is zero for guards.
 
     With components=True, pi contains unnormalized complex PT weights and
@@ -180,16 +193,21 @@ def local_cholesky_tail(common, pi, q, rng_key, ham_data, meas_ctx, trial_data,
         raise ValueError("Missing local Cholesky sampler metadata.")
     sampling = meas_ctx.component_sampling if components else meas_ctx.energy_sampling
     n_model = data.mesh.shape["model"]
+    n_data = data.mesh.shape.get("data", 1)
+    n_strata = n_data * n_model
+    axes, walker_spec = _local_cholesky_axes(data.mesh)
     minimum = 2 if sampling.track_half_sample_diagnostic else 1
-    if sampling.pair_sample_size < minimum * n_model:
-        raise ValueError(f"Local Cholesky sampling requires at least {minimum} pairs per model shard.")
-    base_count, rem = divmod(sampling.pair_sample_size, n_model)
+    if sampling.pair_sample_size < minimum * n_strata:
+        raise ValueError(f"Local Cholesky sampling requires at least {minimum} pairs per mesh stratum.")
+    base_count, rem = divmod(sampling.pair_sample_size, n_strata)
     capacity = base_count + bool(rem)
     dtype = jnp.complex128 if components else jnp.float64
     result_shape = (2, 2) if components else (2,)
 
     def local(common, pi, q, key, arrays, ctx, trial):
         d = lax.axis_index("model")
+        if n_data > 1:
+            d = lax.axis_index("data") * n_model + d
         count = base_count + (d < rem).astype(jnp.int32)
         p = ctx.model_sampling.tail_prob[0]
         mass = jnp.sum(p, dtype=jnp.float64)
@@ -197,14 +215,15 @@ def local_cholesky_tail(common, pi, q, rng_key, ham_data, meas_ctx, trial_data,
 
         def evaluate(_):
             pd = p / mass
+            qd = q / jnp.sum(q, dtype=jnp.float64) if n_data > 1 else q
             kw, kg = jax.random.split(jax.random.fold_in(key, d))
-            iw = _sample_indices(kw, q, capacity)
+            iw = _sample_indices(kw, qd, capacity)
             ig = _sample_indices(kg, pd, capacity)
             walker_batch = math.ceil(pi.size / n_chunks)
             terms = pair_fn(common, iw, ig, h, ctx, trial,
                             n_chunks=math.ceil(capacity / walker_batch))
-            values = (pi[iw, None] * terms / (q[iw, None] * pd[ig, None]) if components
-                      else pi[iw] * terms.real / (q[iw] * pd[ig]))
+            values = (pi[iw, None] * terms / (qd[iw, None] * pd[ig, None]) if components
+                      else pi[iw] * terms.real / (qd[iw] * pd[ig]))
             indices = jnp.arange(capacity)
             if components:
                 indices = indices[:, None]
@@ -221,12 +240,13 @@ def local_cholesky_tail(common, pi, q, rng_key, ham_data, meas_ctx, trial_data,
         # Complex weights may cancel exactly while the numerator is nonzero.
         active_weight = jnp.sum(jnp.abs(pi)) if components else jnp.sum(pi)
         result = lax.cond((mass > 0) & (active_weight > 0), evaluate,
-            lambda _: jnp.zeros_like(p, shape=result_shape, dtype=dtype), operand=None)
-        return lax.psum(result, "model")
+            lambda _: (jnp.zeros_like(p, shape=result_shape, dtype=dtype)
+                       + jnp.zeros_like(pi, shape=result_shape, dtype=dtype)), operand=None)
+        return lax.psum(result, axes)
 
     result = jax.shard_map(
-        local, mesh=data.mesh, axis_names={"model"},
-        in_specs=(P(), P(), P(), P(), (P(), P(), P("model")),
+        local, mesh=data.mesh, axis_names=set(axes),
+        in_specs=(walker_spec, walker_spec, walker_spec, P(), (P(), P(), P("model")),
                   _model_context_specs(meas_ctx, context_specs_fn), P()), out_specs=P(),
     )(common, pi, q, rng_key, (ham_data.h0, ham_data.h1, ham_data.chol), meas_ctx, trial_data)
     return result[0], result[1]
