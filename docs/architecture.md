@@ -212,6 +212,12 @@ leaving model-axis contractions to automatic partitioning. The unchunked
 `vmap` path is unchanged. The automatic memory selector caps its search at
 the local population size and reports `walkers_per_data_shard`.
 
+`QmcParams` enables automatic walker chunking by default (`auto_n_chunks=True`).
+The driver starts from `n_chunks` and increases it as needed to satisfy the
+compiler-estimated device memory budget. Set `auto_n_chunks=False` to keep
+the requested chunk count fixed. If device memory statistics are unavailable,
+the driver keeps the requested count.
+
 The helper reads the mesh from the mapped argument's abstract type, which
 retains Auto mesh axes inside JIT tracing even when the concrete partition
 spec is unavailable. Walker mappings use axis zero for data. Calls that map

@@ -106,7 +106,6 @@ def test_auto_chunks_reuses_first_candidate_when_it_fits(monkeypatch):
     params = QmcParams(
         n_walkers=8,
         n_chunks=1,
-        auto_n_chunks=True,
         n_eql_blocks=50,
         n_blocks=100,
     )
@@ -119,7 +118,7 @@ def test_auto_chunks_reuses_first_candidate_when_it_fits(monkeypatch):
 
 
 def test_auto_chunks_increases_until_compiler_estimate_fits(monkeypatch):
-    params = QmcParams(n_walkers=8, n_chunks=1, auto_n_chunks=True)
+    params = QmcParams(n_walkers=8, n_chunks=1)
     selected, run_blocks, built = _select(monkeypatch, params, {1: 1200, 2: 700})
 
     assert [candidate.n_chunks for candidate in built] == [1, 2]
