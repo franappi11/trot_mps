@@ -29,6 +29,7 @@ trot/
 |-- driver.py                QMC execution loop (equilibration + sampling)
 |-- walkers.py               Walker init, orthogonalization, stochastic reconfiguration
 |-- sharding.py              JAX multidevice sharding utilities
+|-- pair_sampling_runtime.py Install frozen local Cholesky sampling in QMC drivers
 |-- stat_utils.py            Blocking analysis and outlier rejection
 |-- testing.py               Testing helpers
 |-- lattices.py              Lattices for models
@@ -394,6 +395,26 @@ convenient.
 For the experimental low-level option that samples pairs within each GPU's
 walker population, see [local pair sampling](local_pair_sampling.md). It
 requires frozen sampling settings and a replicated Hamiltonian.
+
+For **pair-sampled** compressed CISD/UCISD energies and PT-CCSD/PT-UCCSD
+components with a Hamiltonian sharded across a single node's GPUs and
+replicated walkers, normal Jobs enable local Cholesky sampling by default
+(`QmcParams.local_cholesky_sampling=True`). They distribute the exact head
+and balance the tail proposal across GPUs after any sampling-guide tuning,
+then sample only locally stored Cholesky vectors. Hamiltonian, propagation,
+guide, and estimator arrays receive the same physical permutation. In mixed
+PT runs the layout follows the PT proposal while retaining the guide's own
+head and probabilities.
+
+Set `QmcParams(local_cholesky_sampling=False)` to retain the global sampler.
+This option does not enable Hamiltonian sharding or pair sampling; deterministic
+calculations, single-GPU runs, and walker-sharded runs keep their existing
+paths. For low-level PT runs, `state, runtime = job.prepare_runtime()` supplies
+an owned `QmcRuntime` to `run_mixed_estimator_qmc(runtime=runtime, ...)`.
+This lets the driver update the Job caches and release the original arrays
+after redistribution. Separate borrowed Hamiltonian/context arguments retain
+the global sampler. See [Cholesky pair sampling](cholesky_pair_sampling.md) for
+eligibility, temporary memory requirements, and low-level installation.
 
 ### 2. `setup()` function (mid-level)
 

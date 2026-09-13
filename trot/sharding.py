@@ -46,6 +46,24 @@ class CholeskyLayout:
         return int(self.inverse_permutation.size)
 
 
+def _cholesky_partition(n_chol, head_indices, tail_indices, tail_prob):
+    if not isinstance(n_chol, (int, np.integer)) or n_chol <= 0:
+        raise ValueError("n_chol must be a positive integer.")
+    head, tail = np.asarray(head_indices), np.asarray(tail_indices)
+    if any(a.ndim != 1 or (a.size and a.dtype.kind not in "iu") for a in (head, tail)):
+        raise ValueError("Head and tail indices must be one-dimensional integer arrays.")
+    head, tail = head.astype(np.int64), tail.astype(np.int64)
+    if not np.array_equal(np.sort(np.concatenate((head, tail))), np.arange(n_chol)):
+        raise ValueError("Head and tail must partition the original Cholesky indices exactly.")
+    prob = np.asarray(tail_prob, dtype=np.float64)
+    if prob.shape != tail.shape or not np.isfinite(prob).all() or np.any(prob <= 0):
+        raise ValueError("Every tail vector needs a finite, positive probability.")
+    if prob.size and not np.isclose(prob.sum(), 1.0, rtol=1e-10, atol=1e-12):
+        raise ValueError("Tail probabilities must sum to one.")
+    prob = prob.copy() / prob.sum() if prob.size else prob.copy()
+    return head, tail, prob
+
+
 def plan_cholesky_layout(
     n_chol: int,
     n_model: int,
@@ -60,22 +78,9 @@ def plan_cholesky_layout(
     Every real vector has one owner; padding receives no sampling probability.
     This deterministic planner does not select a guide or change the head.
     """
-    if not isinstance(n_chol, (int, np.integer)) or n_chol <= 0:
-        raise ValueError("n_chol must be a positive integer.")
+    head, tail, prob = _cholesky_partition(n_chol, head_indices, tail_indices, tail_prob)
     if not isinstance(n_model, (int, np.integer)) or n_model <= 0:
         raise ValueError("n_model must be a positive integer.")
-    head, tail = np.asarray(head_indices), np.asarray(tail_indices)
-    if any(a.ndim != 1 or (a.size and a.dtype.kind not in "iu") for a in (head, tail)):
-        raise ValueError("Head and tail indices must be one-dimensional integer arrays.")
-    head, tail = head.astype(np.int64), tail.astype(np.int64)
-    if not np.array_equal(np.sort(np.concatenate((head, tail))), np.arange(n_chol)):
-        raise ValueError("Head and tail must partition the original Cholesky indices exactly.")
-    prob = np.asarray(tail_prob, dtype=np.float64)
-    if prob.shape != tail.shape or not np.isfinite(prob).all() or np.any(prob <= 0):
-        raise ValueError("Every tail vector needs a finite, positive probability.")
-    if prob.size and not np.isclose(prob.sum(), 1.0, rtol=1e-10, atol=1e-12):
-        raise ValueError("Tail probabilities must sum to one.")
-    prob = prob.copy() / prob.sum() if prob.size else prob.copy()
     width = (n_chol + n_model - 1) // n_model
     groups = [list(head[d::n_model]) for d in range(n_model)]
     head_counts = np.array([len(g) for g in groups])
@@ -102,6 +107,71 @@ def plan_cholesky_layout(
     local_prob[tail_new] = prob
     return CholeskyLayout(permutation, inverse, head_new, tail_new, prob,
                           local_head, head_valid, local_prob.reshape(n_model, width))
+
+
+def remap_cholesky_layout(layout, head_indices, tail_indices, tail_prob) -> CholeskyLayout:
+    """Describe another sampler on the same physical permutation.
+
+    A PT estimator and its propagation guide can have different heads and
+    proposals. Both must address the same reordered Hamiltonian. This changes
+    their index metadata, not either sampler's membership or probabilities.
+    """
+    head, tail, prob = _cholesky_partition(layout.n_chol, head_indices, tail_indices, tail_prob)
+    head_new = layout.inverse_permutation[head].astype(np.int32)
+    tail_new = layout.inverse_permutation[tail].astype(np.int32)
+    n_model, width = layout.local_tail_prob.shape
+    groups = [head_new[head_new // width == d] % width for d in range(n_model)]
+    hwidth = max(map(len, groups), default=0)
+    local_head = np.zeros((n_model, hwidth), dtype=np.int32)
+    valid = np.zeros_like(local_head, dtype=bool)
+    for d, group in enumerate(groups):
+        local_head[d, :len(group)] = group
+        valid[d, :len(group)] = True
+    local_prob = np.zeros(layout.permutation.size, dtype=np.float64)
+    local_prob[tail_new] = prob
+    return CholeskyLayout(layout.permutation, layout.inverse_permutation,
+        head_new, tail_new, prob, local_head, valid, local_prob.reshape(n_model, width))
+
+
+def redistribute_cholesky(x, mesh: Mesh, layout: CholeskyLayout, *, batch_size: int = 16):
+    """Reorder existing first-axis data with bounded transfers through the host.
+
+    Unlike a global device gather, this never replicates the full Hamiltonian
+    on every GPU. The host assembles one destination shard at a time; device
+    gathers use at most batch_size rows. Inputs remain valid, so callers that
+    retain them also retain their device storage after the transition. This
+    supports one fully addressable node.
+    """
+    if isinstance(x, np.ndarray):
+        return shard_cholesky_layout(x, mesh, layout)
+    if (not isinstance(x, jax.Array) or not x.is_fully_addressable
+            or x.ndim == 0 or x.shape[0] != layout.n_chol or batch_size <= 0):
+        raise ValueError("Expected fully addressable Cholesky rows and a positive transfer batch.")
+    if not has_model_axis(mesh) or _mesh_axis_size(mesh, "model") != layout.n_model:
+        raise ValueError("Mesh model size does not match the Cholesky layout.")
+    sources = {}
+    for shard in x.addressable_shards:
+        if any(s.indices(n) != (0, n, 1) for s, n in zip(shard.index[1:], x.shape[1:])):
+            raise ValueError("Redistribution supports only first-axis sharding.")
+        start, stop, step = shard.index[0].indices(x.shape[0])
+        if step != 1:
+            raise ValueError("Redistribution requires contiguous source shards.")
+        sources.setdefault((start, stop), shard.data)  # replicated arrays: take one copy
+
+    def block(index):
+        indices = layout.permutation[index[0]]
+        result = np.zeros((indices.size, *x.shape[1:]), dtype=x.dtype)
+        for (start, stop), data in sources.items():
+            positions = np.flatnonzero((indices >= start) & (indices < stop))
+            for offset in range(0, positions.size, batch_size):
+                dest = positions[offset:offset + batch_size]
+                local = jax.device_put(indices[dest] - start, data.sharding)
+                result[dest] = np.asarray(data[local])
+        return result
+
+    result = jax.make_array_from_callback((layout.permutation.size, *x.shape[1:]),
+        NamedSharding(mesh, P("model")), block, dtype=x.dtype)
+    return result.block_until_ready()
 
 
 def shard_cholesky_layout(

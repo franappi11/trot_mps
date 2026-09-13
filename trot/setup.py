@@ -25,7 +25,7 @@ from .ham.chol import HamChol
 from .prop.afqmc import make_prop_ops
 from .prop.blocks import block as default_block
 from .prop.types import PropOps, PropState, QmcParams, QmcParamsBase
-from .runtime_layout import RuntimeLayout, make_runtime_layout
+from .runtime_layout import QmcRuntime, RuntimeLayout, make_runtime_layout
 from .staging import StagedInputs, _resolve_stage_frozen_arg, load, stage
 
 
@@ -329,21 +329,53 @@ class Job:
         self._runtime_state = prepared.state
         return prepared.state, prepared.meas_ctx, prepared.prop_ctx
 
+    def prepare_runtime(
+        self, *, state: PropState | None = None, meas_ctx: object | None = None,
+        prop_ctx: object | None = None,
+    ) -> tuple[PropState, QmcRuntime]:
+        """Prepare owned inputs for this Job or a low-level mixed/PT driver.
+
+        Pass the returned runtime to the driver; its update hook adopts any
+        new Cholesky ordering in this Job's caches as well.
+        """
+        state, meas_ctx, prop_ctx = self._prepare_runtime(
+            state=state, meas_ctx=meas_ctx, prop_ctx=prop_ctx,
+        )
+        return state, QmcRuntime(
+            self.ham_data, prop_ctx, meas_ctx, on_update=self._adopt_runtime,
+        )
+
     def kernel(self, **driver_kwargs: Any) -> QmcResult:
         """
         Run AFQMC energy driver.
         Extra kwargs are forwarded to driver.run_qmc_energy (e.g. state=..., meas_ctx=...).
         """
         assert isinstance(self.params, self.params_cls)
+        driver_kwargs.setdefault("mesh", self.mesh)
+        if self.params_cls is QmcParams:
+            state, runtime = self.prepare_runtime(
+                state=driver_kwargs.pop("state", None),
+                meas_ctx=driver_kwargs.pop("meas_ctx", None),
+                prop_ctx=driver_kwargs.pop("prop_ctx", None),
+            )
+            driver_kwargs["state"] = state
+            return self.driver_fn(
+                sys=self.sys,
+                params=self.params,
+                runtime=runtime,
+                trial_ops=self.trial_ops,
+                trial_data=self.trial_data,
+                meas_ops=self.meas_ops,
+                prop_ops=self.prop_ops,
+                block_fn=self.block_fn,
+                **driver_kwargs,
+            )
         state, meas_ctx, prop_ctx = self._prepare_runtime(
             state=driver_kwargs.get("state"),
             meas_ctx=driver_kwargs.get("meas_ctx"),
             prop_ctx=driver_kwargs.get("prop_ctx"),
         )
-        driver_kwargs["state"] = state
-        driver_kwargs["meas_ctx"] = meas_ctx
-        driver_kwargs["prop_ctx"] = prop_ctx
-        driver_kwargs.setdefault("mesh", self.mesh)
+        driver_kwargs.update(state=state, meas_ctx=meas_ctx, prop_ctx=prop_ctx)
         out = self.driver_fn(
             sys=self.sys,
             params=self.params,
@@ -356,6 +388,11 @@ class Job:
             **driver_kwargs,
         )
         return out
+
+    def _adopt_runtime(self, runtime: QmcRuntime) -> None:
+        self.ham_data = runtime.ham_data
+        self._runtime_prop_ctx = runtime.prop_ctx
+        self._runtime_meas_ctx = runtime.meas_ctx
 
 
 def _assemble_job(

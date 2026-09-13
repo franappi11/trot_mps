@@ -26,7 +26,8 @@ class CholAfqmcCtx:
     exp_h1_half: jax.Array  # (n,n) or (ns,ns)
     mf_shifts: jax.Array  # (n_fields,)
     h0_prop: jax.Array  # scalar
-    # Full layout: (n_fields, n*n). Packed layout: (n_fields, n*(n+1)//2).
+    # Full layout: (n_fields, n*n) or the shared Hamiltonian (n_fields, n, n).
+    # Packed layout: (n_fields, n*(n+1)//2).
     chol_flat: jax.Array
     norb: int
     chol_packed: bool = False
@@ -128,7 +129,10 @@ def _make_vhs_split_flat(
     n: int,
     chol_packed: bool = False,
 ) -> jax.Array:
-    # chol_flat is real and either full-flattened or packed upper-triangular.
+    # Flatten a shared full tensor inside JIT so no second persistent device
+    # array is needed. The packed and existing 2D representations are unchanged.
+    if chol_flat.ndim == 3:
+        chol_flat = chol_flat.reshape(chol_flat.shape[0], -1)
     v_re = jnp.real(x) @ chol_flat
     v_im = jnp.imag(x) @ chol_flat
     vhs = lax.complex(v_re, v_im)

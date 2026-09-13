@@ -27,8 +27,10 @@ from .core.ops import (
 )
 from .core.system import System
 from .meas.pt2ccsd import get_init_pt2trial_energy
+from .pair_sampling_runtime import prepare_local_cholesky_sampling
 from .prop.blocks import BlockFn, MixedBlockFn, MixedEstimatorBlockFn
 from .prop.types import PropOps, PropState, QmcParams, QmcParamsBase, QmcParamsFp
+from .runtime_layout import QmcRuntime
 from .stat_utils import (
     blocking_analysis_components,
     blocking_analysis_ratio,
@@ -854,7 +856,7 @@ def run_qmc(
     *,
     sys: System,
     params: QmcParams,
-    ham_data: Any,
+    ham_data: Any = None,
     trial_data: Any,
     meas_ops: MeasOps,
     trial_ops: TrialOps,
@@ -866,15 +868,27 @@ def run_qmc(
     target_error: float | None = None,
     mesh: Mesh | None = None,
     observable_names: tuple[str, ...] = (),
+    runtime: QmcRuntime | None = None,
 ) -> QmcResult:
     """
     equilibration blocks then sampling blocks.
+
+    ``runtime`` transfers ownership of Hamiltonian/context replacements; normal
+    Jobs supply it automatically. Separate array arguments are borrowed, so
+    automatic Cholesky redistribution is disabled for that calling convention.
 
     Returns:
       QmcResult with energy statistics plus block-level observable estimates.
     """
     for name in observable_names:
         meas_ops.require_observable(name)
+
+    if runtime is not None:
+        ham_data, prop_ctx, (meas_ctx,) = runtime.inputs(
+            ham_data=ham_data, prop_ctx=prop_ctx, contexts=(meas_ctx,),
+            retune=meas_ops.retune_block_energy is not None,
+            local_sampling=params.local_cholesky_sampling,
+        )
 
     # build ctx
     if prop_ctx is None:
@@ -892,6 +906,16 @@ def run_qmc(
             meas_ctx=meas_ctx,
             mesh=mesh,
         )
+
+    def prepare_sampling():
+        nonlocal ham_data, prop_ctx, meas_ctx
+        ham_data, prop_ctx, (meas_ctx,) = prepare_local_cholesky_sampling(
+            ham_data, prop_ctx, (meas_ctx,),
+            enabled=params.local_cholesky_sampling, runtime=runtime,
+        )
+
+    if meas_ops.retune_block_energy is None:
+        prepare_sampling()
 
     if mesh is None or mesh.size == 1:
         block_fn_sr = block_fn
@@ -997,6 +1021,9 @@ def run_qmc(
             n_chunks=retuned.initial_n_chunks,
             n_eql_blocks=retuned.settling_blocks,
         )
+        settling_blocks = retuned.settling_blocks
+        del retuned  # Do not retain the pre-redistribution measurement arrays.
+        prepare_sampling()
         params, run_blocks = _make_run_blocks_with_auto_chunks(
             block_fn=block_fn_sr,
             sys=sys,
@@ -1012,11 +1039,11 @@ def run_qmc(
             observable_names=observable_names,
         )
 
-        if retuned.settling_blocks > 0:
-            print(f"\nPost-tuning settling: {retuned.settling_blocks} blocks")
-            settling_chunk = max(1, retuned.settling_blocks // 5)
-            for start in range(0, retuned.settling_blocks, settling_chunk):
-                n = min(settling_chunk, retuned.settling_blocks - start)
+        if settling_blocks > 0:
+            print(f"\nPost-tuning settling: {settling_blocks} blocks")
+            settling_chunk = max(1, settling_blocks // 5)
+            for start in range(0, settling_blocks, settling_chunk):
+                n = min(settling_chunk, settling_blocks - start)
                 start_batch = time.perf_counter()
                 state, scalars_chunk, obs_chunk = run_blocks(
                     state,
@@ -1031,7 +1058,7 @@ def run_qmc(
                 for i, name in enumerate(observable_names):
                     block_obs_eq[name].append(obs_chunk[i])
                 print(
-                    f"[settle {start + n:4d}/{retuned.settling_blocks}]  "
+                    f"[settle {start + n:4d}/{settling_blocks}]  "
                     f"E={float(jnp.mean(scalars_chunk['energy'])):14.10f}  "
                     f"dt={(time.perf_counter() - start_batch) / n:.3f} s/block"
                 )
@@ -1254,7 +1281,7 @@ def run_mixed_estimator_qmc(
     *,
     sys: System,
     params: QmcParams,
-    ham_data: Any,
+    ham_data: Any = None,
     guide_data: Any,
     guide_ops: TrialOps,
     guide_prop_ops: PropOps,
@@ -1269,6 +1296,7 @@ def run_mixed_estimator_qmc(
     target_error: float | None = None,
     estimator_outlier_zeta: float | None = 20.0,
     mesh: Mesh | None = None,
+    runtime: QmcRuntime | None = None,
 ) -> MixedEstimatorQmcResult:
     """Run one guide trajectory and evaluate arbitrary projected components.
 
@@ -1287,12 +1315,26 @@ def run_mixed_estimator_qmc(
     default, the reported projected estimate also applies the historical
     PT2-CCSD block cleanup at ``zeta=20``. Raw block arrays are retained in the
     result, together with the proxy energies and keep mask.
+
+    Use ``runtime=QmcRuntime(...)`` (or ``job.prepare_runtime()``) to let the
+    driver replace Cholesky-indexed inputs without retaining the old layout.
+    Separate Hamiltonian/context arguments remain borrowed and use the global
+    sampler unless a local layout was explicitly installed beforehand.
     """
 
     if params.n_blocks <= 0:
         raise ValueError("QmcParams.n_blocks must be positive.")
     if params.n_eql_blocks < 0:
         raise ValueError("QmcParams.n_eql_blocks must be nonnegative.")
+
+    if runtime is not None:
+        ham_data, guide_prop_ctx, (guide_meas_ctx, estimator_ctx) = runtime.inputs(
+            ham_data=ham_data, prop_ctx=guide_prop_ctx,
+            contexts=(guide_meas_ctx, estimator_ctx),
+            retune=(guide_meas_ops.retune_block_energy is not None
+                    or estimator_ops.retune_block_components is not None),
+            local_sampling=params.local_cholesky_sampling,
+        )
 
     if guide_prop_ctx is None:
         guide_prop_ctx = guide_prop_ops.build_prop_ctx(
@@ -1315,6 +1357,16 @@ def run_mixed_estimator_qmc(
             meas_ctx=guide_meas_ctx,
             mesh=mesh,
         )
+
+    def prepare_sampling():
+        nonlocal ham_data, guide_prop_ctx, guide_meas_ctx, estimator_ctx
+        ham_data, guide_prop_ctx, (guide_meas_ctx, estimator_ctx) = prepare_local_cholesky_sampling(
+            ham_data, guide_prop_ctx, (guide_meas_ctx, estimator_ctx),
+            enabled=params.local_cholesky_sampling, runtime=runtime,
+        )
+
+    if guide_meas_ops.retune_block_energy is None and estimator_ops.retune_block_components is None:
+        prepare_sampling()
 
     if mesh is None or mesh.size == 1:
         mixed_block_fn_sr = mixed_block_fn
@@ -1485,12 +1537,16 @@ def run_mixed_estimator_qmc(
             n_chunks=retuned.initial_n_chunks,
             n_eql_blocks=retuned.settling_blocks,
         )
+        settling_blocks = retuned.settling_blocks
+        del retuned
+        if estimator_ops.retune_block_components is None:
+            prepare_sampling()
         params, run_blocks = build_blocks(params, state, guide_meas_ctx, estimator_ctx)
-        if retuned.settling_blocks > 0:
-            print(f"\nPost-tuning settling: {retuned.settling_blocks} blocks")
-            settling_chunk = max(1, retuned.settling_blocks // 5)
-            for start in range(0, retuned.settling_blocks, settling_chunk):
-                n = min(settling_chunk, retuned.settling_blocks - start)
+        if settling_blocks > 0:
+            print(f"\nPost-tuning settling: {settling_blocks} blocks")
+            settling_chunk = max(1, settling_blocks // 5)
+            for start in range(0, settling_blocks, settling_chunk):
+                n = min(settling_chunk, settling_blocks - start)
                 batch_started = time.perf_counter()
                 state, scalars_chunk = advance(state, n)
                 guide_energy_chunk = _weighted_block_mean(
@@ -1502,7 +1558,7 @@ def run_mixed_estimator_qmc(
                     scalars_chunk["estimator_components"],
                 )
                 print(
-                    f"[settle {start + n:4d}/{retuned.settling_blocks}]  "
+                    f"[settle {start + n:4d}/{settling_blocks}]  "
                     f"{shift_energy_label}_E={float(guide_energy_chunk):14.10f}  "
                     f"Estimator_E={estimator_energy_chunk:14.10f}  "
                     f"dt={(time.perf_counter() - batch_started) / n:.3f} s/block"
@@ -1540,15 +1596,18 @@ def run_mixed_estimator_qmc(
             n_chunks=estimator_retuned.initial_n_chunks,
             n_eql_blocks=estimator_retuned.settling_blocks,
         )
+        settling_blocks = estimator_retuned.settling_blocks
+        del estimator_retuned
+        prepare_sampling()
         params, run_blocks = build_blocks(params, state, guide_meas_ctx, estimator_ctx)
-        if estimator_retuned.settling_blocks > 0:
+        if settling_blocks > 0:
             print(
                 "\nPost-estimator-tuning settling: "
-                f"{estimator_retuned.settling_blocks} blocks"
+                f"{settling_blocks} blocks"
             )
-            settling_chunk = max(1, estimator_retuned.settling_blocks // 5)
-            for start in range(0, estimator_retuned.settling_blocks, settling_chunk):
-                n = min(settling_chunk, estimator_retuned.settling_blocks - start)
+            settling_chunk = max(1, settling_blocks // 5)
+            for start in range(0, settling_blocks, settling_chunk):
+                n = min(settling_chunk, settling_blocks - start)
                 batch_started = time.perf_counter()
                 state, scalars_chunk = advance(state, n)
                 guide_energy_chunk = _weighted_block_mean(
@@ -1561,7 +1620,7 @@ def run_mixed_estimator_qmc(
                 )
                 print(
                     f"[estimator settle "
-                    f"{start + n:4d}/{estimator_retuned.settling_blocks}]  "
+                    f"{start + n:4d}/{settling_blocks}]  "
                     f"{shift_energy_label}_E={float(guide_energy_chunk):14.10f}  "
                     f"Estimator_E={estimator_energy_chunk:14.10f}  "
                     f"dt={(time.perf_counter() - batch_started) / n:.3f} s/block"

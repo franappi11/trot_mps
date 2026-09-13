@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from functools import partial
-from typing import Any, ClassVar, Protocol
+from typing import Any, Callable, ClassVar, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -43,6 +43,48 @@ class PreparedRuntime:
     state: PropState
     meas_ctx: object
     prop_ctx: object
+
+
+@dataclass
+class QmcRuntime:
+    """Owned runtime inputs that a driver can replace after sampler tuning.
+
+    Pass this object instead of separate Hamiltonian/context arguments when
+    the driver should redistribute Choleskies. Keep this owner, rather than
+    separate references to its old arrays, to allow those buffers to be freed.
+    ``on_update`` lets a Job keep its cached inputs consistent with the owner.
+    """
+
+    ham_data: Any
+    prop_ctx: Any = None
+    meas_ctx: Any = None
+    estimator_ctx: Any = None
+    on_update: Callable[[QmcRuntime], None] | None = field(default=None, repr=False)
+
+    def update(self, ham_data, prop_ctx, contexts):
+        self.ham_data = ham_data
+        self.prop_ctx = prop_ctx
+        self.meas_ctx = contexts[0]
+        self.estimator_ctx = contexts[1] if len(contexts) == 2 else None
+        if self.on_update is not None:
+            self.on_update(self)
+
+    def inputs(self, *, ham_data, prop_ctx, contexts, retune=False, local_sampling=True):
+        if ham_data is not None or prop_ctx is not None or any(c is not None for c in contexts):
+            raise ValueError("Pass runtime or separate Hamiltonian/context inputs, not both.")
+        owned_contexts = (self.meas_ctx,)
+        if len(contexts) == 2:
+            owned_contexts += (self.estimator_ctx,)
+        if retune or not local_sampling:
+            # A repeated run may tune again on the current physical ordering.
+            # Clear both samplers' frozen metadata before either tuning stage.
+            owned_contexts = tuple(
+                replace(c, model_sampling=None)
+                if getattr(c, "model_sampling", None) is not None else c
+                for c in owned_contexts
+            )
+            self.update(self.ham_data, self.prop_ctx, owned_contexts)
+        return self.ham_data, self.prop_ctx, owned_contexts
 
 
 class RuntimeJob(Protocol):
