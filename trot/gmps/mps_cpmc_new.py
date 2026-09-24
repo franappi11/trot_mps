@@ -70,6 +70,13 @@ class Config:
     occupation_tolerance: float = 1.0e-10
     walker_channel_chi: int | None = 4
     walker_cutoff: float = 0.0
+    # Determinant whose dry run freezes the per-sector kept counts (plan_bonds):
+    # "rhf" is the free-fermion determinant, "natural" the trial's natural orbitals.
+    # The orbital plan (gate circuit) is always built on the RHF determinant.
+    bond_reference: str = "rhf"  # rhf, natural
+    # Determinant every walker starts from. "natural" follows trot's convention
+    # (natural orbitals of the trial's one-body density matrix).
+    walker_start: str = "natural"  # natural, rhf
     n_walkers: int = 32
     n_blocks: int = 40
     n_equilibration: int = 15
@@ -494,6 +501,42 @@ def plan_bonds(C, orbital_plan, chi_max=None, cutoff=0.0) -> BondPlan:
         centre = site + 1
 
     return BondPlan(tuple(kept_all), tuple(charges), max(map(len, charges)), discarded)
+
+
+def one_rdm(tensors):
+    """Spin-resolved one-body density matrices <c^dag_i,sigma c_j,sigma> of a real
+    d=4 MPS in the interleaved (alpha before beta on each site) ordering."""
+    create_a = np.zeros((4, 4)); create_a[1, 0] = create_a[3, 2] = 1.0
+    create_b = np.zeros((4, 4)); create_b[2, 0] = 1.0; create_b[3, 1] = -1.0
+    parity_a, parity_b = np.diag([1.0, -1.0, 1.0, -1.0]), np.diag([1.0, 1.0, -1.0, -1.0])
+    operators = {"a": (create_a @ parity_b, create_a.T, np.diag([0.0, 1.0, 0.0, 1.0])),
+                 "b": (parity_a @ create_b, create_b.T, np.diag([0.0, 0.0, 1.0, 1.0]))}
+    A = [np.asarray(t) for t in tensors]
+    L = len(A)
+    site = lambda E, x, O: np.einsum("ab,apc,pq,bqd->cd", E, A[x], O, A[x], optimize=True)
+    left = [np.ones((1, 1))]
+    for x in range(L):
+        left.append(site(left[-1], x, np.eye(4)))
+    right = [np.ones((1, 1))]
+    for x in range(L - 1, -1, -1):
+        right.insert(0, np.einsum("apc,bpd,cd->ab", A[x], A[x], right[0], optimize=True))
+    gammas = []
+    for create_i, annihilate_j, number in operators.values():
+        gamma = np.zeros((L, L))
+        for i in range(L):
+            gamma[i, i] = np.sum(site(left[i], i, number) * right[i + 1])
+            E = site(left[i], i, create_i)
+            for j in range(i + 1, L):
+                gamma[i, j] = gamma[j, i] = np.sum(site(E, j, annihilate_j) * right[j + 1])
+                E = site(E, j, parity_a @ parity_b)  # Jordan-Wigner string between i and j
+        gammas.append(gamma / left[-1][0, 0])
+    return tuple(gammas)
+
+
+def natural_orbitals(gamma, n):
+    """The n most occupied natural orbitals and all occupations, descending."""
+    occupations, vectors = np.linalg.eigh(gamma)
+    return vectors[:, ::-1][:, :n].copy(), occupations[::-1]
 
 
 def contract_real(left_mps, right_mps):
@@ -934,7 +977,11 @@ def run_qmc_fixed_chunks(*, sys, params, ham_data, trial_data, meas_ops, trial_o
     """trot's run_qmc with one chunk size for both phases, gcd(n_eql, n_blocks),
     so the jitted block scan compiles once instead of once per chunk size.
     Same initialisation, block function, outlier rejection and blocking analysis.
-    Returns (mean, stderr, block energies, block weights), all blocks unfiltered."""
+    Stops early if the population collapses (total weight zero: every walker was
+    killed, and reconfiguration cannot bring it back).
+    Returns (mean, stderr, block energies, block weights, collapsed_after_block), all
+    blocks unfiltered; mean and stderr are NaN and collapsed_after_block is set if it
+    collapsed, otherwise collapsed_after_block is None."""
     prop_ctx = prop_ops.build_prop_ctx(ham_data, trial_ops.get_rdm1(trial_data), params)
     meas_ctx = meas_ops.build_meas_ctx(ham_data, trial_data)
     state = prop_ops.init_prop_state(sys=sys, ham_data=ham_data, trial_ops=trial_ops,
@@ -943,7 +990,7 @@ def run_qmc_fixed_chunks(*, sys, params, ham_data, trial_data, meas_ops, trial_o
                                  meas_ops=meas_ops, prop_ops=prop_ops)
     n_eql, total = params.n_eql_blocks, params.n_eql_blocks + params.n_blocks
     chunk = math.gcd(n_eql, params.n_blocks)
-    energies, weights, start = [], [], time.perf_counter()
+    energies, weights, start, collapsed = [], [], time.perf_counter(), None
     for done in range(chunk, total + 1, chunk):
         state, scalars, _ = run_blocks(state, ham_data=ham_data, trial_data=trial_data,
                                        meas_ctx=meas_ctx, prop_ctx=prop_ctx, n_blocks=chunk)
@@ -953,12 +1000,18 @@ def run_qmc_fixed_chunks(*, sys, params, ham_data, trial_data, meas_ops, trial_o
         print(f"[{'eql' if done <= n_eql else 'blk'} {done:4d}/{total}]  E_chunk {np.sum(e * w) / np.sum(w):14.10f}"
               f"  W {w.mean():12.6e}  nodes {int(state.node_encounters):10d}"
               f"  t {time.perf_counter() - start:8.1f} s", flush=True)
+        if not w[-1] > 0.0:
+            collapsed = done
+            print(f"\nPopulation collapsed: total weight is zero after block {done}. Stopping.", flush=True)
+            break
 
+    if collapsed is not None:
+        return float("nan"), float("nan"), np.asarray(energies), np.asarray(weights), collapsed
     sampled = np.column_stack((energies[n_eql:], weights[n_eql:]))
     clean, _ = reject_outliers(sampled, obs=0)
     print(f"\nRejected {len(sampled) - len(clean)} outlier blocks.\n\nFinal blocking analysis:")
     stats = blocking_analysis_ratio(np.asarray(clean[:, 0]), np.asarray(clean[:, 1]), print_q=True)
-    return stats["mu"], stats["se_star"], np.asarray(energies), np.asarray(weights)
+    return stats["mu"], stats["se_star"], np.asarray(energies), np.asarray(weights), None
 
 
 def save_result(path, record):
@@ -973,12 +1026,12 @@ def main(cfg=CFG):
     h1 = hopping_matrix(cfg.L, cfg.hopping)
     ham = HamHubbard(h1=jnp.asarray(h1), u=cfg.interaction)
     system = System(norb=cfg.L, nelec=(cfg.n_up, cfg.n_down), walker_kind="unrestricted")
-    orbital_energies, orbitals = np.linalg.eigh(h1)
+    for option in ("bond_reference", "walker_start"):
+        if getattr(cfg, option) not in ("rhf", "natural"):
+            raise ValueError(f"{option} must be 'rhf' or 'natural'")
+    _, orbitals = np.linalg.eigh(h1)
     Ca, Cb = orbitals[:, :cfg.n_up].copy(), orbitals[:, :cfg.n_down].copy()
-    initial_energy = (orbital_energies[:cfg.n_up].sum() + orbital_energies[:cfg.n_down].sum()
-                      + cfg.interaction * sum((Ca[i] @ Ca[i]) * (Cb[i] @ Cb[i]) for i in range(cfg.L)))
-    trial_data = UhfTrial(mo_coeff_a=jnp.asarray(Ca), mo_coeff_b=jnp.asarray(Cb))
-    print(f"L={cfg.L} ({cfg.n_up},{cfg.n_down}), U={cfg.interaction}, initial determinant E={initial_energy:.12f}")
+    print(f"L={cfg.L} ({cfg.n_up},{cfg.n_down}), U={cfg.interaction}")
 
     hamiltonian = build_dmrg_hamiltonian(cfg)
     dmrg_mps, dmrg_energy = run_dmrg(hamiltonian, cfg)
@@ -996,11 +1049,35 @@ def main(cfg=CFG):
     plan_a = make_orbital_plan(Ca, cfg.orbital_plan, cfg.occupation_tolerance)
     plan_b = make_orbital_plan(Cb, cfg.orbital_plan, cfg.occupation_tolerance)
 
-    bond_a = bond_b = None
+    determinants = {"rhf": (Ca, Cb)}
+    if "natural" in (cfg.bond_reference, cfg.walker_start):
+        gamma_a, gamma_b = one_rdm(trial_np)
+        np.testing.assert_allclose([np.trace(gamma_a), np.trace(gamma_b)], [cfg.n_up, cfg.n_down], atol=1e-8)
+        Na, occupations = natural_orbitals(gamma_a, cfg.n_up)
+        Nb, _ = natural_orbitals(gamma_b, cfg.n_down)
+        determinants["natural"] = (Na, Nb)
+        # The orbital plan is built on RHF; |gauge|^2 is the fidelity it keeps for this determinant.
+        def plan_fidelity(R, plan):
+            _, rows = channel_angles(R, plan, xp=np)
+            return float(np.linalg.det(np.stack([rows[i] for i in np.flatnonzero(plan.occupation)]))) ** 2
+        print(f"trial natural orbitals: alpha gap n_N - n_N+1 = {occupations[cfg.n_up - 1] - occupations[cfg.n_up]:.3f}; "
+              f"orbital-plan infidelity {1 - plan_fidelity(Na, plan_a):.1e}, {1 - plan_fidelity(Nb, plan_b):.1e}")
+    Ra, Rb = determinants[cfg.bond_reference]
 
+    # trot starts every walker from the natural orbitals of trial_ops.get_rdm1(trial_data);
+    # trial_data is only a placeholder here (the MPS trial lives in the walker ops), so
+    # its orbitals choose the starting determinant.
+    Sa, Sb = determinants[cfg.walker_start]
+    trial_data = UhfTrial(mo_coeff_a=jnp.asarray(Sa), mo_coeff_b=jnp.asarray(Sb))
+    Pa, Pb = Sa @ Sa.T, Sb @ Sb.T
+    initial_energy = float(np.sum(h1 * (Pa + Pb)) + cfg.interaction * np.diag(Pa) @ np.diag(Pb))
+    print(f"bond reference: {cfg.bond_reference}; walkers start from the {cfg.walker_start} determinant, "
+          f"E={initial_energy:.12f}")
+
+    bond_a = bond_b = None
     if cfg.walker_channel_chi is not None or cfg.walker_cutoff:
-        bond_a = plan_bonds(Ca, plan_a, cfg.walker_channel_chi, cfg.walker_cutoff)
-        bond_b = plan_bonds(Cb, plan_b, cfg.walker_channel_chi, cfg.walker_cutoff)
+        bond_a = plan_bonds(Ra, plan_a, cfg.walker_channel_chi, cfg.walker_cutoff)
+        bond_b = plan_bonds(Rb, plan_b, cfg.walker_channel_chi, cfg.walker_cutoff)
         print(f"walker truncation reference discarded weights: {bond_a.reference_discarded_weight:.3e}, "
               f"{bond_b.reference_discarded_weight:.3e}")
 
@@ -1023,7 +1100,7 @@ def main(cfg=CFG):
         block_fn = make_block_logger(cfg.block_log, cfg.n_equilibration, cfg.tag)
 
     start = time.perf_counter()
-    mean, error, block_energies, block_weights = run_qmc_fixed_chunks(
+    mean, error, block_energies, block_weights, collapsed = run_qmc_fixed_chunks(
         sys=system, params=params, ham_data=ham, trial_data=trial_data,
         meas_ops=measurement, trial_ops=trial_ops, prop_ops=prop_ops,
         block_fn=block_fn)
@@ -1035,7 +1112,7 @@ def main(cfg=CFG):
     record.update(
         kind="mps", initial_energy=float(initial_energy), dmrg_energy=dmrg_energy,
         trial_energy=trial_energy, cpmc_energy=scalar(mean), cpmc_error=scalar(error),
-        seconds=elapsed, walker_d4_chi=max(map(len, ops.walker_charges)),
+        seconds=elapsed, walker_d4_chi=max(map(len, ops.walker_charges)), collapsed_after_block=collapsed,
         gates=int(plan_a.block_sizes.sum() - len(plan_a.block_sizes)))
     save_result(cfg.result_json, record)
 

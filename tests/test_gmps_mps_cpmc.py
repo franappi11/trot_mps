@@ -107,6 +107,24 @@ def _exact_energy(model, ca, cb):
     return (da @ model.hamp @ db) / (da @ model.amp @ db)
 
 
+def test_one_rdm_matches_enumeration(model):
+    """one_rdm of the trial against <c^dag_i c_j> built from its determinant amplitudes."""
+    index = {tuple(o): k for k, o in enumerate(model.occ)}
+    hop = np.zeros((L, L, len(model.occ), len(model.occ)))  # <a|c^dag_i c_j|a'>
+    for k, o in enumerate(model.occ):
+        for j in np.flatnonzero(o):
+            removed = o.copy(); removed[j] = 0
+            for i in np.flatnonzero(removed == 0):
+                added = removed.copy(); added[i] = 1
+                hop[i, j, index[tuple(added)], k] = (-1) ** (o[:j].sum() + removed[:i].sum())
+    amp = model.amp / np.linalg.norm(model.amp)
+    gamma_a = np.einsum("ab,ijac,cb->ij", amp, hop, amp)
+    gamma_b = np.einsum("ba,ijac,bc->ij", amp, hop, amp)
+    got_a, got_b = m.one_rdm(model.trial_np)
+    np.testing.assert_allclose(got_a, gamma_a, atol=1e-10)
+    np.testing.assert_allclose(got_b, gamma_b, atol=1e-10)
+
+
 @pytest.mark.parametrize("mode,tol", [("rank_exact", 1e-12), ("maximal", 1e-12), ("adaptive", 1e-8)])
 def test_channel_conversion_is_exact(model, mode, tol):
     """Without truncation the channel MPS times the gauge reproduces every determinant."""
