@@ -70,10 +70,10 @@ class Config:
     occupation_tolerance: float = 1.0e-10
     walker_channel_chi: int | None = 4
     walker_cutoff: float = 0.0
-    # Determinant whose dry run freezes the per-sector kept counts (plan_bonds):
-    # "rhf" is the free-fermion determinant, "natural" the trial's natural orbitals.
-    # The orbital plan (gate circuit) is always built on the RHF determinant.
-    bond_reference: str = "rhf"  # rhf, natural
+    # Determinant that freezes the static structure: the gate circuit (make_orbital_plan)
+    # and the per-sector kept counts (plan_bonds). "natural" is the determinant of the
+    # trial's most occupied natural orbitals, "rhf" the free-fermion determinant.
+    plan_reference: str = "natural"  # natural, rhf
     # Determinant every walker starts from. "natural" follows trot's convention
     # (natural orbitals of the trial's one-body density matrix).
     walker_start: str = "natural"  # natural, rhf
@@ -1026,7 +1026,7 @@ def main(cfg=CFG):
     h1 = hopping_matrix(cfg.L, cfg.hopping)
     ham = HamHubbard(h1=jnp.asarray(h1), u=cfg.interaction)
     system = System(norb=cfg.L, nelec=(cfg.n_up, cfg.n_down), walker_kind="unrestricted")
-    for option in ("bond_reference", "walker_start"):
+    for option in ("plan_reference", "walker_start"):
         if getattr(cfg, option) not in ("rhf", "natural"):
             raise ValueError(f"{option} must be 'rhf' or 'natural'")
     _, orbitals = np.linalg.eigh(h1)
@@ -1046,23 +1046,21 @@ def main(cfg=CFG):
     print("trial bonds:", [A.shape[0] for A in trial] + [trial[-1].shape[-1]])
     print("H|trial> compressed bonds:", [A.shape[0] for A in Htrial] + [Htrial[-1].shape[-1]])
 
-    plan_a = make_orbital_plan(Ca, cfg.orbital_plan, cfg.occupation_tolerance)
-    plan_b = make_orbital_plan(Cb, cfg.orbital_plan, cfg.occupation_tolerance)
-
     determinants = {"rhf": (Ca, Cb)}
-    if "natural" in (cfg.bond_reference, cfg.walker_start):
+    if "natural" in (cfg.plan_reference, cfg.walker_start):
         gamma_a, gamma_b = one_rdm(trial_np)
         np.testing.assert_allclose([np.trace(gamma_a), np.trace(gamma_b)], [cfg.n_up, cfg.n_down], atol=1e-8)
         Na, occupations = natural_orbitals(gamma_a, cfg.n_up)
         Nb, _ = natural_orbitals(gamma_b, cfg.n_down)
         determinants["natural"] = (Na, Nb)
-        # The orbital plan is built on RHF; |gauge|^2 is the fidelity it keeps for this determinant.
-        def plan_fidelity(R, plan):
-            _, rows = channel_angles(R, plan, xp=np)
-            return float(np.linalg.det(np.stack([rows[i] for i in np.flatnonzero(plan.occupation)]))) ** 2
-        print(f"trial natural orbitals: alpha gap n_N - n_N+1 = {occupations[cfg.n_up - 1] - occupations[cfg.n_up]:.3f}; "
-              f"orbital-plan infidelity {1 - plan_fidelity(Na, plan_a):.1e}, {1 - plan_fidelity(Nb, plan_b):.1e}")
-    Ra, Rb = determinants[cfg.bond_reference]
+        print(f"trial natural orbitals: alpha gap n_N - n_N+1 = {occupations[cfg.n_up - 1] - occupations[cfg.n_up]:.3f}")
+
+    # Gate circuit and kept counts are both frozen on the plan reference.
+    Ra, Rb = determinants[cfg.plan_reference]
+    plan_a = make_orbital_plan(Ra, cfg.orbital_plan, cfg.occupation_tolerance)
+    plan_b = make_orbital_plan(Rb, cfg.orbital_plan, cfg.occupation_tolerance)
+    gates = lambda plan: int(plan.block_sizes.sum() - len(plan.block_sizes))
+    print(f"plan reference: {cfg.plan_reference} determinant; gates {gates(plan_a)}, {gates(plan_b)}")
 
     # trot starts every walker from the natural orbitals of trial_ops.get_rdm1(trial_data);
     # trial_data is only a placeholder here (the MPS trial lives in the walker ops), so
@@ -1071,8 +1069,13 @@ def main(cfg=CFG):
     trial_data = UhfTrial(mo_coeff_a=jnp.asarray(Sa), mo_coeff_b=jnp.asarray(Sb))
     Pa, Pb = Sa @ Sa.T, Sb @ Sb.T
     initial_energy = float(np.sum(h1 * (Pa + Pb)) + cfg.interaction * np.diag(Pa) @ np.diag(Pb))
-    print(f"bond reference: {cfg.bond_reference}; walkers start from the {cfg.walker_start} determinant, "
-          f"E={initial_energy:.12f}")
+
+    # |gauge|^2 is the fidelity the orbital plan keeps for a determinant (1 for the plan reference).
+    def plan_fidelity(S, plan):
+        _, rows = channel_angles(S, plan, xp=np)
+        return float(np.linalg.det(np.stack([rows[i] for i in np.flatnonzero(plan.occupation)]))) ** 2
+    print(f"walkers start from the {cfg.walker_start} determinant, E={initial_energy:.12f}; orbital-plan infidelity "
+          f"{1 - plan_fidelity(Sa, plan_a):.1e}, {1 - plan_fidelity(Sb, plan_b):.1e}")
 
     bond_a = bond_b = None
     if cfg.walker_channel_chi is not None or cfg.walker_cutoff:
@@ -1081,7 +1084,7 @@ def main(cfg=CFG):
         print(f"walker truncation reference discarded weights: {bond_a.reference_discarded_weight:.3e}, "
               f"{bond_b.reference_discarded_weight:.3e}")
 
-    ops = make_walker_ops(Ca, Cb, plan_a, plan_b, bond_a, bond_b, trial_np, trial_charges, Htrial)
+    ops = make_walker_ops(Ra, Rb, plan_a, plan_b, bond_a, bond_b, trial_np, trial_charges, Htrial)
     report = contraction_report(ops.overlap_plan)
     print("walker bonds:", [len(q) for q in ops.walker_charges])
     print("overlap environment entries:", report,
@@ -1113,7 +1116,7 @@ def main(cfg=CFG):
         kind="mps", initial_energy=float(initial_energy), dmrg_energy=dmrg_energy,
         trial_energy=trial_energy, cpmc_energy=scalar(mean), cpmc_error=scalar(error),
         seconds=elapsed, walker_d4_chi=max(map(len, ops.walker_charges)), collapsed_after_block=collapsed,
-        gates=int(plan_a.block_sizes.sum() - len(plan_a.block_sizes)))
+        gates=gates(plan_a))
     save_result(cfg.result_json, record)
 
 
