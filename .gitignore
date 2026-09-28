@@ -7,6 +7,7 @@ __pycache__/
 
 # Output files
 runs/
+*.npz
 
 # OS
 .DS_Store
