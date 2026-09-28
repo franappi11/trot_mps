@@ -13,7 +13,8 @@
 # sbatch options go before a "--" separator:
 #   ./submit_mps_sweep.sh --time=2-00:00:00 --cpus-per-task=8 -- --L 48 --chi-w 2 4
 #
-# REF_CHI=N sets the DMRG reference bond dimension (default 200); NO_REF=1
+# REF_CHI=N sets the DMRG reference bond dimension (default 200) and REF_MEM its
+# memory (default 64G; chi=200 at L=48 was OOM-killed with the default); NO_REF=1
 # skips the reference jobs (e.g. when reference.jsonl already has them).
 # DRY_RUN=1 prints the sbatch commands instead of submitting them.
 # PYTHON=/path/to/python is forwarded to the jobs (see run_mps_sweep.sh).
@@ -32,6 +33,13 @@ while (($#)); do
         --L|--U|--chi-w)
             opt="$1"; shift; vals=()
             while (($#)) && [[ "$1" != --* ]]; do vals+=("$1"); shift; done
+            # Catch typos like "12--chi-w" and repeated values before anything is submitted.
+            for v in "${vals[@]}"; do
+                [[ "$v" =~ ^[0-9]+([.][0-9]*)?$ ]] || { echo "error: $opt value '$v' is not a number" >&2; exit 1; }
+            done
+            if (( ${#vals[@]} == 0 )); then echo "error: $opt needs at least one value" >&2; exit 1; fi
+            dup=$(printf '%s\n' "${vals[@]}" | awk '{print $1 + 0}' | sort -g | uniq -d)
+            if [[ -n "$dup" ]]; then echo "error: $opt repeats $(echo $dup)" >&2; exit 1; fi
             case "$opt" in
                 --L) Ls=("${vals[@]}") ;;
                 --U) Us=("${vals[@]}") ;;
@@ -50,7 +58,7 @@ mkdir -p slurm "$out"
 for L in "${Ls[@]}"; do
     for U in "${Us[@]}"; do
         if [[ -z "$NO_REF" ]]; then
-            submit sbatch -J "ref_L${L}_U${U}" "${sbatch_opts[@]}" --export=ALL,TARGET=dmrg_reference.py \
+            submit sbatch -J "ref_L${L}_U${U}" --mem="${REF_MEM:-64G}" "${sbatch_opts[@]}" --export=ALL,TARGET=dmrg_reference.py \
                 run_mps_sweep.sh --L "$L" --U "$U" --chi "${REF_CHI:-200}" --out "$out/reference.jsonl"
         fi
         for w in "${chi_ws[@]}"; do
