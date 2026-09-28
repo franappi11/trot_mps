@@ -1,0 +1,84 @@
+L=32 (16,16), U=12.0
+MPO site   0 / 32 .. D = 6
+MPO site   1 / 32 .. D = 6
+MPO site   2 / 32 .. D = 6
+MPO site   3 / 32 .. D = 6
+MPO site   4 / 32 .. D = 6
+MPO site   5 / 32 .. D = 6
+MPO site   6 / 32 .. D = 6
+MPO site   7 / 32 .. D = 6
+MPO site   8 / 32 .. D = 6
+MPO site   9 / 32 .. D = 6
+MPO site  10 / 32 .. D = 6
+MPO site  11 / 32 .. D = 6
+MPO site  12 / 32 .. D = 6
+MPO site  13 / 32 .. D = 6
+MPO site  14 / 32 .. D = 6
+MPO site  15 / 32 .. D = 6
+MPO site  16 / 32 .. D = 6
+MPO site  17 / 32 .. D = 6
+MPO site  18 / 32 .. D = 6
+MPO site  19 / 32 .. D = 6
+MPO site  20 / 32 .. D = 6
+MPO site  21 / 32 .. D = 6
+MPO site  22 / 32 .. D = 6
+MPO site  23 / 32 .. D = 6
+MPO site  24 / 32 .. D = 6
+MPO site  25 / 32 .. D = 6
+MPO site  26 / 32 .. D = 6
+MPO site  27 / 32 .. D = 6
+MPO site  28 / 32 .. D = 6
+MPO site  29 / 32 .. D = 6
+MPO site  30 / 32 .. D = 6
+MPO site  31 / 32 .. D = 1
+DMRG Davidson energy=-7.013635787505; dense-MPS expectation=-7.011205631182
+trial bonds: [1, 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 1]
+H|trial> compressed bonds: [1, 4, 16, 36, 31, 38, 31, 37, 31, 37, 31, 37, 31, 37, 31, 37, 31, 37, 31, 37, 31, 37, 31, 37, 31, 37, 31, 38, 31, 36, 16, 4, 1]
+trial natural orbitals: alpha gap n_N - n_N+1 = 0.116
+plan reference: natural determinant; gates 162, 162
+walkers start from the natural determinant, E=57.158356260234; orbital-plan infidelity 2.6e-10, 2.6e-10
+walker truncation reference discarded weights: 5.864e-05, 5.864e-05
+walker bonds: [1, 4, 16, 36, 36, 36, 36, 36, 36, 36, 36, 36, 36, 36, 36, 36, 36, 36, 36, 36, 36, 36, 36, 36, 36, 36, 36, 36, 36, 36, 16, 4, 1]
+overlap environment entries: {'dense': 8066, 'exact_blocks': 868, 'padded_blocks': 1690, 'transitions': 456} dense/padded=4.77x
+E0925 00:29:08.766074  601760 slow_operation_alarm.cc:73] 
+********************************
+[Compiling module jit_run_blocks for CPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+E0925 00:29:53.810682  601441 slow_operation_alarm.cc:140] The operation took 2m45.044746408s
+
+********************************
+[Compiling module jit_run_blocks for CPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+[eql   20/260]  E_chunk  -7.0297903608  W 1.996277e+02  nodes          0  t   1012.1 s
+[eql   40/260]  E_chunk  -7.0582836266  W 2.003685e+02  nodes          0  t   1477.0 s
+[eql   60/260]  E_chunk  -7.0783617381  W 2.004999e+02  nodes          0  t   1942.2 s
+[blk   80/260]  E_chunk  -7.0626339573  W 1.999804e+02  nodes          0  t   2407.7 s
+[blk  100/260]  E_chunk  -7.0490396750  W 2.000818e+02  nodes          0  t   2873.5 s
+[blk  120/260]  E_chunk  -7.0508073471  W 2.001586e+02  nodes          0  t   3338.0 s
+[blk  140/260]  E_chunk  -7.0467610095  W 2.001397e+02  nodes          0  t   3801.8 s
+[blk  160/260]  E_chunk  -7.0566563130  W 2.002398e+02  nodes          0  t   4266.4 s
+[blk  180/260]  E_chunk  -7.0534074122  W 2.001267e+02  nodes          0  t   4731.0 s
+[blk  200/260]  E_chunk  -7.0685919569  W 2.002326e+02  nodes          0  t   5195.5 s
+[blk  220/260]  E_chunk  -7.0633669736  W 2.001056e+02  nodes          0  t   5659.8 s
+[blk  240/260]  E_chunk  -7.0524462866  W 2.000455e+02  nodes          0  t   6122.7 s
+[blk  260/260]  E_chunk  -7.0601825610  W 2.003527e+02  nodes          0  t   6586.5 s
+
+Rejected 0 outlier blocks.
+
+Final blocking analysis:
+mu: -7.056390081923729  SE*: 0.001820663049137503  95% CI: (-7.059958581500038, -7.052821582347419)
+
+Blocking SE curve (ratio LOO):
+      B      G             SE   SE/SE(B=1)
+      1    200   8.661736e-04        1.000
+      2    100   1.052410e-03        1.215
+      3     66   1.240737e-03        1.432
+      4     50   1.296176e-03        1.496
+      5     40   1.458968e-03        1.684
+      6     33   1.572750e-03        1.816
+      7     28   1.613329e-03        1.863
+      8     25   1.553415e-03        1.793
+*     9     22   1.820663e-03        2.102
+     10     20   1.703233e-03        1.966
+
+CPMC energy = -7.056390081923729 +/- 0.0018206630491375026; elapsed=6627.3 s

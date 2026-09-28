@@ -1,0 +1,40 @@
+job:    7104508 on worker5163
+python: /mnt/home/fnappi/.trot_venv/bin/python dmrg_reference.py
+args:   --L 32 --U 8 --chi 200 --out sweep_T8/reference.jsonl
+start:  Thu Sep 24 21:06:30 EDT 2026
+env: 3.11.11 jax 0.4.28 trot /mnt/home/fnappi/trot_mps/trot/__init__.py
+QC MPO site   0 / 32
+QC MPO site   1 / 32
+QC MPO site   2 / 32
+QC MPO site   3 / 32
+QC MPO site   4 / 32
+QC MPO site   5 / 32
+QC MPO site   6 / 32
+QC MPO site   7 / 32
+QC MPO site   8 / 32
+QC MPO site   9 / 32
+QC MPO site  10 / 32
+QC MPO site  11 / 32
+QC MPO site  12 / 32
+QC MPO site  13 / 32
+QC MPO site  14 / 32
+QC MPO site  15 / 32
+QC MPO site  16 / 32
+QC MPO site  17 / 32
+QC MPO site  18 / 32
+QC MPO site  19 / 32
+QC MPO site  20 / 32
+QC MPO site  21 / 32
+QC MPO site  22 / 32
+QC MPO site  23 / 32
+QC MPO site  24 / 32
+QC MPO site  25 / 32
+QC MPO site  26 / 32
+QC MPO site  27 / 32
+QC MPO site  28 / 32
+QC MPO site  29 / 32
+QC MPO site  30 / 32
+QC MPO site  31 / 32
+INTEL MKL ERROR: /mnt/home/fnappi/.trot_venv/lib/python3.11/site-packages/pyblock3.libs/libmkl_def.so.1: cannot open shared object file: No such file or directory.
+Intel MKL FATAL ERROR: Cannot load libmkl_def.so.1.
+finish: Thu Sep 24 21:09:40 EDT 2026  rc=2

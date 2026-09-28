@@ -1,0 +1,54 @@
+job:    7104540 on worker5187
+python: /mnt/home/fnappi/.trot_venv/bin/python dmrg_reference.py
+args:   --L 48 --U 2 --chi 200 --out sweep_T8/reference.jsonl
+start:  Thu Sep 24 21:06:32 EDT 2026
+env: 3.11.11 jax 0.4.28 trot /mnt/home/fnappi/trot_mps/trot/__init__.py
+QC MPO site   0 / 48
+QC MPO site   1 / 48
+QC MPO site   2 / 48
+QC MPO site   3 / 48
+QC MPO site   4 / 48
+QC MPO site   5 / 48
+QC MPO site   6 / 48
+QC MPO site   7 / 48
+QC MPO site   8 / 48
+QC MPO site   9 / 48
+QC MPO site  10 / 48
+QC MPO site  11 / 48
+QC MPO site  12 / 48
+QC MPO site  13 / 48
+QC MPO site  14 / 48
+QC MPO site  15 / 48
+QC MPO site  16 / 48
+QC MPO site  17 / 48
+QC MPO site  18 / 48
+QC MPO site  19 / 48
+QC MPO site  20 / 48
+QC MPO site  21 / 48
+QC MPO site  22 / 48
+QC MPO site  23 / 48
+QC MPO site  24 / 48
+QC MPO site  25 / 48
+QC MPO site  26 / 48
+QC MPO site  27 / 48
+QC MPO site  28 / 48
+QC MPO site  29 / 48
+QC MPO site  30 / 48
+QC MPO site  31 / 48
+QC MPO site  32 / 48
+QC MPO site  33 / 48
+QC MPO site  34 / 48
+QC MPO site  35 / 48
+QC MPO site  36 / 48
+QC MPO site  37 / 48
+QC MPO site  38 / 48
+QC MPO site  39 / 48
+QC MPO site  40 / 48
+QC MPO site  41 / 48
+QC MPO site  42 / 48
+QC MPO site  43 / 48
+QC MPO site  44 / 48
+QC MPO site  45 / 48
+QC MPO site  46 / 48
+QC MPO site  47 / 48
+[2026-09-24T21:16:33.711] error: *** JOB 7104540 ON worker5187 CANCELLED AT 2026-09-24T21:16:33 DUE to SIGNAL Terminated ***

@@ -1,0 +1,6 @@
+job:    7104545 on worker5197
+python: /mnt/home/fnappi/.trot_venv/bin/python run_mps_sweep.py
+args:   --L 48 --U 4 --chi-w 2 --trial-chi 8 --walkers 200 --eql 60 --blocks 200 --out sweep_T8
+start:  Thu Sep 24 21:06:31 EDT 2026
+env: 3.11.11 jax 0.4.28 trot /mnt/home/fnappi/trot_mps/trot/__init__.py
+[2026-09-24T21:16:30.305] error: *** JOB 7104545 ON worker5197 CANCELLED AT 2026-09-24T21:16:30 DUE to SIGNAL Terminated ***

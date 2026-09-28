@@ -1,0 +1,19 @@
+job:    7104946 on worker5163
+python: /mnt/home/fnappi/.trot_venv/bin/python dmrg_reference.py
+args:   --L 8 --U 4 --chi 20 --out mkltest.jsonl
+start:  Thu Sep 24 22:37:11 EDT 2026
+MPO site   0 / 4 .. D = 6
+MPO site   1 / 4 .. D = 6
+MPO site   2 / 4 .. D = 6
+MPO site   3 / 4 .. D = 1
+env: 3.11.11 jax 0.4.28 trot /mnt/home/fnappi/trot_mps/trot/__init__.py mkl ok, L=4 DMRG -1.9531453087
+MPO site   0 / 8 .. D = 6
+MPO site   1 / 8 .. D = 6
+MPO site   2 / 8 .. D = 6
+MPO site   3 / 8 .. D = 6
+MPO site   4 / 8 .. D = 6
+MPO site   5 / 8 .. D = 6
+MPO site   6 / 8 .. D = 6
+MPO site   7 / 8 .. D = 1
+{"L": 8, "U": 4.0, "chi": 20, "sweeps": 20, "e_davidson": -4.235102959575794, "e_variational": -4.234506922795068, "bond_dims": [1, 4, 16, 20, 20, 20, 16, 4], "seconds": 1.5521304607391357}
+finish: Thu Sep 24 22:37:19 EDT 2026  rc=0

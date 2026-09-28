@@ -1,0 +1,100 @@
+L=48 (24,24), U=12.0
+MPO site   0 / 48 .. D = 6
+MPO site   1 / 48 .. D = 6
+MPO site   2 / 48 .. D = 6
+MPO site   3 / 48 .. D = 6
+MPO site   4 / 48 .. D = 6
+MPO site   5 / 48 .. D = 6
+MPO site   6 / 48 .. D = 6
+MPO site   7 / 48 .. D = 6
+MPO site   8 / 48 .. D = 6
+MPO site   9 / 48 .. D = 6
+MPO site  10 / 48 .. D = 6
+MPO site  11 / 48 .. D = 6
+MPO site  12 / 48 .. D = 6
+MPO site  13 / 48 .. D = 6
+MPO site  14 / 48 .. D = 6
+MPO site  15 / 48 .. D = 6
+MPO site  16 / 48 .. D = 6
+MPO site  17 / 48 .. D = 6
+MPO site  18 / 48 .. D = 6
+MPO site  19 / 48 .. D = 6
+MPO site  20 / 48 .. D = 6
+MPO site  21 / 48 .. D = 6
+MPO site  22 / 48 .. D = 6
+MPO site  23 / 48 .. D = 6
+MPO site  24 / 48 .. D = 6
+MPO site  25 / 48 .. D = 6
+MPO site  26 / 48 .. D = 6
+MPO site  27 / 48 .. D = 6
+MPO site  28 / 48 .. D = 6
+MPO site  29 / 48 .. D = 6
+MPO site  30 / 48 .. D = 6
+MPO site  31 / 48 .. D = 6
+MPO site  32 / 48 .. D = 6
+MPO site  33 / 48 .. D = 6
+MPO site  34 / 48 .. D = 6
+MPO site  35 / 48 .. D = 6
+MPO site  36 / 48 .. D = 6
+MPO site  37 / 48 .. D = 6
+MPO site  38 / 48 .. D = 6
+MPO site  39 / 48 .. D = 6
+MPO site  40 / 48 .. D = 6
+MPO site  41 / 48 .. D = 6
+MPO site  42 / 48 .. D = 6
+MPO site  43 / 48 .. D = 6
+MPO site  44 / 48 .. D = 6
+MPO site  45 / 48 .. D = 6
+MPO site  46 / 48 .. D = 6
+MPO site  47 / 48 .. D = 1
+DMRG Davidson energy=-10.546379635744; dense-MPS expectation=-10.544127939640
+trial bonds: [1, 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 1]
+H|trial> compressed bonds: [1, 4, 16, 37, 33, 35, 35, 33, 38, 37, 38, 34, 38, 33, 38, 31, 38, 32, 38, 35, 38, 37, 38, 37, 38, 37, 38, 37, 38, 35, 38, 34, 38, 31, 38, 33, 38, 36, 38, 37, 38, 33, 35, 35, 33, 37, 16, 4, 1]
+trial natural orbitals: alpha gap n_N - n_N+1 = 0.146
+plan reference: natural determinant; gates 210, 209
+walkers start from the natural determinant, E=44.234642155386; orbital-plan infidelity 5.4e-10, 5.3e-10
+walker truncation reference discarded weights: 1.174e-03, 9.550e-04
+walker bonds: [1, 4, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 4, 1]
+overlap environment entries: {'dense': 5794, 'exact_blocks': 810, 'padded_blocks': 2462, 'transitions': 762} dense/padded=2.35x
+E0925 00:30:37.710994 2913755 slow_operation_alarm.cc:73] 
+********************************
+[Compiling module jit_run_blocks for CPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+E0925 00:31:32.074740 2913489 slow_operation_alarm.cc:140] The operation took 2m54.363869912s
+
+********************************
+[Compiling module jit_run_blocks for CPU] Very slow compile? If you want to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+********************************
+[eql   20/260]  E_chunk -10.5621624302  W 2.007437e+02  nodes          0  t   1041.0 s
+[eql   40/260]  E_chunk -10.5635655641  W 2.002179e+02  nodes         14  t   1452.2 s
+[eql   60/260]  E_chunk -10.5803686309  W 2.003946e+02  nodes         40  t   1866.1 s
+[blk   80/260]  E_chunk -10.5833558464  W 2.004718e+02  nodes         57  t   2278.3 s
+[blk  100/260]  E_chunk -10.5880271714  W 1.992386e+02  nodes         78  t   2688.9 s
+[blk  120/260]  E_chunk -10.5805006450  W 2.008369e+02  nodes         98  t   3102.7 s
+[blk  140/260]  E_chunk -10.5742475915  W 2.072841e+02  nodes        225  t   3516.3 s
+[blk  160/260]  E_chunk -10.5886816066  W 2.159139e+02  nodes        402  t   3927.4 s
+[blk  180/260]  E_chunk -10.5582438408  W 2.147413e+02  nodes        492  t   4337.5 s
+[blk  200/260]  E_chunk -10.5747620192  W 2.091670e+02  nodes        651  t   4747.4 s
+[blk  220/260]  E_chunk -10.5516025508  W 2.132864e+02  nodes        824  t   5160.7 s
+[blk  240/260]  E_chunk -10.5818374936  W 2.150899e+02  nodes        935  t   5570.9 s
+[blk  260/260]  E_chunk -10.5513981170  W 2.156271e+02  nodes       1059  t   5981.8 s
+
+Rejected 0 outlier blocks.
+
+Final blocking analysis:
+mu: -10.57304774026906  SE*: 0.004374462982948937  95% CI: (-10.581621687715636, -10.564473792822476)
+
+Blocking SE curve (ratio LOO):
+      B      G             SE   SE/SE(B=1)
+      1    200   1.692210e-03        1.000
+      2    100   2.247807e-03        1.328
+      3     66   2.646090e-03        1.564
+      4     50   2.991049e-03        1.768
+      5     40   3.280784e-03        1.939
+      6     33   3.490167e-03        2.062
+      7     28   3.209587e-03        1.897
+      8     25   3.979239e-03        2.352
+      9     22   3.992630e-03        2.359
+*    10     20   4.374463e-03        2.585
+
+CPMC energy = -10.573047740269056 +/- 0.0043744629829489375; elapsed=6023.3 s

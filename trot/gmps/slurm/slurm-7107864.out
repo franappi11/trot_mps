@@ -1,0 +1,101 @@
+
+Currently Loaded Modules:
+  1) modules/2.5-beta2 (S)   2) python/3.12.13   3) cuda/13.3.0
+
+  Where:
+   S:  Module is Sticky, requires --force to unload or purge
+
+ 
+
+job:    7107864 on workergpu053
+python: /mnt/home/fnappi/.trot312/bin/python gpu_linalg_bench.py
+args:   
+start:  Fri Sep 25 16:43:05 EDT 2026
+NVIDIA A100-SXM4-80GB, 580.178.04, 81920 MiB
+MPO site   0 / 4 .. D = 6
+MPO site   1 / 4 .. D = 6
+MPO site   2 / 4 .. D = 6
+MPO site   3 / 4 .. D = 1
+env: 3.12.13 jax 0.11.0 device NVIDIA A100-SXM4-80GB memory 76764151808 L=4 DMRG -1.9531453087
+jax 0.11.0, backend gpu, device NVIDIA A100-SXM4-80GB, memory limit 76.8 GB
+
+           op    n       us/mat@1    us/mat@1000   us/mat@10000  us/mat@100000   alone/batched  verdict   custom calls
+         eigh    4        493.788          0.578          0.094          0.036         13779.3  batched   cusolver_syevd_ffi
+         eigh    8        836.379          0.567          0.125          0.082         10179.4  batched   cusolver_syevd_ffi
+         eigh   16       1071.923          0.762          0.210          0.154          6968.1  batched   cusolver_syevd_ffi
+         eigh   24       1064.647          1.491          0.800          0.742          1435.5  batched   cusolver_syevd_ffi
+         eigh   32        987.035          1.735          1.022              -           965.8  batched   cusolver_syevd_ffi
+         eigh   40       1264.718          3.875          3.140              -           402.8  batched   cusolver_syevd_ffi
+         eigh   48       1348.483          4.670          3.911              -           344.8  batched   cusolver_syevd_ffi
+         eigh   64       1592.760          6.367          5.689              -           280.0  batched   cusolver_syevd_ffi
+         eigh   96       2428.480         15.507         14.321              -           169.6  batched   cusolver_syevd_ffi
+         eigh  128       2977.987         22.422              -              -           132.8  batched   cusolver_syevd_ffi
+
+           qr    4        459.205          0.368          0.056          0.011         42561.6  batched   cusolver_geqrf_ffi,cusolver_orgqr_ffi
+           qr    8        518.730          0.570          0.099          0.040         12823.9  batched   cusolver_geqrf_ffi,cusolver_orgqr_ffi
+           qr   16        520.422          0.684          0.331          0.257          2028.4  batched   cusolver_geqrf_ffi,cusolver_orgqr_ffi
+           qr   24        484.544          1.752          1.045          0.934           518.7  batched   cusolver_geqrf_ffi,cusolver_orgqr_ffi
+           qr   32        647.911          2.947          2.101              -           308.3  batched   cusolver_geqrf_ffi,cusolver_orgqr_ffi
+           qr   40        729.074          5.389          4.451              -           163.8  batched   cusolver_geqrf_ffi,cusolver_orgqr_ffi
+           qr   48        728.413          8.997          8.193              -            88.9  batched   cusolver_geqrf_ffi,cusolver_orgqr_ffi
+           qr   64        758.316         21.594         25.520              -            29.7  batched   cusolver_geqrf_ffi,cusolver_orgqr_ffi
+           qr   96       1005.415         81.151         74.079              -            13.6  batched   cusolver_geqrf_ffi,cusolver_orgqr_ffi
+           qr  128       1112.851        119.453              -              -             9.3  batched   cusolver_geqrf_ffi,cusolver_orgqr_ffi
+
+ cholesky_qr2    4        626.686          0.401          0.059          0.015         42174.0  batched   __cublas$triangularSolve,cusolver_potrf_ffi
+ cholesky_qr2    8        531.788          0.569          0.084          0.033         16048.5  batched   __cublas$triangularSolve,cusolver_potrf_ffi
+ cholesky_qr2   16        302.854          0.482          0.152          0.094          3219.7  batched   __cublas$triangularSolve,cusolver_potrf_ffi
+ cholesky_qr2   24        436.110          0.827          0.301          0.225          1940.0  batched   __cublas$triangularSolve,cusolver_potrf_ffi
+ cholesky_qr2   32        445.571          0.936          0.428              -          1041.5  batched   __cublas$triangularSolve,cusolver_potrf_ffi
+ cholesky_qr2   40        629.067          1.411          0.768              -           819.4  batched   __cublas$triangularSolve,cusolver_potrf_ffi
+ cholesky_qr2   48        617.415          1.740          1.061              -           582.0  batched   __cublas$triangularSolve,cusolver_potrf_ffi
+ cholesky_qr2   64        428.030          2.600          1.965              -           217.8  batched   __cublas$triangularSolve,cusolver_potrf_ffi
+ cholesky_qr2   96        617.736          5.044          4.308              -           143.4  batched   __cublas$triangularSolve,cusolver_potrf_ffi
+ cholesky_qr2  128        608.682          8.682              -              -            70.1  batched   __cublas$triangularSolve,cusolver_potrf_ffi
+
+     cholesky    4        541.974          0.060          0.052          0.009         60540.2  batched   cusolver_potrf_ffi
+     cholesky    8        545.579          0.546          0.048          0.012         44594.5  batched   cusolver_potrf_ffi
+     cholesky   16        539.447          0.480          0.058          0.021         25967.5  batched   cusolver_potrf_ffi
+     cholesky   24        471.454          0.460          0.095          0.055          8550.2  batched   cusolver_potrf_ffi
+     cholesky   32        395.992          0.498          0.110              -          3591.5  batched   cusolver_potrf_ffi
+     cholesky   40        465.647          0.560          0.169              -          2750.3  batched   cusolver_potrf_ffi
+     cholesky   48        453.304          0.622          0.186              -          2432.8  batched   cusolver_potrf_ffi
+     cholesky   64        375.337          0.802          0.298              -          1260.9  batched   cusolver_potrf_ffi
+     cholesky   96        583.487          1.121          0.585              -           996.8  batched   cusolver_potrf_ffi
+     cholesky  128        532.466          1.501              -              -           354.7  batched   cusolver_potrf_ffi
+
+          det    4         85.215          0.324          0.047          0.004         19068.3  batched   cusolver_getrf_ffi
+          det    8        338.253          0.311          0.040          0.007         46774.9  batched   cusolver_getrf_ffi
+          det   16        483.355          0.431          0.062          0.018         26310.0  batched   cusolver_getrf_ffi
+          det   24        540.818          0.503          0.063          0.036         14891.0  batched   cusolver_getrf_ffi
+          det   32        536.405          0.469          0.087              -          6193.3  batched   cusolver_getrf_ffi
+          det   40        420.414          0.705          0.281              -          1495.2  batched   cusolver_getrf_ffi
+          det   48        575.429          0.868          0.369              -          1557.3  batched   cusolver_getrf_ffi
+          det   64        390.072          0.941          0.578              -           675.3  batched   cusolver_getrf_ffi
+          det   96        602.703          1.865          1.314              -           458.7  batched   cusolver_getrf_ffi
+          det  128        713.731          3.490              -              -           204.5  batched   cusolver_getrf_ffi
+
+       matmul    4        451.111          0.434          0.045          0.005         88057.2  batched   
+       matmul    8        302.388          0.391          0.049          0.004         78594.8  batched   
+       matmul   16        299.073          0.382          0.049          0.006         54136.6  batched   
+       matmul   24         95.660          0.457          0.039          0.010          9144.1  batched   
+       matmul   32        433.992          0.314          0.047              -          9152.0  batched   
+       matmul   40        294.445          0.428          0.057              -          5159.3  batched   
+       matmul   48        292.685          0.426          0.071              -          4150.4  batched   
+       matmul   64        301.644          0.447          0.084              -          3611.5  batched   
+       matmul   96        381.366          0.513          0.227              -          1682.4  batched   
+       matmul  128        380.825          0.583              -              -           653.0  batched   
+
+  gram_factor    4        666.416          0.420          0.082          0.037         17773.5  batched   cusolver_syevd_ffi
+  gram_factor    8        825.736          0.420          0.131          0.087          9510.1  batched   cusolver_syevd_ffi
+  gram_factor   16        864.239          0.516          0.221          0.155          5580.0  batched   cusolver_syevd_ffi
+  gram_factor   24       1038.906          1.485          0.826          0.763          1362.3  batched   cusolver_syevd_ffi
+  gram_factor   32       1124.616          1.628          1.042              -          1079.6  batched   cusolver_syevd_ffi
+  gram_factor   40       1327.917          4.382          3.459              -           383.9  batched   cusolver_syevd_ffi
+  gram_factor   48       1413.838          4.916          4.084              -           346.2  batched   cusolver_syevd_ffi
+  gram_factor   64       1622.063          6.721          5.895              -           275.2  batched   cusolver_syevd_ffi
+  gram_factor   96       2396.073         17.950         15.245              -           157.2  batched   cusolver_syevd_ffi
+  gram_factor  128       2966.777         25.956              -              -           114.3  batched   cusolver_syevd_ffi
+
+wrote 231 records to gpu_linalg_bench.jsonl
+finish: Fri Sep 25 16:45:42 EDT 2026  rc=0

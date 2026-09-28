@@ -1,0 +1,59 @@
+job:    7104973 on worker5169
+python: /mnt/home/fnappi/.trot_venv/bin/python dmrg_reference.py
+args:   --L 48 --U 12 --chi 200 --out sweep_T8/reference.jsonl
+start:  Thu Sep 24 22:38:43 EDT 2026
+MPO site   0 / 4 .. D = 6
+MPO site   1 / 4 .. D = 6
+MPO site   2 / 4 .. D = 6
+MPO site   3 / 4 .. D = 1
+env: 3.11.11 jax 0.4.28 trot /mnt/home/fnappi/trot_mps/trot/__init__.py mkl ok, L=4 DMRG -1.9531453087
+MPO site   0 / 48 .. D = 6
+MPO site   1 / 48 .. D = 6
+MPO site   2 / 48 .. D = 6
+MPO site   3 / 48 .. D = 6
+MPO site   4 / 48 .. D = 6
+MPO site   5 / 48 .. D = 6
+MPO site   6 / 48 .. D = 6
+MPO site   7 / 48 .. D = 6
+MPO site   8 / 48 .. D = 6
+MPO site   9 / 48 .. D = 6
+MPO site  10 / 48 .. D = 6
+MPO site  11 / 48 .. D = 6
+MPO site  12 / 48 .. D = 6
+MPO site  13 / 48 .. D = 6
+MPO site  14 / 48 .. D = 6
+MPO site  15 / 48 .. D = 6
+MPO site  16 / 48 .. D = 6
+MPO site  17 / 48 .. D = 6
+MPO site  18 / 48 .. D = 6
+MPO site  19 / 48 .. D = 6
+MPO site  20 / 48 .. D = 6
+MPO site  21 / 48 .. D = 6
+MPO site  22 / 48 .. D = 6
+MPO site  23 / 48 .. D = 6
+MPO site  24 / 48 .. D = 6
+MPO site  25 / 48 .. D = 6
+MPO site  26 / 48 .. D = 6
+MPO site  27 / 48 .. D = 6
+MPO site  28 / 48 .. D = 6
+MPO site  29 / 48 .. D = 6
+MPO site  30 / 48 .. D = 6
+MPO site  31 / 48 .. D = 6
+MPO site  32 / 48 .. D = 6
+MPO site  33 / 48 .. D = 6
+MPO site  34 / 48 .. D = 6
+MPO site  35 / 48 .. D = 6
+MPO site  36 / 48 .. D = 6
+MPO site  37 / 48 .. D = 6
+MPO site  38 / 48 .. D = 6
+MPO site  39 / 48 .. D = 6
+MPO site  40 / 48 .. D = 6
+MPO site  41 / 48 .. D = 6
+MPO site  42 / 48 .. D = 6
+MPO site  43 / 48 .. D = 6
+MPO site  44 / 48 .. D = 6
+MPO site  45 / 48 .. D = 6
+MPO site  46 / 48 .. D = 6
+MPO site  47 / 48 .. D = 1
+{"L": 48, "U": 12.0, "chi": 200, "sweeps": 20, "e_davidson": -10.66245310634422, "e_variational": -10.662453106260537, "bond_dims": [1, 4, 16, 48, 100, 152, 176, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 176, 152, 100, 48, 16, 4], "seconds": 396.3635447025299}
+finish: Thu Sep 24 22:45:24 EDT 2026  rc=0

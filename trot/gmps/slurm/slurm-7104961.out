@@ -1,0 +1,43 @@
+job:    7104961 on worker5163
+python: /mnt/home/fnappi/.trot_venv/bin/python dmrg_reference.py
+args:   --L 32 --U 12 --chi 200 --out sweep_T8/reference.jsonl
+start:  Thu Sep 24 22:38:43 EDT 2026
+MPO site   0 / 4 .. D = 6
+MPO site   1 / 4 .. D = 6
+MPO site   2 / 4 .. D = 6
+MPO site   3 / 4 .. D = 1
+env: 3.11.11 jax 0.4.28 trot /mnt/home/fnappi/trot_mps/trot/__init__.py mkl ok, L=4 DMRG -1.9531453087
+MPO site   0 / 32 .. D = 6
+MPO site   1 / 32 .. D = 6
+MPO site   2 / 32 .. D = 6
+MPO site   3 / 32 .. D = 6
+MPO site   4 / 32 .. D = 6
+MPO site   5 / 32 .. D = 6
+MPO site   6 / 32 .. D = 6
+MPO site   7 / 32 .. D = 6
+MPO site   8 / 32 .. D = 6
+MPO site   9 / 32 .. D = 6
+MPO site  10 / 32 .. D = 6
+MPO site  11 / 32 .. D = 6
+MPO site  12 / 32 .. D = 6
+MPO site  13 / 32 .. D = 6
+MPO site  14 / 32 .. D = 6
+MPO site  15 / 32 .. D = 6
+MPO site  16 / 32 .. D = 6
+MPO site  17 / 32 .. D = 6
+MPO site  18 / 32 .. D = 6
+MPO site  19 / 32 .. D = 6
+MPO site  20 / 32 .. D = 6
+MPO site  21 / 32 .. D = 6
+MPO site  22 / 32 .. D = 6
+MPO site  23 / 32 .. D = 6
+MPO site  24 / 32 .. D = 6
+MPO site  25 / 32 .. D = 6
+MPO site  26 / 32 .. D = 6
+MPO site  27 / 32 .. D = 6
+MPO site  28 / 32 .. D = 6
+MPO site  29 / 32 .. D = 6
+MPO site  30 / 32 .. D = 6
+MPO site  31 / 32 .. D = 1
+{"L": 32, "U": 12.0, "chi": 200, "sweeps": 20, "e_davidson": -7.06168373537667, "e_variational": -7.061683735293259, "bond_dims": [1, 4, 16, 48, 100, 152, 176, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 176, 152, 100, 48, 16, 4], "seconds": 147.4262397289276}
+finish: Thu Sep 24 22:41:15 EDT 2026  rc=0

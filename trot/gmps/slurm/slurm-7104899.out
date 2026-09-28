@@ -1,0 +1,5 @@
+job:    7104899 on worker5161
+python: /mnt/home/fnappi/.trot_venv/bin/python dmrg_reference.py
+args:   --L 8 --U 4 --chi 20 --out mkltest.jsonl
+start:  Thu Sep 24 22:30:23 EDT 2026
+/mnt/home/fnappi/.trot_venv/bin/python: symbol lookup error: /mnt/home/fnappi/.trot_venv/lib/python3.11/site-packages/pyblock3.libs/libmkl_gnu_thread-76126a9d.so.1: undefined symbol: DftiFreeDescriptor

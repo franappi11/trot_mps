@@ -1,0 +1,91 @@
+L=48 (24,24), U=12.0
+MPO site   0 / 48 .. D = 6
+MPO site   1 / 48 .. D = 6
+MPO site   2 / 48 .. D = 6
+MPO site   3 / 48 .. D = 6
+MPO site   4 / 48 .. D = 6
+MPO site   5 / 48 .. D = 6
+MPO site   6 / 48 .. D = 6
+MPO site   7 / 48 .. D = 6
+MPO site   8 / 48 .. D = 6
+MPO site   9 / 48 .. D = 6
+MPO site  10 / 48 .. D = 6
+MPO site  11 / 48 .. D = 6
+MPO site  12 / 48 .. D = 6
+MPO site  13 / 48 .. D = 6
+MPO site  14 / 48 .. D = 6
+MPO site  15 / 48 .. D = 6
+MPO site  16 / 48 .. D = 6
+MPO site  17 / 48 .. D = 6
+MPO site  18 / 48 .. D = 6
+MPO site  19 / 48 .. D = 6
+MPO site  20 / 48 .. D = 6
+MPO site  21 / 48 .. D = 6
+MPO site  22 / 48 .. D = 6
+MPO site  23 / 48 .. D = 6
+MPO site  24 / 48 .. D = 6
+MPO site  25 / 48 .. D = 6
+MPO site  26 / 48 .. D = 6
+MPO site  27 / 48 .. D = 6
+MPO site  28 / 48 .. D = 6
+MPO site  29 / 48 .. D = 6
+MPO site  30 / 48 .. D = 6
+MPO site  31 / 48 .. D = 6
+MPO site  32 / 48 .. D = 6
+MPO site  33 / 48 .. D = 6
+MPO site  34 / 48 .. D = 6
+MPO site  35 / 48 .. D = 6
+MPO site  36 / 48 .. D = 6
+MPO site  37 / 48 .. D = 6
+MPO site  38 / 48 .. D = 6
+MPO site  39 / 48 .. D = 6
+MPO site  40 / 48 .. D = 6
+MPO site  41 / 48 .. D = 6
+MPO site  42 / 48 .. D = 6
+MPO site  43 / 48 .. D = 6
+MPO site  44 / 48 .. D = 6
+MPO site  45 / 48 .. D = 6
+MPO site  46 / 48 .. D = 6
+MPO site  47 / 48 .. D = 1
+DMRG Davidson energy=-10.546379635744; dense-MPS expectation=-10.544127939640
+trial bonds: [1, 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 1]
+H|trial> compressed bonds: [1, 4, 16, 37, 33, 35, 35, 33, 38, 37, 38, 34, 38, 33, 38, 31, 38, 32, 38, 35, 38, 37, 38, 37, 38, 37, 38, 37, 38, 35, 38, 34, 38, 31, 38, 33, 38, 36, 38, 37, 38, 33, 35, 35, 33, 37, 16, 4, 1]
+trial natural orbitals: alpha gap n_N - n_N+1 = 0.146
+plan reference: natural determinant; gates 210, 209
+walkers start from the natural determinant, E=44.234642155386; orbital-plan infidelity 5.4e-10, 5.3e-10
+walker truncation reference discarded weights: 1.166e-01, 1.141e-01
+walker bonds: [1, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 1]
+overlap environment entries: {'dense': 1474, 'exact_blocks': 262, 'padded_blocks': 402, 'transitions': 422} dense/padded=3.67x
+[eql   20/260]  E_chunk -10.5490833147  W 1.689026e+02  nodes       4131  t    598.9 s
+[eql   40/260]  E_chunk -10.5480130773  W 1.609904e+02  nodes       9310  t    749.2 s
+[eql   60/260]  E_chunk -10.5566580785  W 1.615220e+02  nodes      14922  t    900.1 s
+[blk   80/260]  E_chunk -10.5071962450  W 1.516083e+02  nodes      21027  t   1051.7 s
+[blk  100/260]  E_chunk -10.5444816442  W 1.502222e+02  nodes      26357  t   1203.1 s
+[blk  120/260]  E_chunk -10.5775200650  W 1.681597e+02  nodes      31953  t   1353.8 s
+[blk  140/260]  E_chunk -10.5500603643  W 1.539257e+02  nodes      37890  t   1504.3 s
+[blk  160/260]  E_chunk -10.5573625988  W 1.526828e+02  nodes      43051  t   1655.0 s
+[blk  180/260]  E_chunk -10.5335338583  W 1.658894e+02  nodes      48867  t   1805.4 s
+[blk  200/260]  E_chunk -10.5208107276  W 1.592854e+02  nodes      54156  t   1956.6 s
+[blk  220/260]  E_chunk -10.5653121984  W 1.603615e+02  nodes      59090  t   2107.2 s
+[blk  240/260]  E_chunk -10.5476544693  W 1.571479e+02  nodes      64600  t   2257.7 s
+[blk  260/260]  E_chunk -10.5174856139  W 1.632307e+02  nodes      70326  t   2408.1 s
+
+Rejected 0 outlier blocks.
+
+Final blocking analysis:
+mu: -10.5423168933976  SE*: 0.006768101572311539  95% CI: (-10.555582372479332, -10.52905141431587)
+
+Blocking SE curve (ratio LOO):
+      B      G             SE   SE/SE(B=1)
+      1    200   3.873581e-03        1.000
+      2    100   4.250307e-03        1.097
+      3     66   4.697584e-03        1.213
+      4     50   5.066268e-03        1.308
+      5     40   5.478860e-03        1.414
+      6     33   5.627160e-03        1.453
+      7     28   6.005622e-03        1.550
+      8     25   5.813040e-03        1.501
+      9     22   6.233903e-03        1.609
+*    10     20   6.768102e-03        1.747
+
+CPMC energy = -10.5423168933976 +/- 0.006768101572311539; elapsed=2439.4 s

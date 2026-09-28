@@ -1,0 +1,7 @@
+job:    7104510 on worker5163
+python: /mnt/home/fnappi/.trot_venv/bin/python run_mps_sweep.py
+args:   --L 32 --U 8 --chi-w 4 --trial-chi 8 --walkers 200 --eql 60 --blocks 200 --out sweep_T8
+start:  Thu Sep 24 21:06:31 EDT 2026
+env: 3.11.11 jax 0.4.28 trot /mnt/home/fnappi/trot_mps/trot/__init__.py
+[21:16:12] L32_U8_T8_w4_NOplan_NOstart_s1234  rc=2  578 s
+finish: Thu Sep 24 21:16:12 EDT 2026  rc=0
