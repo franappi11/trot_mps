@@ -33,7 +33,12 @@ parser.add_argument("--U", type=float, nargs="+", default=[4.0])
 parser.add_argument("--plan-reference", default="natural", choices=["natural", "rhf"])
 parser.add_argument("--walker-start", default="natural", choices=["natural", "rhf"])
 parser.add_argument("--dmrg-sweeps", type=int, default=20)
+parser.add_argument("--orbital-plan", default="adaptive", choices=["adaptive", "rank_exact", "maximal"])
+parser.add_argument("--dt", type=float, default=0.01)
 parser.add_argument("--tag-suffix", default="", help="appended to every run tag")
+parser.add_argument("--save-walkers", action="store_true",
+                    help="mps_cpmc_gpu: save every block's walkers to <out>/<tag>_walkers.npz and the DMRG trial to "
+                         "<out>/dmrg_trial_L<L>_U<U>_chi<trial chi>.npz (the notebooks' formats)")
 # mps_cpmc_gpu only
 parser.add_argument("--n-chunks", type=int, default=0, help="0 = from the memory model")
 parser.add_argument("--mem-fraction", type=float, default=0.75)
@@ -55,13 +60,19 @@ for L, U, chi_w in itertools.product(args.L, args.U, args.chi_w):
     cfg = (f"L={L}, n_up={L // 2}, n_down={L // 2}, interaction={U}, trial_chi={args.trial_chi}, "
            f"walker_channel_chi={chi_w}, plan_reference={args.plan_reference!r}, walker_start={args.walker_start!r}, "
            f"n_walkers={args.walkers}, n_equilibration={args.eql}, n_blocks={args.blocks}, n_steps={args.steps}, "
-           f"seed={args.seed}, dmrg_sweeps={args.dmrg_sweeps}, tag={tag!r}, "
+           f"seed={args.seed}, dmrg_sweeps={args.dmrg_sweeps}, orbital_plan={args.orbital_plan!r}, dt={args.dt}, "
+           f"tag={tag!r}, "
            f"result_json={os.path.join(out, 'results.jsonl')!r}, "
            f"block_log={os.path.join(out, 'blocks.jsonl')!r}")
     if args.module == "mps_cpmc_gpu":
         cfg += (f", n_chunks={args.n_chunks}, mem_fraction={args.mem_fraction}, linalg={args.linalg!r}, "
                 f"walker_qr={args.walker_qr!r}, energy={args.energy!r}, trial_cache={args.trial_cache!r}, "
                 f"compile_cache={args.compile_cache!r}")
+        if args.save_walkers:
+            cfg += (f", walker_snapshots={os.path.join(out, tag + '_walkers.npz')!r}, "
+                    f"trial_export={os.path.join(out, f'dmrg_trial_L{L}_U{U:g}_chi{args.trial_chi}.npz')!r}")
+    elif args.save_walkers:
+        sys.exit("--save-walkers needs --module mps_cpmc_gpu")
     code = f"import sys; sys.path.insert(0, {HERE!r}); import {args.module} as m; m.main(m.Config({cfg}))"
     start = time.time()
     with open(os.path.join(out, f"{tag}.log"), "w") as log:

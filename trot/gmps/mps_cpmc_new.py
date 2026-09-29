@@ -473,11 +473,7 @@ def plan_bonds(C, orbital_plan, chi_max=None, cutoff=0.0) -> BondPlan:
             singular_values.append(s)
 
         flat = np.concatenate(singular_values)
-<<<<<<< HEAD
-        order = np.argsort(-flat)
-=======
         order = np.argsort(-flat, kind="stable")  # exact ties: earlier sector first, reproducibly
->>>>>>> gmps_local
         count = len(flat) if chi_max is None else min(int(chi_max), len(flat))
         selected = order[:count]
         if cutoff:
@@ -619,16 +615,6 @@ def build_dmrg_hamiltonian(cfg: Config):
     return Hamiltonian(fcidump, flat=True)
 
 
-<<<<<<< HEAD
-def run_dmrg(hamiltonian, cfg: Config):
-    np.random.seed(cfg.dmrg_seed)
-    mpo, _ = hamiltonian.build_qc_mpo().compress(cutoff=1.0e-12)
-    mps = hamiltonian.build_mps(cfg.trial_chi)
-    result = MPE(mps, mpo, mps).dmrg(
-        bdims=[cfg.trial_chi] * cfg.dmrg_sweeps,
-        noises=[1.0e-5] * min(6, cfg.dmrg_sweeps) + [0.0],
-        dav_thrds=[1.0e-10], iprint=-1, n_sweeps=cfg.dmrg_sweeps)
-=======
 def hubbard_dmrg_mpo(hamiltonian, cfg: Config):
     """Hubbard-chain MPO from its ~6L operator terms (bond dimension ~6).
     build_qc_mpo treats g2 as a general two-electron tensor, which gives a bond
@@ -664,7 +650,6 @@ def run_dmrg(hamiltonian, cfg: Config):
     noises = [1.0e-4] * 4 + [1.0e-5] * 2 + [1.0e-6] * (cfg.dmrg_sweeps - 2) + [0.0] * 2
     result = MPE(mps, mpo, mps).dmrg(
         bdims=bdims, noises=noises, dav_thrds=[1.0e-10], iprint=-1, n_sweeps=len(bdims))
->>>>>>> gmps_local
     return mps, float(result.energies[-1])
 
 
@@ -1015,12 +1000,8 @@ def make_block_logger(path, n_equilibration, tag="", base_block_fn=blocks.block)
     return block_fn
 
 
-<<<<<<< HEAD
-def run_qmc_fixed_chunks(*, sys, params, ham_data, trial_data, meas_ops, trial_ops, prop_ops, block_fn):
-=======
 def run_qmc_fixed_chunks(*, sys, params, ham_data, trial_data, meas_ops, trial_ops, prop_ops, block_fn,
                          chunk_times=None):
->>>>>>> gmps_local
     """trot's run_qmc with one chunk size for both phases, gcd(n_eql, n_blocks),
     so the jitted block scan compiles once instead of once per chunk size.
     Same initialisation, block function, outlier rejection and blocking analysis.
@@ -1028,13 +1009,9 @@ def run_qmc_fixed_chunks(*, sys, params, ham_data, trial_data, meas_ops, trial_o
     killed, and reconfiguration cannot bring it back).
     Returns (mean, stderr, block energies, block weights, collapsed_after_block), all
     blocks unfiltered; mean and stderr are NaN and collapsed_after_block is set if it
-<<<<<<< HEAD
-    collapsed, otherwise collapsed_after_block is None."""
-=======
     collapsed, otherwise collapsed_after_block is None.
     If chunk_times is a list, (blocks done, seconds since start) is appended after
     every chunk; the first includes the compile."""
->>>>>>> gmps_local
     prop_ctx = prop_ops.build_prop_ctx(ham_data, trial_ops.get_rdm1(trial_data), params)
     meas_ctx = meas_ops.build_meas_ctx(ham_data, trial_data)
     state = prop_ops.init_prop_state(sys=sys, ham_data=ham_data, trial_ops=trial_ops,
@@ -1048,11 +1025,8 @@ def run_qmc_fixed_chunks(*, sys, params, ham_data, trial_data, meas_ops, trial_o
         state, scalars, _ = run_blocks(state, ham_data=ham_data, trial_data=trial_data,
                                        meas_ctx=meas_ctx, prop_ctx=prop_ctx, n_blocks=chunk)
         e, w = np.asarray(scalars["energy"]), np.asarray(scalars["weight"])
-<<<<<<< HEAD
-=======
         if chunk_times is not None:
             chunk_times.append((done, time.perf_counter() - start))
->>>>>>> gmps_local
         energies.extend(e.tolist())
         weights.extend(w.tolist())
         print(f"[{'eql' if done <= n_eql else 'blk'} {done:4d}/{total}]  E_chunk {np.sum(e * w) / np.sum(w):14.10f}"
@@ -1081,13 +1055,10 @@ def save_result(path, record):
 
 def main(cfg=CFG):
 
-<<<<<<< HEAD
-=======
     # The script runs unchanged on any JAX backend; log which one this is.
     device = jax.devices()[0]
     print(f"jax {jax.__version__}, backend {jax.default_backend()}, device {device.device_kind}", flush=True)
 
->>>>>>> gmps_local
     h1 = hopping_matrix(cfg.L, cfg.hopping)
     ham = HamHubbard(h1=jnp.asarray(h1), u=cfg.interaction)
     system = System(norb=cfg.L, nelec=(cfg.n_up, cfg.n_down), walker_kind="unrestricted")
@@ -1168,16 +1139,6 @@ def main(cfg=CFG):
         block_fn = make_block_logger(cfg.block_log, cfg.n_equilibration, cfg.tag)
 
     start = time.perf_counter()
-<<<<<<< HEAD
-    mean, error, block_energies, block_weights, collapsed = run_qmc_fixed_chunks(
-        sys=system, params=params, ham_data=ham, trial_data=trial_data,
-        meas_ops=measurement, trial_ops=trial_ops, prop_ops=prop_ops,
-        block_fn=block_fn)
-    elapsed = time.perf_counter() - start
-
-    scalar = lambda x: None if x is None else float(x)
-    print(f"CPMC energy = {scalar(mean)} +/- {scalar(error)}; elapsed={elapsed:.1f} s")
-=======
     chunk_times = []
     mean, error, block_energies, block_weights, collapsed = run_qmc_fixed_chunks(
         sys=system, params=params, ham_data=ham, trial_data=trial_data,
@@ -1196,19 +1157,14 @@ def main(cfg=CFG):
     if chunk_times:
         print(f"first chunk (compile + run) {chunk_times[0][1]:.1f} s; steady throughput "
               f"{walker_steps_per_s or float('nan'):.1f} walker-steps/s", flush=True)
->>>>>>> gmps_local
     record = asdict(cfg)
     record.update(
         kind="mps", initial_energy=float(initial_energy), dmrg_energy=dmrg_energy,
         trial_energy=trial_energy, cpmc_energy=scalar(mean), cpmc_error=scalar(error),
         seconds=elapsed, walker_d4_chi=max(map(len, ops.walker_charges)), collapsed_after_block=collapsed,
-<<<<<<< HEAD
-        gates=gates(plan_a))
-=======
         gates=gates(plan_a), backend=jax.default_backend(), device=device.device_kind,
         first_chunk_seconds=chunk_times[0][1] if chunk_times else None,
         walker_steps_per_s=walker_steps_per_s)
->>>>>>> gmps_local
     save_result(cfg.result_json, record)
 
 

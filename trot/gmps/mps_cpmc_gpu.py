@@ -117,6 +117,8 @@ class Config:
     compile_cache: str = ""  # JAX persistent compilation cache directory
     result_json: str = ""
     block_log: str = ""  # if set, append every block's scalars here as it finishes
+    walker_snapshots: str = ""  # if set, every block's walkers go here (.npz, notebook format; see WalkerSnapshots)
+    trial_export: str = ""  # if set, the DMRG trial goes here in the notebooks' format (see export_trial)
     tag: str = ""
 
 
@@ -1903,10 +1905,13 @@ def make_half_step(ops: GpuOps, params: QmcParams, n_chunks: int):
     return half_step
 
 
-def make_block(ops: GpuOps, params: QmcParams, n_chunks: int, energy_chunks: int):
+def make_block(ops: GpuOps, params: QmcParams, n_chunks: int, energy_chunks: int, record_comb=False):
     """trot.prop.blocks.block for these ops: n_prop_steps steps, orthonormalise,
     measure the energy, comb. Overlaps after orthonormalisation are rescaled by
-    det(R) and after the comb gathered, instead of reconverting every walker."""
+    det(R) and after the comb gathered, instead of reconverting every walker.
+    record_comb: also return the comb's input, per walker: its weight at the
+    measurement (pre_comb_weights) and the copy map (comb_index: walker i after the
+    comb is a copy of walker comb_index[i] before it)."""
     half_step = make_half_step(ops, params, n_chunks)
     n_half = 2 * params.n_prop_steps
 
@@ -1936,7 +1941,10 @@ def make_block(ops: GpuOps, params: QmcParams, n_chunks: int, energy_chunks: int
         average = jnp.cumsum(jnp.abs(weights))[-1] / n
         state = PropState((qu[idx], qd[idx]), jnp.full((n,), average, weights.dtype), overlaps[idx], key,
                           state.pop_control_ene_shift, e_estimate, state.node_encounters)
-        return state, dict(energy=e_block, weight=w_sum)
+        scalars = dict(energy=e_block, weight=w_sum)
+        if record_comb:
+            scalars.update(pre_comb_weights=weights, comb_index=idx.astype(jnp.int32))
+        return state, scalars
 
     return block
 
@@ -2010,10 +2018,94 @@ def peak_device_bytes():
         return None
 
 
-def run_qmc(state, data, run_blocks, *, n_eql, n_blocks, n_walkers, n_steps):
+class WalkerSnapshots:
+    """Every block's walkers, in the format fixed_block_walkers.ipynb and entanglement_vs_gmps.ipynb load.
+
+    Snapshot 0 is the starting population and snapshot b the population after block b, after its comb (where
+    every walker has the same weight): up, dn of shape (n_snap, n_walkers, L, N_sigma), float64, at imaginary
+    time tau_snapshots = b * n_steps * dt. Per block b (the one ending at tau_blocks[b] and producing snapshot
+    b + 1): energies, weights (the block's energy and total weight), e_estimate and node_encounters (cumulative),
+    and the comb's input: pre_comb_weights[b, j] is walker j's weight at the energy measurement, and
+    comb_index[b, i] = j says walker i of snapshot b + 1 is a copy of that walker j. So walker i of snapshot
+    b + 1 carried the weight pre_comb_weights[b, comb_index[b, i]] before the comb.
+
+    Arrays are written block by block into <name>.parts/ (progress.json says how many are valid), so a crash keeps
+    every finished block; finish() packs them with the config into <name>.npz and removes the parts.
+    """
+
+    def __init__(self, path, n_snap, n_walkers, L, n_up, n_down, config=None):
+        from numpy.lib.format import open_memmap
+        self.config = dict(config or {})  # stored in progress.json too, so unfinished runs can be plotted
+        self.path = Path(path)
+        self.parts = self.path.with_name(self.path.stem + ".parts")
+        self.parts.mkdir(parents=True, exist_ok=True)
+        memmap = lambda name, shape, dtype=np.float64: open_memmap(self.parts / f"{name}.npy", mode="w+",
+                                                                   dtype=dtype, shape=shape)
+        self.up = memmap("up", (n_snap, n_walkers, L, n_up))
+        self.dn = memmap("dn", (n_snap, n_walkers, L, n_down))
+        self.pre_comb_weights = memmap("pre_comb_weights", (n_snap - 1, n_walkers))
+        self.comb_index = memmap("comb_index", (n_snap - 1, n_walkers), np.int32)
+        self.snapshots, self.blocks = 0, []
+        print(f"walker snapshots: {n_snap} x {n_walkers} walkers -> {self.path} "
+              f"({(self.up.nbytes + self.dn.nbytes) / 1e9:.1f} GB)", flush=True)
+
+    def add_snapshot(self, state):
+        self.up[self.snapshots] = np.asarray(state.walkers[0])
+        self.dn[self.snapshots] = np.asarray(state.walkers[1])
+        self.snapshots += 1
+
+    def add_block(self, state, scalars):
+        """After one block (a run_blocks call with n_blocks=1): its scalars, the comb data and the new walkers."""
+        b = len(self.blocks)
+        self.pre_comb_weights[b] = np.asarray(scalars["pre_comb_weights"])[-1]
+        self.comb_index[b] = np.asarray(scalars["comb_index"])[-1]
+        self.blocks.append(dict(energy=float(np.asarray(scalars["energy"])[-1]),
+                                weight=float(np.asarray(scalars["weight"])[-1]),
+                                e_estimate=float(state.e_estimate), node_encounters=int(state.node_encounters)))
+        self.add_snapshot(state)
+        for array in (self.up, self.dn, self.pre_comb_weights, self.comb_index):
+            array.flush()
+        (self.parts / "progress.json").write_text(json.dumps(dict(snapshots=self.snapshots, blocks=self.blocks,
+                                                                  config=self.config)))
+
+    def finish(self, config, arrays=None):
+        config = {**self.config, **config}
+        n, nb = self.snapshots, len(self.blocks)
+        step = config["N_PROP"] * config["DT"]
+        column = lambda key, dtype=float: np.array([blk[key] for blk in self.blocks], dtype=dtype)
+        np.savez(self.path, up=self.up[:n], dn=self.dn[:n], energies=column("energy"), weights=column("weight"),
+                 e_estimate=column("e_estimate"), node_encounters=column("node_encounters", np.int64),
+                 pre_comb_weights=self.pre_comb_weights[:nb], comb_index=self.comb_index[:nb],
+                 tau_snapshots=np.arange(n) * step, tau_blocks=np.arange(1, nb + 1) * step,
+                 config=json.dumps(config), **(arrays or {}))
+        del self.up, self.dn, self.pre_comb_weights, self.comb_index
+        import shutil
+        shutil.rmtree(self.parts)
+        print(f"saved {self.path}: {n} snapshots, {nb} blocks", flush=True)
+
+
+def export_trial(path, cfg, trial_np, trial_charges, dmrg_energy, references, start):
+    """The DMRG trial in the format fixed_block_walkers.ipynb loads (its DMRG_FILE): T{i} (d=4 tensors, local
+    index n_up + 2 n_dn), H{i} (H|trial>, dense-compressed exactly as the notebook builds it), q{i} (the
+    (N_up, N_dn) bond labels) and e_dmrg; plus its spin-resolved one-body density matrices (gamma), the plan
+    reference determinant (reference_up/dn: the natural orbitals for plan_reference="natural") and the walkers'
+    starting determinant (start_up/dn)."""
+    H = compress_mps(apply_mpo(hubbard_mpo(cfg.L, cfg.hopping, cfg.interaction), trial_np))
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, e_dmrg=dmrg_energy, gamma=np.stack(one_rdm(trial_np)),
+                        reference_up=np.asarray(references[0]), reference_dn=np.asarray(references[1]),
+                        start_up=np.asarray(start[0]), start_dn=np.asarray(start[1]),
+                        **{f"T{i}": np.asarray(A) for i, A in enumerate(trial_np)},
+                        **{f"H{i}": np.asarray(A) for i, A in enumerate(H)},
+                        **{f"q{i}": np.asarray(q) for i, q in enumerate(trial_charges)})
+    print(f"saved the DMRG trial to {path}", flush=True)
+
+
+def run_qmc(state, data, run_blocks, *, n_eql, n_blocks, n_walkers, n_steps, snapshots=None):
     """run_qmc_fixed_chunks with an explicit AOT compile (timed) and throughput.
+    With snapshots (a WalkerSnapshots), one block per call and every block's walkers saved.
     Returns (mean, stderr, energies, weights, collapsed_after_block, timing)."""
-    chunk = math.gcd(n_eql, n_blocks)
+    chunk = 1 if snapshots is not None else math.gcd(n_eql, n_blocks)
     total = n_eql + n_blocks
     t0 = time.perf_counter()
     compiled = run_blocks.lower(state, data, n_blocks=chunk).compile()
@@ -2022,9 +2114,13 @@ def run_qmc(state, data, run_blocks, *, n_eql, n_blocks, n_walkers, n_steps):
           flush=True)
 
     energies, weights, collapsed, chunk_times = [], [], None, []
+    if snapshots is not None:
+        snapshots.add_snapshot(state)  # snapshot 0, read before the first call donates the state
     start = time.perf_counter()
     for done in range(chunk, total + 1, chunk):
         state, scalars = compiled(state, data)
+        if snapshots is not None:
+            snapshots.add_block(state, scalars)
         e, w = np.asarray(scalars["energy"]), np.asarray(scalars["weight"])
         chunk_times.append((done, time.perf_counter() - start))
         energies.extend(e.tolist())
@@ -2207,18 +2303,39 @@ def main(cfg=CFG):
         if max(errors) > 1e-6:
             raise AssertionError(f"device conversion disagrees with the NumPy reference: {errors}")
 
+    start_det = (np.asarray(setup.trial_data.mo_coeff_a), np.asarray(setup.trial_data.mo_coeff_b))
+    if cfg.trial_export:
+        export_trial(cfg.trial_export, cfg, *setup.trial, setup.info["dmrg_energy"], setup.references, start_det)
+
     logger = make_block_logger(cfg.block_log, cfg.n_equilibration, cfg.tag) if cfg.block_log else None
-    block_fn = make_block(ops, params, setup.n_chunks, setup.energy_chunks)
+    snapshots = None
+    if cfg.walker_snapshots:
+        # the notebooks' config keys (N_PROP, DT, N_EQL, ...), and this run's settings
+        config = dict(L=cfg.L, N_UP=cfg.n_up, N_DN=cfg.n_down, T=cfg.hopping, U=cfg.interaction,
+                      N_WALKERS=cfg.n_walkers, N_EQL=cfg.n_equilibration, N_BLOCKS=cfg.n_blocks, N_PROP=cfg.n_steps,
+                      DT=cfg.dt, SEED=cfg.seed, DMRG_CHI_T=cfg.trial_chi, DMRG_SWEEPS=cfg.dmrg_sweeps,
+                      CHI_PROP=cfg.walker_channel_chi, E_DMRG=setup.info["dmrg_energy"],
+                      E_TRIAL=setup.info["trial_energy"], plan_reference=cfg.plan_reference,
+                      walker_start=cfg.walker_start, orbital_plan=cfg.orbital_plan, EPS=cfg.occupation_tolerance,
+                      trial_file=cfg.trial_export, tag=cfg.tag, module="mps_cpmc_gpu", device=setup.info["device"])
+        snapshots = WalkerSnapshots(cfg.walker_snapshots, cfg.n_equilibration + cfg.n_blocks + 1, cfg.n_walkers,
+                                    cfg.L, cfg.n_up, cfg.n_down, config)
+    block_fn = make_block(ops, params, setup.n_chunks, setup.energy_chunks, record_comb=snapshots is not None)
     run_blocks = make_run_blocks(block_fn, logger)
 
     start = time.perf_counter()
     mean, error, block_energies, block_weights, collapsed, timing = run_qmc(
         state, ops.data, run_blocks, n_eql=cfg.n_equilibration, n_blocks=cfg.n_blocks,
-        n_walkers=cfg.n_walkers, n_steps=cfg.n_steps)
+        n_walkers=cfg.n_walkers, n_steps=cfg.n_steps, snapshots=snapshots)
     elapsed = time.perf_counter() - start
 
     scalar = lambda x: None if x is None else float(x)
     print(f"CPMC energy = {scalar(mean)} +/- {scalar(error)}; elapsed={elapsed:.1f} s")
+    if snapshots is not None:
+        snapshots.finish(dict(E_CPMC=scalar(mean), E_CPMC_ERR=scalar(error), collapsed_after_block=collapsed),
+                         dict(reference_up=np.asarray(setup.references[0]),
+                              reference_dn=np.asarray(setup.references[1]),
+                              start_up=start_det[0], start_dn=start_det[1]))
     record = asdict(cfg)
     info = dict(setup.info)
     record.update(

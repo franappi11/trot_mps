@@ -1,30 +1,4 @@
 #!/usr/bin/env python
-<<<<<<< HEAD
-"""Frozen vs per-walker (padded) kept-count allocation for the gMPS walker truncation.
-
-Production (mps_cpmc_new.py) truncates every walker's Fishman-White gMPS with the number of kept states per
-charge sector frozen once, on a reference determinant (plan_bonds). A per-walker allocation is much closer to
-the optimum (entanglement_vs_gmps.ipynb), but jitted code needs static shapes: every sector must be padded to
-the largest count any walker uses, and the padded bond D is what the contraction costs. Does paying for that
-padding beat spending the same bond on a frozen allocation?
-
-For each (L, U, trial) two independent CPMC populations are run (train and test seeds). For every nominal bond
-chi, the padding is learned on the training walkers, and every test walker (spin up) gets the infidelity of:
-
-  scheme      kept counts per charge sector                                          cost (max bond)
-  optimum     none: the smallest error any MPS with that bond can have (worst cut,
-              from the correlation spectrum; exact)                                  chi, and D
-  frozen      production: frozen on the plan reference (plan_bonds)                  chi
-  own         the walker's own best counts (the ideal; not jittable)                 chi
-  padded      own counts capped by the training padding: the jittable dynamic
-              scheme (a walker needing more than the padding is clipped)             D
-  union       the padding used as a frozen allocation (every padded slot filled)     D
-  frozen_D    production at the padded bond                                          D
-  frozen_W    production at the largest bond whose work (sum over gates of bond^3)
-              does not exceed the padded scheme's                                    equal work
-
-D is the largest padded bond over the circuit's gates. The overflow rate is the fraction of test walkers whose
-=======
 """Given a target accuracy, what is the cheapest walker truncation that reaches it: padding or not?
 
 Production (mps_cpmc_new.py, mps_cpmc_gpu.py) truncates every walker's Fishman-White gMPS with the number of
@@ -59,7 +33,6 @@ measured configuration that reaches it, and which scheme wins; schemes within --
 tie. No interpolation between configurations: small systems and latency-bound GPU steps have flat, noisy costs.
 --report redoes the tables and plots from <out>/results.jsonl without computing anything.
 D is the largest padded bond over the circuit's gates; the overflow rate is the fraction of test walkers whose
->>>>>>> gmps_local
 own allocation the training padding cannot hold at some gate.
 
 Walkers come from production-like CPMC with the plan reference production uses (plan_reference="natural"):
@@ -69,17 +42,11 @@ Walkers come from production-like CPMC with the plan reference production uses (
 Infidelities are exact against the dense walker state for L <= DENSE_MAX_L, otherwise against the walker's
 untruncated own-plan gMPS, whose own error (the "floor", <~1e-9) is recorded.
 
-<<<<<<< HEAD
-Usage (from trot/gmps; everything is cached in --out and re-used):
-  ~/.trot/bin/python allocation_study.py --L 8 12 --U 4 8
-  ~/.trot/bin/python allocation_study.py --selftest
-=======
 Usage (from trot/gmps; populations, trials and GPU timings are cached in --out and re-used):
   ~/.trot/bin/python allocation_study.py --L 8 12 --U 4 8
   ~/.trot/bin/python allocation_study.py --selftest
   sbatch --export=ALL,TARGET=allocation_study.py run_mps_gpu.sh --L 8 12 16 24 32 --U 4 8 --gpu
   ~/.trot/bin/python allocation_study.py --report            # tables and plots from saved results only
->>>>>>> gmps_local
 """
 from __future__ import annotations
 
@@ -103,17 +70,11 @@ import jax.numpy as jnp
 
 jax.config.update("jax_enable_x64", True)
 
-<<<<<<< HEAD
-import mps_cpmc_new as mcn  # noqa: E402
-from mps_cpmc_new import (_assemble, _move_centre, channel_angles, channel_mps, gate_pair,  # noqa: E402
-                          hopping_matrix, make_orbital_plan, plan_bonds, sector_plan)
-=======
 import mps_cpmc_gpu as gpu  # noqa: E402
 import mps_cpmc_new as mcn  # noqa: E402
 from mps_cpmc_new import (_assemble, _move_centre, channel_angles, channel_mps, gate_pair,  # noqa: E402
                           hopping_matrix, make_orbital_plan, plan_bonds, sector_plan)
 from jax import lax  # noqa: E402
->>>>>>> gmps_local
 from trot.core.ops import MeasOps, TrialOps, k_energy  # noqa: E402
 from trot.core.system import System  # noqa: E402
 from trot.driver import make_run_blocks  # noqa: E402
@@ -121,12 +82,8 @@ from trot.ham.chol import HamChol  # noqa: E402
 from trot.ham.hubbard import HamHubbard  # noqa: E402
 from trot.meas.uhf import make_uhf_meas_ops  # noqa: E402
 from trot.prop import blocks, cpmc_slow  # noqa: E402
-<<<<<<< HEAD
-from trot.prop.types import QmcParams  # noqa: E402
-=======
 from trot.prop.hubbard_cpmc_ops import _build_prop_ctx  # noqa: E402
 from trot.prop.types import PropState, QmcParams  # noqa: E402
->>>>>>> gmps_local
 from trot.trial.auto import make_auto_trial_ops  # noqa: E402
 from trot.trial.uhf import UhfTrial, get_rdm1 as uhf_get_rdm1, make_uhf_trial_ops  # noqa: E402
 
@@ -207,11 +164,7 @@ def optimum_discarded(Q, chis):
 
 
 # ------------------------------------------------------------------------------------------ gMPS with any allocation
-<<<<<<< HEAD
-def gmps(Q, plan, chi=None, counts=None, caps=None):
-=======
 def gmps(Q, plan, chi=None, counts=None, caps=None, trace=None):
->>>>>>> gmps_local
     """Fishman-White gMPS of one orthonormal spin channel, in NumPy, with a chosen truncation.
 
     The same gates, orthogonality-centre moves and charge-blocked splits as mps_cpmc_new.channel_mps and its
@@ -221,13 +174,9 @@ def gmps(Q, plan, chi=None, counts=None, caps=None, trace=None):
                                 optionally at most caps[g] = {charge: k_max} per sector, or
       everything                chi = counts = None (untruncated).
     Returns tensors, gauge (phi = gauge * MPS), chosen[g] = {charge: k}, the discarded weight, the kept bond per
-<<<<<<< HEAD
-    gate, and whether a cap was ever binding.
-=======
     gate, and whether a cap was ever binding. With trace a list, one dict per gate is appended: how close its
     truncation came to a tie, relative to the gate's largest squared singular value (within: the smallest gap
     between a sector's last kept and first dropped value; across: smallest kept minus largest dropped overall).
->>>>>>> gmps_local
     """
     occ = plan.occupation
     tensors = [np.eye(2)[int(o)].reshape(1, 2, 1) for o in occ]
@@ -270,8 +219,6 @@ def gmps(Q, plan, chi=None, counts=None, caps=None, trace=None):
             kept[int(np.argmax([d[1][0] for d in decs]))] = 1
             capped = True
         chosen.append({q: k for q, k in zip(qvals, kept) if k})
-<<<<<<< HEAD
-=======
         if trace is not None:
             top = max(float(d[1][0]) ** 2 for d in decs) or 1.0
             within = [(d[1][k - 1] ** 2 - d[1][k] ** 2) / top for d, k in zip(decs, kept) if 0 < k < len(d[1])]
@@ -280,7 +227,6 @@ def gmps(Q, plan, chi=None, counts=None, caps=None, trace=None):
             trace.append(dict(gate=g, site=int(site), within=min(within, default=np.inf),
                               across=(min(kept_v) - max(dropped)) / top if dropped else np.inf,
                               discarded=float(sum(np.sum(d[1][k:] ** 2) for d, k in zip(decs, kept)))))
->>>>>>> gmps_local
         truncated = sector_plan(ql, qr, tuple(kept))
         left, right = [], []
         for (u, s, vh), k in zip(decs, kept):
@@ -436,17 +382,12 @@ def run_population(L, U, trial, seed, args):
     return dict(up=up, dn=dn, energies=e, reference=nos[0], how=how)
 
 
-<<<<<<< HEAD
-def population(L, U, trial, seed, args):
-    path = Path(args.out) / "walkers" / f"L{L}_U{U:g}_{trial}_chiT{args.trial_chi}_nw{args.walkers}_b{args.eql}+{args.blocks}_s{seed}.npz"
-=======
 def population_path(L, U, trial, seed, args):
     return Path(args.out) / "walkers" / f"L{L}_U{U:g}_{trial}_chiT{args.trial_chi}_nw{args.walkers}_b{args.eql}+{args.blocks}_s{seed}.npz"
 
 
 def population(L, U, trial, seed, args):
     path = population_path(L, U, trial, seed, args)
->>>>>>> gmps_local
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
         start = time.perf_counter()
@@ -481,8 +422,6 @@ def exact_state(Q):
     return ("mps", tensors), 1.0 - gauge ** 2                       # floor: the norm it misses
 
 
-<<<<<<< HEAD
-=======
 def timing_walkers(pop):
     """Both spins of the population's last snapshot, orthonormalised: the batch the GPU cost is timed on."""
     return (np.stack([orthonormal(W) for W in pop["up"][-1]]), np.stack([orthonormal(W) for W in pop["dn"][-1]]))
@@ -598,7 +537,6 @@ def gpu_costs(L, U, plan, grid, frozen_counts, chis, pads, sample, pop_tag, args
     return out
 
 
->>>>>>> gmps_local
 def study(L, U, trial, args):
     tag = f"L{L}_U{U:g}_{trial}"
     out_npz = Path(args.out) / f"{tag}.npz"
@@ -611,112 +549,6 @@ def study(L, U, trial, args):
     start = time.perf_counter()
     exacts, floors = zip(*[exact_state(Q) for Q in test])
     chis = sorted(args.chis)
-<<<<<<< HEAD
-    res = {k: np.full((len(test), len(chis)), np.nan) for k in
-           ("optimum", "frozen", "own", "padded", "union", "frozen_D", "frozen_W", "optimum_D")}
-    res["overflow"] = np.zeros((len(test), len(chis)), bool)
-    meta = []
-    for j, chi in enumerate(chis):
-        frozen_counts = gmps(ref, plan, chi=chi)[2]
-        pad = padding([gmps(Q, plan, chi=chi)[2] for Q in train])
-        union_bonds = gmps(ref, plan, counts=pad)[4]
-        D = max(union_bonds)
-        frozen_D_counts = gmps(ref, plan, chi=D)[2]
-        frozen_bonds = gmps(ref, plan, counts=frozen_counts)[4]
-        frozen_D_bonds = gmps(ref, plan, counts=frozen_D_counts)[4]
-        work = lambda b: int(np.sum(np.asarray(b) ** 3))
-        chi_W = chi                                   # frozen at equal work: largest bond within the padded work
-        for cand in range(chi, D + 1):
-            if work(gmps(ref, plan, counts=gmps(ref, plan, chi=cand)[2])[4]) <= work(union_bonds):
-                chi_W = cand
-        frozen_W_counts = gmps(ref, plan, chi=chi_W)[2]
-        frozen_W_bonds = gmps(ref, plan, counts=frozen_W_counts)[4]
-        for w, (Q, exact) in enumerate(zip(test, exacts)):
-            res["frozen"][w, j] = fidelity_loss(exact, gmps(Q, plan, counts=frozen_counts)[0])
-            res["own"][w, j] = fidelity_loss(exact, gmps(Q, plan, chi=chi)[0])
-            tensors, _, _, _, _, capped = gmps(Q, plan, chi=chi, caps=pad)
-            res["padded"][w, j], res["overflow"][w, j] = fidelity_loss(exact, tensors), capped
-            res["union"][w, j] = fidelity_loss(exact, gmps(Q, plan, counts=pad)[0])
-            res["frozen_D"][w, j] = fidelity_loss(exact, gmps(Q, plan, counts=frozen_D_counts)[0])
-            res["frozen_W"][w, j] = fidelity_loss(exact, gmps(Q, plan, counts=frozen_W_counts)[0])
-            res["optimum"][w, j], res["optimum_D"][w, j] = optimum_discarded(Q, [chi, D])
-        cost = lambda b: dict(max=int(max(b)), sum_cubed=int(np.sum(np.asarray(b) ** 3)))
-        meta.append(dict(chi=chi, D=int(D), chi_W=int(chi_W), frozen=cost(frozen_bonds), union=cost(union_bonds),
-                         frozen_D=cost(frozen_D_bonds), frozen_W=cost(frozen_W_bonds)))
-        print(f"    chi={chi:3d}: padded bond D={D:3d}   ({time.perf_counter() - start:.0f} s)", flush=True)
-    np.savez_compressed(out_npz, chis=np.array(chis), floor=np.array(floors), **res, meta=json.dumps(meta))
-    return res, meta, np.array(floors), dict(train=len(train), test=len(test), how=str(train_pop["how"]),
-                                             energy_train=float(np.mean(train_pop["energies"][args.eql:])),
-                                             gates=int((plan.block_sizes - 1).sum()), plan_max_B=int(plan.block_sizes.max()))
-
-
-def summarize(L, U, trial, res, meta, floors, info, args):
-    stats = lambda x: dict(median=float(np.median(x)), p90=float(np.percentile(x, 90)),
-                           p99=float(np.percentile(x, 99)), mean=float(np.mean(x)), max=float(np.max(x)))
-    records = []
-    print(f"\n  L={L} U={U:g} {trial}: {info['how']}; {info['train']} training and {info['test']} test walkers; "
-          f"circuit {info['gates']} gates (max B {info['plan_max_B']}); reference floor max {floors.max():.1e}")
-    print(f"  {'chi':>4s} {'D':>4s} {'optimum':>9s} {'frozen':>9s} {'own':>9s} | {'padded':>9s} {'union':>9s} "
-          f"{'frozen_D':>9s} {'opt(D)':>9s} | {'chi_W':>5s} {'frozen_W':>9s} | {'overflow':>8s}  best at equal work")
-    for j, m in enumerate(meta):
-        row = {k: stats(res[k][:, j]) for k in ("optimum", "frozen", "own", "padded", "union", "frozen_D", "frozen_W", "optimum_D")}
-        at_W = {k: row[k]["median"] for k in ("padded", "union", "frozen_W")}
-        best = min(at_W, key=at_W.get) if max(at_W.values()) > 1e-13 else "tie (roundoff)"
-        print(f"  {m['chi']:4d} {m['D']:4d} " + " ".join(f"{row[k]['median']:9.1e}" for k in ("optimum", "frozen", "own"))
-              + " | " + " ".join(f"{row[k]['median']:9.1e}" for k in ("padded", "union", "frozen_D", "optimum_D"))
-              + f" | {m['chi_W']:5d} {row['frozen_W']['median']:9.1e} | {np.mean(res['overflow'][:, j]):8.0%}  {best}")
-        viol = int(np.sum(np.column_stack([res[k][:, j] for k in ("frozen", "own", "frozen_W")])
-                          < res["optimum"][:, j, None] - 1e-12 - 10 * floors[:, None])
-                   + np.sum(np.column_stack([res[k][:, j] for k in ("padded", "union", "frozen_D")])
-                            < res["optimum_D"][:, j, None] - 1e-12 - 10 * floors[:, None]))
-        records.append(dict(L=L, U=U, trial=trial, chi=m["chi"], D=m["D"], chi_W=m["chi_W"],
-                            costs={k: m[k] for k in ("frozen", "union", "frozen_D", "frozen_W")},
-                            overflow=float(np.mean(res["overflow"][:, j])), violations=viol, floor_max=float(floors.max()),
-                            n_train=info["train"], n_test=info["test"], how=info["how"], energy_train=info["energy_train"],
-                            trial_chi=args.trial_chi, **{k: v for k, v in row.items()}))
-    return records
-
-
-def plot(records, out):
-    import matplotlib.pyplot as plt
-    ink2, grid, surface = "#52514e", "#e6e5e1", "#fcfcfb"
-    plt.rcParams.update({"figure.facecolor": surface, "axes.facecolor": surface, "savefig.facecolor": surface,
-                         "axes.edgecolor": grid, "axes.labelcolor": ink2, "axes.titlesize": 14, "axes.labelsize": 10,
-                         "xtick.color": ink2, "ytick.color": ink2, "axes.grid": True, "grid.color": grid,
-                         "axes.spines.top": False, "axes.spines.right": False, "lines.linewidth": 2.0,
-                         "legend.frameon": False, "font.size": 10})
-    style = {"frozen": ("#eb6834", "-", "frozen (production), cost chi"),
-             "own": ("#d4a20f", "--", "own counts, cost chi (not jittable)"),
-             "padded": ("#2a78d6", "-", "padded own counts, cost D"),
-             "union": ("#1baf7a", "-", "union of paddings (frozen), cost D"),
-             "frozen_D": ("#8e5bd0", "-", ""),
-             "optimum": ("#52514e", ":", "optimum, any MPS")}
-    for key in sorted({(r["trial"], r["U"], r["L"]) for r in records}):
-        rows = sorted([r for r in records if (r["trial"], r["U"], r["L"]) == key], key=lambda r: r["chi"])
-        fig, ax = plt.subplots(figsize=(7.5, 3.8))
-        for name, (col, ls, lab) in style.items():
-            if name == "frozen_D":
-                continue
-            if name == "frozen":                   # production at every bond it was run at: chi, chi_W and D
-                pts = sorted({(r["chi"], r["frozen"]["median"]) for r in rows}
-                             | {(r["chi_W"], r["frozen_W"]["median"]) for r in rows}
-                             | {(r["D"], r["frozen_D"]["median"]) for r in rows})
-                x, y = [p[0] for p in pts], [max(p[1], 1e-17) for p in pts]
-                lab = "frozen (production), cost = its bond"
-            else:
-                x = [r["D"] if name in ("padded", "union") else r["chi"] for r in rows]
-                y = [max(r[name]["median"], 1e-17) for r in rows]
-            ax.plot(x, y, ls, marker="o", ms=4, color=col, label=lab)
-        ax.set_xscale("log", base=2); ax.set_yscale("log")
-        ax.set_xlabel("cost: largest bond per spin channel"); ax.set_ylabel(r"$1-F$ per spin channel (median)")
-        trial, U, L = key
-        ax.set_title(f"Allocation vs cost: L={L}, U={U:g}, {trial.upper()} trial")
-        ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0))
-        path = Path(out) / f"allocation_L{L}_U{U:g}_{trial}.png"
-        fig.savefig(path, dpi=200, bbox_inches="tight")
-        plt.close(fig)
-        print(f"  saved {path}")
-=======
 
     # paddings learned on the training walkers; their padded bond D
     pads = [padding([gmps(Q, plan, chi=chi)[2] for Q in train]) for chi in chis]
@@ -943,30 +775,21 @@ def write_curves(record, path):
             lines.append(f"{name},{chi},,,,,{err},,,,")
     path.write_text("\n".join(lines) + "\n")
     print(f"  wrote {path}")
->>>>>>> gmps_local
 
 
 # ------------------------------------------------------------------------------------------------ self-test
 def selftest(args):
-<<<<<<< HEAD
-    """Small, exact checks of every piece against production code and dense states (L=8)."""
-=======
     """Small, exact checks of every piece against production code and dense states (L=8), including the GPU
     conversions of every scheme (frozen, union, padded) against this file's NumPy gmps."""
->>>>>>> gmps_local
     print("self-test (L=8, U=4):")
     L, N, U = 8, 4, 4.0
     rng = np.random.default_rng(0)
     trial_np, trial_charges, _, gamma, nos, _ = dmrg_trial_mps(L, U, 8, 10)
     plan = make_orbital_plan(nos[0], "adaptive", EPS)
     walkers = [orthonormal(nos[0] + 0.3 * rng.standard_normal(nos[0].shape)) for _ in range(6)]
-<<<<<<< HEAD
-    worst = dict(frozen_vs_production=0.0, own_discarded_vs_plan_bonds=0.0, reference_vs_dense=0.0)
-=======
     others = [orthonormal(nos[0] + 0.6 * rng.standard_normal(nos[0].shape)) for _ in range(4)]
     worst = dict(frozen_vs_production=0.0, own_discarded_vs_plan_bonds=0.0, reference_vs_dense=0.0,
                  gpu_frozen_vs_numpy=0.0, gpu_union_vs_numpy=0.0, gpu_padded_vs_numpy=0.0)
->>>>>>> gmps_local
     violations = 0
     for chi in (2, 4, 8):
         bp = plan_bonds(nos[0], plan, chi, 0.0)
@@ -986,8 +809,6 @@ def selftest(args):
                 worst["reference_vs_dense"] = max(worst["reference_vs_dense"],
                                                   abs(fidelity_loss(ref, tensors) - fidelity_loss(("dense", psi), tensors)))
                 violations += int(fidelity_loss(("dense", psi), tensors) < optimum_discarded(Q, [chi])[0] - 1e-12)
-<<<<<<< HEAD
-=======
     for chi in (2, 3, 4):  # GPU conversions of the three jittable schemes, capped walkers included
         pad = padding([gmps(Q, plan, chi=chi)[2] for Q in walkers[:4]])
         frozen_counts = gmps(nos[0], plan, chi=chi)[2]
@@ -1004,24 +825,16 @@ def selftest(args):
                     want, g_want, *_ = reference(Q)
                     worst[name] = max(worst[name], np.abs(float(gauge) * mps_to_dense([np.asarray(t) for t in tensors])
                                                           - g_want * mps_to_dense(want)).max())
->>>>>>> gmps_local
     for k, v in worst.items():
         print(f"  max |{k}| = {v:.1e}")
     print(f"  errors below the optimum: {violations}")
     ok = worst["frozen_vs_production"] < 1e-10 and worst["own_discarded_vs_plan_bonds"] < 1e-10 \
-<<<<<<< HEAD
-        and worst["reference_vs_dense"] < 1e-8 and violations == 0
-=======
         and worst["reference_vs_dense"] < 1e-8 and violations == 0 \
         and all(worst[k] < 1e-10 for k in ("gpu_frozen_vs_numpy", "gpu_union_vs_numpy", "gpu_padded_vs_numpy"))
->>>>>>> gmps_local
     print("  self-test", "passed" if ok else "FAILED")
     return ok
 
 
-<<<<<<< HEAD
-def main():
-=======
 # options that change a system's results: a saved record is reused only if all of them match
 SETTINGS = ("chis", "extra_bonds", "trial_chi", "dmrg_sweeps", "run_chi_w", "walkers", "eql", "blocks", "steps",
             "dt", "seed", "test_seed_offset", "train_snaps", "test_snaps", "gpu", "gpu_walkers", "gpu_steps",
@@ -1069,21 +882,17 @@ def report(results, args):
 
 
 def build_parser():
->>>>>>> gmps_local
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--L", type=int, nargs="+", default=[8, 12, 16, 24, 32])
     parser.add_argument("--U", type=float, nargs="+", default=[4.0, 8.0])
     parser.add_argument("--trial", nargs="+", default=["dmrg"], choices=["dmrg", "uhf"])
     parser.add_argument("--chis", type=int, nargs="+", default=[2, 3, 4, 6, 8, 12, 16], help="nominal bonds per spin channel")
-<<<<<<< HEAD
-=======
     parser.add_argument("--extra-bonds", type=int, nargs="*", default=[],
                         help="more bonds for the frozen curve (it always includes every chi and every padded D)")
     parser.add_argument("--targets", type=float, nargs="+", default=[1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8],
                         help="target accuracies (1-F per spin channel) for the cost-to-target tables")
     parser.add_argument("--stats", nargs="+", default=["median"], choices=["median", "p90", "p99", "mean", "max"],
                         help="which statistic of 1-F over test walkers must meet the target (the first one is plotted)")
->>>>>>> gmps_local
     parser.add_argument("--trial-chi", type=int, default=8, help="DMRG trial bond (the L=32 sweeps used 8)")
     parser.add_argument("--dmrg-sweeps", type=int, default=14)
     parser.add_argument("--run-chi-w", type=int, default=8, help="walker bond of the production MPS-CPMC runs (L > 12)")
@@ -1096,12 +905,6 @@ def build_parser():
     parser.add_argument("--test-seed-offset", type=int, default=1000)
     parser.add_argument("--train-snaps", type=int, default=4)
     parser.add_argument("--test-snaps", type=int, default=4)
-<<<<<<< HEAD
-    parser.add_argument("--out", default=str(HERE / "allocation_study_data"))
-    parser.add_argument("--selftest", action="store_true", help="run only the self-test")
-    args = parser.parse_args()
-    Path(args.out).mkdir(parents=True, exist_ok=True)
-=======
     parser.add_argument("--gpu", action="store_true", help="measure each scheme's mps_cpmc_gpu step time on this device")
     parser.add_argument("--gpu-walkers", type=int, default=1024, help="walker batch the GPU cost is timed at")
     parser.add_argument("--gpu-steps", type=int, default=10, help="CPMC steps per timed call")
@@ -1135,30 +938,15 @@ def main():
         jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
     if args.gpu and jax.default_backend() != "gpu":
         print(f"note: --gpu on the {jax.default_backend()} backend: the 'gpu' cost is that device's time")
->>>>>>> gmps_local
     if not selftest(args):
         sys.exit(1)
     if args.selftest:
         return
-<<<<<<< HEAD
-    results = Path(args.out) / "results.jsonl"
-    records = []
-=======
     records, saved = [], load_records(results)
->>>>>>> gmps_local
     for trial in args.trial:
         for U in args.U:
             for L in args.L:
                 print(f"\n== L={L} U={U:g} trial={trial}", flush=True)
-<<<<<<< HEAD
-                res, meta, floors, info = study(L, U, trial, args)
-                recs = summarize(L, U, trial, res, meta, floors, info, args)
-                with results.open("a") as stream:
-                    for r in recs:
-                        stream.write(json.dumps(r) + "\n")
-                records += recs
-    plot(records, args.out)
-=======
                 previous = saved.get((L, U, trial, args.trial_chi))
                 if reusable(previous, args) and not args.recompute:
                     print(f"  reusing the saved result (same settings; --recompute to redo it)")
@@ -1173,7 +961,6 @@ def main():
                         stream.write(json.dumps(r) + "\n")
                 records += recs
     plot(records, args)
->>>>>>> gmps_local
 
 
 if __name__ == "__main__":
