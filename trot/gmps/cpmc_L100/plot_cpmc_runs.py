@@ -12,6 +12,7 @@ ignores autocorrelation.
     python plot_cpmc_runs.py /mnt/ceph/users/fnappi/trot_walkers/L100_U8
     python plot_cpmc_runs.py run_a_walkers.npz run_b_walkers.npz --per-site --estimate --out energy.png
     python plot_cpmc_runs.py L100_U8/blocks.jsonl --estimate   # a directory holding the two .jsonl files also works
+    python plot_cpmc_runs.py L100_U8 --estimate --reference L100_U8/dmrg_reference.jsonl   # + DMRG reference line
 """
 import argparse
 import json
@@ -34,14 +35,12 @@ def load_runs(path):
         z = np.load(path)  # lazy: only the arrays read below are loaded
         run = dict(energies=z["energies"], weights=z["weights"], e_estimate=z["e_estimate"],
                    tau=z["tau_blocks"], config=json.loads(str(z["config"])), finished=True)
-    elif path.name == "progress.json":  # a run in progress: <tag>_walkers.parts/progress.json
+    else:  # a run in progress: <tag>_walkers.parts/progress.json
         progress = json.loads(path.read_text())
         blocks, config = progress["blocks"], progress["config"]
         run = dict(energies=np.array([b["energy"] for b in blocks]), weights=np.array([b["weight"] for b in blocks]),
                    e_estimate=np.array([b["e_estimate"] for b in blocks]),
                    tau=np.arange(1, len(blocks) + 1) * config["N_PROP"] * config["DT"], config=config, finished=False)
-    else:
-        raise SystemExit(f"cannot read {path}: expected a _walkers.npz, progress.json, blocks.jsonl or results.jsonl")
     run["path"] = path
     return [run]
 
@@ -74,13 +73,11 @@ def load_block_logs(path):
             print(f"skipping {tag}: no record in {results_path} (still going, or crashed)")
             continue
         r = results[tag]
-        config = dict(L=r.get("L", r.get("n_sites")), N_UP=r["n_up"], N_DN=r["n_down"], T=r["hopping"], U=r["interaction"],
+        config = dict(L=r["L"], N_UP=r["n_up"], N_DN=r["n_down"], T=r["hopping"], U=r["interaction"],
                       N_WALKERS=r["n_walkers"], N_EQL=r["n_equilibration"], N_BLOCKS=r["n_blocks"],
                       N_PROP=r["n_steps"], DT=r["dt"], SEED=r["seed"], DMRG_CHI_T=r["trial_chi"],
                       DMRG_SWEEPS=r["dmrg_sweeps"], CHI_PROP=r["walker_channel_chi"], E_DMRG=r["dmrg_energy"],
                       E_TRIAL=r["trial_energy"], E_CPMC=r["cpmc_energy"], E_CPMC_ERR=r["cpmc_error"], tag=tag)
-        if "Lx" in r:  # square lattice (mps_cpmc_2d_gpu), as in its walker files' config
-            config.update(LX=r["Lx"], LY=r["Ly"])
         runs.append(dict(energies=np.array([b["energy"] for b in rows]), weights=np.array([b["weight"] for b in rows]),
                          e_estimate=np.array([b["e_estimate"] for b in rows]),
                          tau=(np.array([b["block"] for b in rows]) + 1) * r["n_steps"] * r["dt"],
@@ -94,8 +91,6 @@ def find_runs(paths):
     from the first file listed: in a directory, the walker file."""
     files = []
     for p in map(Path, paths):
-        if not p.exists():
-            raise SystemExit(f"{p} not found")
         if p.is_dir():
             files += sorted(p.glob("*_walkers.npz")) + sorted(p.glob("*_walkers.parts/progress.json"))
             files += [p / "blocks.jsonl"] if (p / "blocks.jsonl").exists() else []
@@ -106,6 +101,29 @@ def find_runs(paths):
         for run in load_runs(f):
             runs.setdefault(run["config"].get("tag") or str(run["path"]), run)
     return list(runs.values())
+
+
+def load_references(specs):
+    """(label, energy, L, U) for each --reference.
+
+    A spec is either a number (L and U are then None) or a .jsonl written by
+    chain_dmrg_reference.py. From a .jsonl this takes the variational e_mps, keeping the
+    last record per bond dimension.
+    """
+    refs = []
+    for spec in specs:
+        try:
+            refs.append(("DMRG reference", float(spec), None, None))
+            continue
+        except ValueError:
+            pass
+        by_chi = {}
+        for line in Path(spec).read_text().splitlines():
+            if line.strip():
+                r = json.loads(line)
+                by_chi[r["chi"]] = (r["e_mps"], r["L"], r["interaction"])
+        refs += [(rf"DMRG $\chi$={chi}", e, L, U) for chi, (e, L, U) in sorted(by_chi.items())]
+    return refs
 
 
 def sampling_stats(energies, weights, n_eql):
@@ -133,6 +151,9 @@ def main():
     parser.add_argument("--per-site", action="store_true", help="plot E / L")
     parser.add_argument("--estimate", action="store_true", help="also draw the running energy estimate")
     parser.add_argument("--no-trial", action="store_true", help="do not draw the DMRG trial energies")
+    parser.add_argument("--reference", action="append", default=[],
+                        help="DMRG reference energy to draw as a black dash-dot line: a number, or a .jsonl from "
+                             "chain_dmrg_reference.py (its variational e_mps); repeatable")
     parser.add_argument("--out", default="cpmc_energy_vs_tau.png", help="figure path (a .csv with the curves goes next to it)")
     parser.add_argument("--show", action="store_true", help="also open the figure window")
     args = parser.parse_args()
@@ -140,10 +161,7 @@ def main():
     runs = find_runs(args.paths)
     if not runs:
         raise SystemExit("no runs found")
-    runs.sort(key=lambda r: (r["config"].get("DMRG_CHI_T", 0), r["config"].get("CHI_PROP") or 0, r["config"]["DT"],
-                             str(r["path"])))
-    several_dt = len({r["config"]["DT"] for r in runs}) > 1  # then the labels say each run's time step
-    several_chi_w = len({r["config"].get("CHI_PROP") for r in runs}) > 1  # ... and each run's walker bond
+    runs.sort(key=lambda r: (r["config"].get("DMRG_CHI_T", 0), str(r["path"])))
 
     import matplotlib
     if not args.show:
@@ -167,9 +185,8 @@ def main():
         state = "" if r["finished"] else " (running)"
         print(f"{name[:40]:40s} {chi_t!s:>9s} {len(r['energies']):6d} {mean:16.8f} {err:10.2e} "
               f"{cfg.get('E_DMRG', float('nan')):14.8f}  {method}{state}")
-        run_label = (rf"trial $\chi_T$={chi_t}" + (rf", $\chi_w$={cfg.get('CHI_PROP')}" if several_chi_w else "")
-                     + (f", dt={cfg['DT']:g}" if several_dt else "") + state)
-        label = (rf"{run_label}: {mean * scale:.6f} $\pm$ {err * scale:.1e}" if np.isfinite(mean) else run_label)
+        label = (rf"trial $\chi_T$={chi_t}{state}: {mean * scale:.6f} $\pm$ {err * scale:.1e}"
+                 if np.isfinite(mean) else rf"trial $\chi_T$={chi_t}{state}")
         ax.plot(r["tau"], r["energies"] * scale, "-", marker="o", ms=2.5, color=color, label=label)
         if args.estimate:
             ax.plot(r["tau"], r["e_estimate"] * scale, "--", lw=1.0, color=color, alpha=0.8)
@@ -179,13 +196,17 @@ def main():
             rows.append(f"{name},{chi_t},{b},{t},{e},{w},{est}")
 
     cfg0 = runs[0]["config"]
-    for tau_eql in sorted({r["config"]["N_EQL"] * r["config"]["N_PROP"] * r["config"]["DT"] for r in runs}):
-        ax.axvline(tau_eql, color=INK2, lw=1.0, ls="--", zorder=0)
+    for label, energy, L, U in load_references(args.reference):
+        if L is not None and (L != cfg0["L"] or U != cfg0["U"]):
+            print(f"warning: reference {label} is for L={L}, U={U:g}, the runs for L={cfg0['L']}, U={cfg0['U']:g}")
+        scale = 1.0 / cfg0["L"] if args.per_site else 1.0
+        print(f"{label.replace('$', '').replace(chr(92) + 'chi', 'chi'):40s} {'':>9s} {'':>6s} {energy:16.8f}")
+        ax.axhline(energy * scale, color=INK, ls="-.", lw=1.3, label=f"{label}: {energy * scale:.6f}")
+    ax.axvline(cfg0["N_EQL"] * cfg0["N_PROP"] * cfg0["DT"], color=INK2, lw=1.0, ls="--", zorder=0)
     ax.set_xlabel(r"imaginary time $\tau$")
     ax.set_ylabel("CPMC energy per block" + (" per site" if args.per_site else ""))
-    lattice = f"{cfg0['LX']}x{cfg0['LY']}" if "LX" in cfg0 else f"L={cfg0['L']}"
-    walker_bond = "" if several_chi_w else f", walker bond {cfg0.get('CHI_PROP')} per spin"
-    ax.set_title(f"CPMC energy per block: {lattice}, U={cfg0['U']:g}, {cfg0['N_WALKERS']} walkers{walker_bond}")
+    ax.set_title(f"CPMC energy per block: L={cfg0['L']}, U={cfg0['U']:g}, {cfg0['N_WALKERS']} walkers, "
+                 f"walker bond {cfg0.get('CHI_PROP')} per spin")
     extra = ["dashed: running estimate"] if args.estimate else []
     extra += ["dotted: DMRG trial energy"] if not args.no_trial else []
     extra += ["vertical: end of equilibration"]

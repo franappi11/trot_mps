@@ -36,11 +36,51 @@ from pyblock3.hamiltonian import Hamiltonian
 from trot.core.ops import MeasOps, k_energy
 from trot.core.system import System
 from trot.gmps import mps_cpmc_new as m
-from trot.ham.hubbard import HamHubbard
+from trot.ham.hubbard import HamHubbard, square_hopping_matrix
+from trot.meas.mps import CHANNEL_CHARGE, apply_mpo, hubbard_mpo_from_h1, trial_times_h
 from trot.prop import blocks
 from trot.prop.types import QmcParams
 from trot.trial.auto import make_auto_trial_ops
 from trot.trial.uhf import UhfTrial, get_rdm1 as uhf_get_rdm1
+
+__all__ = [
+    "CHANNEL_CHARGE",
+    "Config",
+    "FCIDUMP",
+    "HamHubbard",
+    "Hamiltonian",
+    "MPE",
+    "MeasOps",
+    "QmcParams",
+    "System",
+    "UhfTrial",
+    "apply_mpo",
+    "asdict",
+    "ast",
+    "blocks",
+    "build_dmrg_hamiltonian",
+    "config_from_args",
+    "dataclass",
+    "densified_trial",
+    "describe",
+    "dmrg_schedule",
+    "hubbard_mpo_from_h1",
+    "jnp",
+    "k_energy",
+    "lattice_hopping",
+    "m",
+    "main",
+    "make_auto_trial_ops",
+    "make_blocked_energy",
+    "np",
+    "reference",
+    "run_dmrg",
+    "square_hopping_matrix",
+    "sys",
+    "time",
+    "trial_times_h",
+    "uhf_get_rdm1",
+]
 
 
 @dataclass(frozen=True)
@@ -89,95 +129,8 @@ class Config:
         return self.Lx * self.Ly
 
 
-def square_hopping_matrix(Lx, Ly, hopping, boundary_x="open", boundary_y="open"):
-    """Nearest-neighbour hopping on an Lx x Ly lattice, site x*Ly + y.
-
-    Bonds accumulate, so a periodic side of length 2 carries a doubled bond.
-    """
-    signs = {"open": 0.0, "periodic": 1.0, "antiperiodic": -1.0}
-    if boundary_x not in signs or boundary_y not in signs:
-        raise ValueError("boundaries must be 'open', 'periodic', or 'antiperiodic'")
-    bonds = []
-    for x in range(Lx):
-        for y in range(Ly):
-            i = x * Ly + y
-            if x + 1 < Lx:
-                bonds.append((i, i + Ly, 1.0))
-            elif Lx > 1 and signs[boundary_x]:
-                bonds.append((i, y, signs[boundary_x]))
-            if y + 1 < Ly:
-                bonds.append((i, i + 1, 1.0))
-            elif Ly > 1 and signs[boundary_y]:
-                bonds.append((i, x * Ly, signs[boundary_y]))
-    h1 = np.zeros((Lx * Ly, Lx * Ly))
-    for i, j, sign in bonds:
-        h1[i, j] -= sign * hopping
-        h1[j, i] -= sign * hopping
-    return h1
-
-
 def lattice_hopping(cfg: Config) -> np.ndarray:
     return square_hopping_matrix(cfg.Lx, cfg.Ly, cfg.hopping, cfg.boundary_x, cfg.boundary_y)
-
-
-def hubbard_mpo_from_h1(h1, interaction):
-    """Hubbard MPO for any real symmetric one-body matrix, in the spatial local basis.
-
-    A finite-state automaton. Channel 0 has placed nothing and the last channel holds a
-    finished term. A hopping opened on site i travels in four channels, one per opening
-    operator, and carries the Jordan-Wigner string Pa Pb to its partner site. Bonds are
-    padded to a common width. A nearest-neighbour chain gives m.hubbard_mpo exactly.
-    """
-    h1 = np.asarray(h1)
-    if np.iscomplexobj(h1) or not np.array_equal(h1, h1.T):
-        raise ValueError("h1 must be real symmetric")
-    n = len(h1)
-    eye = np.eye(4)
-    create_a = np.zeros((4, 4)); create_a[1, 0] = create_a[3, 2] = 1.0
-    create_b = np.zeros((4, 4)); create_b[2, 0] = 1.0; create_b[3, 1] = -1.0
-    annihilate_a, annihilate_b = create_a.T, create_b.T
-    parity_a = np.diag([1.0, -1.0, 1.0, -1.0])
-    parity_b = np.diag([1.0, 1.0, -1.0, -1.0])
-    double = np.diag([0.0, 0.0, 0.0, 1.0])
-    number = np.diag([0.0, 1.0, 1.0, 2.0])
-    opening = (create_a @ parity_b, annihilate_a @ parity_b,
-               parity_a @ create_b, parity_a @ annihilate_b)
-    closing = (annihilate_a, create_a, annihilate_b, create_b)
-
-    upper = np.triu(h1, 1) != 0
-    reach = [np.flatnonzero(row).max(initial=i) for i, row in enumerate(upper)]
-    slots = [{i: 1 + 4 * rank for rank, i in enumerate(i for i in range(b) if reach[i] >= b)}
-             for b in range(n + 1)]
-    D = 2 + 4 * max(map(len, slots))
-
-    W = np.zeros((n, D, 4, 4, D))
-    for k in range(n):
-        left, right = slots[k], slots[k + 1]
-        W[k, 0, :, :, 0] = W[k, -1, :, :, -1] = eye
-        W[k, 0, :, :, -1] = interaction * double + h1[k, k] * number
-        for op in range(4):
-            if k in right:
-                W[k, 0, :, :, right[k] + op] = opening[op]
-            for i, slot in left.items():
-                if h1[i, k]:
-                    W[k, slot + op, :, :, -1] = h1[i, k] * closing[op]
-                if i in right:
-                    W[k, slot + op, :, :, right[i] + op] = parity_a @ parity_b
-    return W
-
-
-def apply_mpo(W, tensors):
-    """m.apply_mpo, with the finished-term channel taken as the last one instead of 5."""
-    out = []
-    for i, (operator, A) in enumerate(zip(W, tensors)):
-        if i == 0:
-            operator = operator[:1]
-        if i == len(tensors) - 1:
-            operator = operator[..., -1:]
-        T = np.einsum("apqb,cqd->acpbd", operator, np.asarray(A))
-        dl, cl, d, dr, cr = T.shape
-        out.append(T.reshape(dl*cl, d, dr*cr))
-    return out
 
 
 def build_dmrg_hamiltonian(cfg: Config, h1):
@@ -233,33 +186,6 @@ def densified_trial(cfg: Config, h1, iprint=-1):
     dmrg_mps, dmrg_energy, sweep_energies, mps_energy = run_dmrg(hamiltonian, cfg, iprint)
     trial_np, trial_charges = m.densify_with_charges(dmrg_mps, cfg.n_sites)
     return trial_np, trial_charges, dmrg_energy, sweep_energies, mps_energy
-
-
-CHANNEL_CHARGE = np.array([[1, 0], [-1, 0], [0, 1], [0, -1]])  # c†a, ca, c†b, cb left open
-
-
-def trial_times_h(W, trial_np, trial_charges):
-    """H|trial>, uncompressed, with exact (N_alpha, N_beta) bond labels.
-
-    Bond index (channel, trial) is labelled with the trial's label plus the charge that
-    the channel's open operator has put left of the cut (the opening order of
-    hubbard_mpo_from_h1). That lets <H trial|walker> use the blocked overlap machinery.
-    Padding channels that a bond never uses are dropped.
-    """
-    n, D = len(trial_np), W.shape[1]
-    delta = np.zeros((D, 2), int)
-    delta[1:-1] = np.tile(CHANNEL_CHARGE, ((D - 2) // 4, 1))
-    active = ([np.zeros(1, int)]
-              + [np.flatnonzero(np.any(W[b - 1] != 0, axis=(0, 1, 2))) for b in range(1, n)]
-              + [np.full(1, D - 1)])
-    tensors = []
-    for k in range(n):
-        T = np.einsum("apqb,cqd->acpbd", W[k][active[k]][..., active[k + 1]], np.asarray(trial_np[k]))
-        dl, cl, d, dr, cr = T.shape
-        tensors.append(T.reshape(dl*cl, d, dr*cr))
-    charges = tuple((delta[active[b]][:, None, :] + np.asarray(trial_charges[b])[None]).reshape(-1, 2)
-                    for b in range(n + 1))
-    return tensors, charges
 
 
 def make_blocked_energy(ops, Ra, Rb, trial_np, Htrial_np, Htrial_charges):

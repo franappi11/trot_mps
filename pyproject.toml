@@ -18,6 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 gpu = ["jaxlib[cuda]"] 
+mps = ["pyblock3>=0.2.9rc6"]
 
 [tool.setuptools.packages.find]
 include = ["trot*"]
