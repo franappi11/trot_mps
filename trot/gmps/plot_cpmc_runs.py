@@ -133,11 +133,14 @@ def main():
     parser.add_argument("--per-site", action="store_true", help="plot E / L")
     parser.add_argument("--estimate", action="store_true", help="also draw the running energy estimate")
     parser.add_argument("--no-trial", action="store_true", help="do not draw the DMRG trial energies")
+    parser.add_argument("--trial-chi", type=int, nargs="+", default=None, help="keep only runs with these trial chi")
     parser.add_argument("--out", default="cpmc_energy_vs_tau.png", help="figure path (a .csv with the curves goes next to it)")
     parser.add_argument("--show", action="store_true", help="also open the figure window")
     args = parser.parse_args()
 
     runs = find_runs(args.paths)
+    if args.trial_chi:
+        runs = [r for r in runs if r["config"].get("DMRG_CHI_T") in args.trial_chi]
     if not runs:
         raise SystemExit("no runs found")
     runs.sort(key=lambda r: (r["config"].get("DMRG_CHI_T", 0), r["config"].get("CHI_PROP") or 0, r["config"]["DT"],
@@ -191,6 +194,7 @@ def main():
     extra += ["vertical: end of equilibration"]
     ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), title="; ".join(extra), title_fontsize=8)
     out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.with_suffix(".csv").write_text("\n".join(rows) + "\n")
     print(f"saved {out.with_suffix('.csv')}")
     try:

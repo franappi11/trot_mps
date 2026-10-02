@@ -430,6 +430,16 @@ def rotate_spin(tensors, R):
     return [np.einsum("ps,asb->apb", M, np.asarray(A, dtype=float)) for A in tensors]
 
 
+def spin_rotation_y(beta_deg) -> np.ndarray:
+    """R for rotate_spin of exp(-i beta S^y): |up> -> cos(beta/2)|up> + sin(beta/2)|dn> (beta in degrees).
+
+    Projected onto an S_z sector, a rotation by beta multiplies the spin-S part of an S_z = 0 state by
+    P_S(cos beta): beta = 90 removes every odd total spin (trot/gmps/notes/spin_projection.tex).
+    """
+    b = np.deg2rad(float(beta_deg)) / 2.0
+    return np.array([[np.cos(b), -np.sin(b)], [np.sin(b), np.cos(b)]])
+
+
 # ---------------------------------------------------------------------------------------------
 # The trial
 # ---------------------------------------------------------------------------------------------
