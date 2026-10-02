@@ -25,7 +25,7 @@ import jax.scipy.linalg
 import numpy as np
 import scipy.linalg
 
-jax.config.update("jax_enable_x64", True)
+# Precision follows trot: float32 unless trot.config.configure_once() (default) enables float64.
 
 """
 Orbital plan is the fixed block sizes and occupation number for all walkers GMPS conversions, computed from a reference state
