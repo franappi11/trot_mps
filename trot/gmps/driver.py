@@ -2,7 +2,8 @@
 
 make_mps_cpmc_ops(ham_data, trial, sys, params) returns the walker plan and the trial, measurement
 and propagation ops for trot.driver.run_qmc; run_qmc_mps(...) does everything in one call and,
-when no trial is given, builds one by pyblock3 DMRG (trot.gmps.dmrg).
+when no trial is given, builds one by pyblock3 DMRG (trot.gmps.dmrg). make_rotated_mps_cpmc_ops
+does the same for a RotatedMpsTrial (trot.trial.mps_rotation), a trial without definite S_z.
 
 The second half of this module is the legacy closure-based API of trot/gmps/mps_cpmc_new.py
 (make_walker_ops, make_block_logger, run_qmc_fixed_chunks, save_result), moved here unchanged.
@@ -27,8 +28,10 @@ from trot.driver import make_run_blocks, run_qmc
 from trot.gmps.utils import channel_angles, channel_mps, combine_channels, combined_charges
 from trot.gmps.utils import contract_real
 from trot.meas.mps import make_mps_meas_ops_hubbard
+from trot.meas.mps_rotated import make_rotated_meas_ops_hubbard
 from trot.prop import blocks
 from trot.prop.mps_cpmc import make_fast_sweep, make_prop_ops
+from trot.prop.mps_cpmc_rotated import make_rotated_prop_ops
 from trot.prop.types import PropOps
 from trot.stat_utils import blocking_analysis_ratio, reject_outliers
 from trot.trial.mps import (
@@ -46,6 +49,11 @@ from trot.trial.mps import (
     make_walker_plan,
     natural_orbitals,
     rhf_orbitals,
+)
+from trot.trial.mps_rotation import (
+    RotatedMpsTrial,
+    make_rotated_trial_ops,
+    make_rotated_walker_plan,
 )
 from trot.walkers import _qr as qr_with_det
 
@@ -70,6 +78,23 @@ def make_mps_cpmc_ops(ham_data, trial_data: MpsTrial, sys, params) -> MpsCpmcOps
         trial_ops=make_mps_trial_ops(plan),
         meas_ops=make_mps_meas_ops_hubbard(plan, energy_kernel=params.energy_kernel),
         prop_ops=make_prop_ops(ham_data, sys, plan, propagator=params.propagator),
+    )
+
+
+def make_rotated_mps_cpmc_ops(ham_data, trial_data: RotatedMpsTrial, sys, params) -> MpsCpmcOps:
+    """Walker plan and trot ops for a RotatedMpsTrial (no S_z projection) with QmcParamsMps.
+
+    Overlap, local energy and the fast sweep contract densely (the trial has no bond labels), so
+    params.energy_kernel is ignored; everything else follows make_mps_cpmc_ops.
+    """
+    if not isinstance(trial_data, RotatedMpsTrial):
+        raise TypeError("trial_data must be a RotatedMpsTrial (see make_rotated_mps_trial)")
+    plan = make_rotated_walker_plan(ham_data, trial_data, sys, params)
+    return MpsCpmcOps(
+        plan=plan,
+        trial_ops=make_rotated_trial_ops(plan),
+        meas_ops=make_rotated_meas_ops_hubbard(plan),
+        prop_ops=make_rotated_prop_ops(ham_data, sys, plan, propagator=params.propagator),
     )
 
 
