@@ -4,6 +4,11 @@ make_mps_cpmc_ops(ham_data, trial, sys, params) returns the walker plan and the 
 and propagation ops for trot.driver.run_qmc; run_qmc_mps(...) does everything in one call and,
 when no trial is given, builds one by pyblock3 DMRG (trot.gmps.dmrg).
 
+params.engine picks the implementation behind the same interface: "reference" (trot.trial.mps,
+trot.meas.mps, trot.prop.mps_cpmc), "batched" (the GPU engine of trot/gmps/gpu.py: batched sector
+factorisations, factorized contractions, device data as jit arguments) or "auto" (batched on a GPU
+backend, reference on CPU). Both give the same trajectories up to rounding.
+
 The second half of this module is the legacy closure-based API of trot/gmps/mps_cpmc_new.py
 (make_walker_ops, make_block_logger, run_qmc_fixed_chunks, save_result), moved here unchanged.
 """
@@ -24,6 +29,7 @@ import numpy as np
 
 from trot.core.ops import MeasOps, TrialOps
 from trot.driver import make_run_blocks, run_qmc
+from trot.gmps import gpu
 from trot.gmps.utils import channel_angles, channel_mps, combine_channels, combined_charges
 from trot.gmps.utils import contract_real
 from trot.meas.mps import make_mps_meas_ops_hubbard
@@ -55,16 +61,20 @@ class MpsCpmcOps(NamedTuple):
     trial_ops: TrialOps
     meas_ops: MeasOps
     prop_ops: PropOps
+    engine: gpu.GpuOps | None = None  # the batched engine's ops (engine="batched"), None for the reference
 
 
 def make_mps_cpmc_ops(ham_data, trial_data: MpsTrial, sys, params) -> MpsCpmcOps:
-    """Walker plan and trot ops for trial_data (an MpsTrial) with QmcParamsMps settings."""
+    """Walker plan and trot ops for trial_data (an MpsTrial) with QmcParamsMps settings (params.engine)."""
     if not isinstance(trial_data, MpsTrial):
         raise TypeError(
             "trial_data must be an MpsTrial; convert pyblock3/dense trials with "
             "trot.trial.mps.as_mps_trial and pass that same object to run_qmc"
         )
     plan = make_walker_plan(ham_data, trial_data, sys, params)
+    if gpu.resolve_engine(params) == "batched":
+        engine, trial_ops, meas_ops, prop_ops = gpu.make_batched_ops(ham_data, trial_data, plan, params)
+        return MpsCpmcOps(plan, trial_ops, meas_ops, prop_ops, engine)
     return MpsCpmcOps(
         plan=plan,
         trial_ops=make_mps_trial_ops(plan),
@@ -122,6 +132,14 @@ def _print_diagnostics(ham_data, trial, ops, params, meas_ctx, dmrg) -> None:
         f"  walkers start from the {params.walker_start} determinant; orbital-plan infidelity "
         f"{1 - _plan_fidelity(Sa, plan_a):.1e}, {1 - _plan_fidelity(Sb, plan_b):.1e}"
     )
+    if ops.engine is not None:
+        linalg, walker_qr = gpu.resolve_linalg(params)
+        print(
+            f"  batched engine: linalg={linalg}, walker_qr={walker_qr}, "
+            f"spin-batched={ops.engine.converter.spin_batched}; circuit "
+            f"{gpu.circuit_stats(ops.engine.converter.circuits[0])}; overlap plan {ops.engine.overlap_plan.stats}"
+        )
+        return
     report = contraction_report(contraction_layout(plan, trial.charges).contraction)
     print(
         f"  overlap environment entries {report}, dense/padded "

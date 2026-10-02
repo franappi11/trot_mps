@@ -521,3 +521,38 @@ def test_gpu_walker_batching_scales(model):
             best = min(best, time.perf_counter() - t)
         times[n] = best
     assert times[1024] < 8.0 * times[64], times
+
+
+# --------------------------------------------------------------------------
+# Rotated trials (Config.trial_rotation)
+# --------------------------------------------------------------------------
+
+def test_spin_rotation_y():
+    from trot.trial.mps import spin_rotation_unitary, spin_rotation_y
+
+    np.testing.assert_allclose(spin_rotation_y(90.0), np.array([[1.0, -1.0], [1.0, 1.0]]) / np.sqrt(2.0), atol=1e-15)
+    np.testing.assert_allclose(spin_rotation_y(0.0), np.eye(2), atol=1e-15)
+    assert abs(spin_rotation_unitary(spin_rotation_y(37.0))[3, 3] - 1.0) < 1e-14  # a rotation: det R = 1
+
+
+def test_rotated_trial_overlaps_and_energies_match_enumeration(model):
+    """Config.trial_rotation = 90: build() rotates the DMRG trial and projects it onto (N, N) (trot's
+    make_mps_trial); the engine's overlaps and blocked local energies against that trial, with an exact walker
+    conversion, equal exact enumeration with the projected trial's own amplitudes."""
+    cfg = g.Config(L=L, n_up=N, n_down=N, interaction=U, trial_chi=16, dmrg_sweeps=8, trial_rotation=90.0,
+                   walker_channel_chi=None, orbital_plan="rank_exact", n_walkers=6, self_check=False)
+    setup = g.build(cfg, verbose=False)
+    assert 0.0 < setup.info["trial_sector_weight"] <= 1.0 + 1e-12  # = 1 only for an exact singlet
+    trial_np, _ = setup.trial
+    np.testing.assert_allclose(g.mps_overlap_host(trial_np, trial_np), 1.0, atol=1e-10)
+    amp = _signed_amplitudes(trial_np, model.occ)
+    hamp = _signed_amplitudes(g.compress_mps(g.apply_mpo(model.mpo, trial_np)), model.occ)
+    ca, cb = _walker_batch(model)
+    da = np.stack([np.linalg.det(c[model.rows]) for c in ca])
+    db = np.stack([np.linalg.det(c[model.rows]) for c in cb])
+    exact_overlap = np.einsum("wi,ij,wj->w", da, amp, db)
+    exact_energy = np.einsum("wi,ij,wj->w", da, hamp, db) / exact_overlap
+    got_overlap = jax.jit(setup.ops.overlaps)(jnp.asarray(ca), jnp.asarray(cb), setup.ops.data)
+    got_energy = jax.jit(setup.ops.energies)(jnp.asarray(ca), jnp.asarray(cb), setup.ops.data)
+    np.testing.assert_allclose(np.asarray(got_overlap), exact_overlap, rtol=1e-9)
+    np.testing.assert_allclose(np.asarray(got_energy), exact_energy, rtol=1e-8)

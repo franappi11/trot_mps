@@ -914,3 +914,138 @@ def test_legacy_api_is_bitwise_identical_to_the_frozen_head(frozen_legacy):
         )
         results.append((step(state(ops)), final, scalars))
     _assert_same(results[0], results[1])
+
+
+# ---------------------------------------------------------------------------------------------
+# Batched engine (QmcParamsMps.engine = "batched", trot/gmps/gpu.py) against the reference engine
+# ---------------------------------------------------------------------------------------------
+
+BATCHED_LINALG = [
+    pytest.param("batched", "native", id="batched-householder"),
+    pytest.param("batched", "cholesky", id="batched-choleskyqr2"),
+    pytest.param("native", "native", id="loop-householder"),
+]
+
+
+def _both_engines(m, **overrides):
+    """The reference and the batched ops (and their meas_ctx) for the same trial and settings."""
+    out = {}
+    for engine in ("reference", "batched"):
+        params = _params(engine=engine, **overrides)
+        ops = make_mps_cpmc_ops(m.ham, m.trial, m.sys, params)
+        out[engine] = types.SimpleNamespace(
+            params=params, ops=ops, ctx=ops.meas_ops.build_meas_ctx(m.ham, m.trial)
+        )
+    assert out["batched"].ops.engine is not None and out["reference"].ops.engine is None
+    return out
+
+
+def test_engine_auto_is_batched_exactly_on_a_gpu(lattice_model):
+    m = lattice_model
+    ops = make_mps_cpmc_ops(m.ham, m.trial, m.sys, _params())
+    assert (ops.engine is not None) == (jax.default_backend() == "gpu")  # "fast" propagator (the default)
+    with pytest.raises(ValueError):
+        _params(engine="fastest")
+
+
+@pytest.mark.parametrize("linalg, walker_qr", BATCHED_LINALG)
+@pytest.mark.parametrize("walker_channel_chi", [None, 2])
+@pytest.mark.parametrize("energy_kernel", ["blocked", "dense"])
+def test_batched_overlaps_and_energies_match_the_reference(
+    lattice_model, linalg, walker_qr, walker_channel_chi, energy_kernel
+):
+    """Diffused walkers (nodes crossed): overlaps and local energies of both engines agree."""
+    m = lattice_model
+    e = _both_engines(
+        m,
+        orbital_plan="adaptive",
+        walker_channel_chi=walker_channel_chi,
+        energy_kernel=energy_kernel,
+        linalg=linalg,
+        walker_qr=walker_qr,
+    )
+    Ca, Cb = _determinant("uhf", m.h1, m.nelec)
+    walkers = _diffused_state(m.trial, e["reference"].ops, m.h1, Ca, Cb, n_walkers=8, seed=3).walkers
+    results = {}
+    for name, side in e.items():
+        overlap = jax.vmap(side.ops.trial_ops.overlap, in_axes=(0, None))(walkers, m.trial)
+        kernel = side.ops.meas_ops.require_kernel(k_energy)
+        energy = jax.vmap(kernel, in_axes=(0, None, None, None))(walkers, m.ham, side.ctx, m.trial)
+        results[name] = (np.asarray(overlap), np.asarray(energy))
+    np.testing.assert_allclose(results["batched"][0], results["reference"][0], rtol=1e-9)
+    np.testing.assert_allclose(results["batched"][1], results["reference"][1], rtol=1e-9)
+    assert e["batched"].ctx.trial_energy == pytest.approx(e["reference"].ctx.trial_energy, rel=1e-12)
+    assert e["batched"].ctx.kernel == energy_kernel
+
+
+@pytest.mark.parametrize("walker_qr", ["native", "cholesky"])
+@pytest.mark.parametrize("walker_channel_chi", [None, 2])
+def test_batched_step_matches_the_reference_step(lattice_model, walker_qr, walker_channel_chi):
+    """Three steps of each engine from the same state: same walkers, weights, overlaps, shift, nodes, RNG."""
+    m = lattice_model
+    e = _both_engines(
+        m, orbital_plan="adaptive", walker_channel_chi=walker_channel_chi, linalg="batched", walker_qr=walker_qr
+    )
+    ref = e["reference"]
+    state = _initial_state(m.ham, m.trial, ref.ops, ref.params, ref.ctx, m.sys)
+    out = {}
+    for name, side in e.items():
+        out[name] = _three_steps(
+            side.ops.prop_ops,
+            state,
+            params=side.params,
+            ham=m.ham,
+            trial=m.trial,
+            trial_ops=side.ops.trial_ops,
+            meas_ops=side.ops.meas_ops,
+            meas_ctx=side.ctx,
+            prop_ctx=side.ops.prop_ops.build_prop_ctx(m.ham, None, side.params),
+        )
+    _compare_states(out["batched"], out["reference"], walkers_atol=1e-12, rtol=1e-9)
+
+
+def test_batched_step_chunking_is_exact(lattice_model):
+    """n_chunks that does not divide the walkers (3 of 10) is rounded up to a divisor; same result as one chunk."""
+    m = lattice_model
+    results = []
+    for n_chunks in (1, 3):
+        params = _params(engine="batched", orbital_plan="adaptive", walker_channel_chi=2, n_chunks=n_chunks)
+        ops = make_mps_cpmc_ops(m.ham, m.trial, m.sys, params)
+        ctx = ops.meas_ops.build_meas_ctx(m.ham, m.trial)
+        state = _initial_state(m.ham, m.trial, ops, params, ctx, m.sys)
+        results.append(
+            _three_steps(
+                ops.prop_ops,
+                state,
+                params=params,
+                ham=m.ham,
+                trial=m.trial,
+                trial_ops=ops.trial_ops,
+                meas_ops=ops.meas_ops,
+                meas_ctx=ctx,
+                prop_ctx=ops.prop_ops.build_prop_ctx(m.ham, None, params),
+            )
+        )
+    _compare_states(results[1], results[0], walkers_atol=1e-13, rtol=1e-11)
+
+
+def test_run_qmc_mps_engines_agree(lattice_model):
+    """run_qmc_mps end to end (init, trot's block and measurement, statistics) with either engine."""
+    m = lattice_model
+    runs = {}
+    for engine in ("reference", "batched"):
+        params = _params(
+            engine=engine,
+            orbital_plan="adaptive",
+            walker_channel_chi=2,
+            linalg="batched",
+            walker_qr="native",
+            n_eql_blocks=2,
+            n_blocks=4,
+        )
+        runs[engine] = run_qmc_mps(sys=m.sys, params=params, ham_data=m.ham, trial_data=m.trial)
+    for key in ("block_energies", "block_weights"):
+        np.testing.assert_allclose(
+            np.asarray(getattr(runs["batched"], key)), np.asarray(getattr(runs["reference"], key)), rtol=1e-9
+        )
+    assert float(runs["batched"].mean_energy) == pytest.approx(float(runs["reference"].mean_energy), rel=1e-9)

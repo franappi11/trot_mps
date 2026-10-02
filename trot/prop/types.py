@@ -68,6 +68,9 @@ _MPS_CHOICES = {
     "walker_start": ("natural", "rhf"),
     "energy_kernel": ("blocked", "dense"),
     "propagator": ("fast", "slow"),
+    "engine": ("auto", "batched", "reference"),
+    "linalg": ("auto", "batched", "native"),
+    "walker_qr": ("auto", "cholesky", "native"),
 }
 
 
@@ -91,6 +94,12 @@ class QmcParamsMps(QmcParams):
       (d=4 walker MPS against a densely compressed H|trial>).
     propagator: "fast" (one walker conversion per HS sweep with cached environments) or
       "slow" (trot.prop.cpmc_slow: a full conversion and overlap for every field proposal).
+    engine: "reference" (trot.trial.mps / trot.meas.mps / trot.prop.mps_cpmc), "batched" (the GPU engine of
+      trot/gmps/gpu.py: batched sector factorisations, factorized contractions, device data as jit arguments;
+      "fast" propagator only) or "auto" (batched on a GPU backend, reference on CPU). Same results up to rounding.
+    linalg, walker_qr: batched engine only. linalg "batched" factors all sectors of one kind in one call,
+      "native" runs the per-sector loop; walker_qr "cholesky" (CholeskyQR2, Householder fallback) or "native".
+      "auto": batched and cholesky on accelerators, native on CPU.
     """
 
     trial_chi: int = 64
@@ -104,6 +113,9 @@ class QmcParamsMps(QmcParams):
     walker_start: Literal["natural", "rhf"] = "natural"
     energy_kernel: Literal["blocked", "dense"] = "blocked"
     propagator: Literal["fast", "slow"] = "fast"
+    engine: Literal["auto", "batched", "reference"] = "auto"
+    linalg: Literal["auto", "batched", "native"] = "auto"
+    walker_qr: Literal["auto", "cholesky", "native"] = "auto"
 
     def __post_init__(self) -> None:
         for name, allowed in _MPS_CHOICES.items():
