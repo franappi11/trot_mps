@@ -11,6 +11,8 @@ by gate with the orthogonality centre on the gate. What changes is the layout fo
   spin channels run in one batch when their gate sequences match (spin_batch).
 * walker-trial contractions never form the d=4 walker: factorized (alpha, beta, trial) blocks per shared label,
   Pa*Pb*Pt*(Pa+Pb+Pt) per transition (make_factorized_plan, left_contract, right_environments, field_sweep).
+  The trial may carry (N_up, N_dn) labels (MpsTrial) or particle-number labels only (a RotatedMpsTrial, labelled
+  by number_labels): then each walker label (N_alpha, N_beta) meets the trial's N_alpha + N_beta sector.
 * walker QR by CholeskyQR2 with a Householder fallback (make_batch_qr("cholesky")).
 * everything large (trial and H|trial> blocks, exp(-dt K/2), HS factors) is a jit argument (DeviceData), not an
   HLO constant; walkers are chunked with lax.map as the memory model requires (choose_chunks, chunked).
@@ -56,7 +58,7 @@ from trot.prop.cpmc import init_prop_state
 from trot.prop.hubbard_cpmc_ops import _build_prop_ctx
 from trot.prop.mps_cpmc import constrain_ratio
 from trot.prop.types import PropOps, PropState, QmcParams
-from trot.trial.mps import compress_mps_qn, get_rdm1, rhf_orbitals
+from trot.trial.mps import compress_mps_qn, get_rdm1, label_array, rhf_orbitals
 from trot.walkers import _qr as qr_with_det
 
 
@@ -725,6 +727,50 @@ def _table(keys, n):
     return table
 
 
+N_PHYSICAL = np.array([0, 1, 1, 2])  # n_alpha + n_beta of p = n_alpha + 2 n_beta
+
+
+def number_labels(tensors):
+    """Particle-number bond labels of a real d=4 MPS, read off its nonzero entries.
+
+    Bond 0 has N = 0, and every nonzero entry A[i, p, j] gives index j the label
+    N_i + n_up(p) + n_dn(p). A spin rotation acts site by site and keeps N, so a
+    rotated trial (RotatedMpsTrial) keeps the input's N labels while its (N_up, N_dn)
+    labels are lost. Returns L+1 (D, 1) int arrays, or None if some index is reached
+    with two different N (the MPS mixes particle numbers in this gauge). An index
+    that no nonzero entry reaches gets -1: its left block is zero, so it pairs with
+    no walker label and dropping it is exact.
+    """
+    labels = [np.zeros(1, int)]
+    for A in tensors:
+        hit = (np.asarray(A) != 0) & (labels[-1] >= 0)[:, None, None]
+        candidate = (labels[-1][:, None] + N_PHYSICAL[None, :])[:, :, None]
+        high = np.where(hit, candidate, -1).max(axis=(0, 1))
+        low = np.where(hit, candidate, np.iinfo(int).max).min(axis=(0, 1))
+        if np.any((high >= 0) & (low != high)):
+            return None
+        labels.append(high)
+    return tuple(q[:, None] for q in labels)
+
+
+def _fixed_key(width):
+    """The fixed MPS's label that a walker label pair c = (N_alpha, N_beta) contracts
+    with: c itself for (N_up, N_dn) labels, (N_alpha + N_beta,) for N labels."""
+    if width == 2:
+        return lambda c: c
+    if width == 1:
+        return lambda c: (c[0] + c[1],)
+    raise ValueError(f"fixed MPS labels must be (N_up, N_dn) pairs or particle numbers, got width {width}")
+
+
+def _fixed_block(tensor, rows, p, columns, left, right):
+    """Block (left label, p, right label) of one site of the fixed MPS: a dense tensor, or
+    mps_cpmc_2d_gpu's block form {(left, p, right): block} (rows and columns in bond order)."""
+    if isinstance(tensor, dict):
+        return tensor.get((left, p, right), 0.0)
+    return np.asarray(tensor)[np.ix_(rows, [p], columns)][:, 0]
+
+
 def make_factorized_plan(qa, qb, fixed_np, fixed_charges) -> ContractionPlan:
     """Layout of <fixed MPS|walker> with the walker kept as its two spin channels.
 
@@ -732,17 +778,25 @@ def make_factorized_plan(qa, qb, fixed_np, fixed_charges) -> ContractionPlan:
     fixed) block per shared (N_alpha, N_beta) label. A transition moves label
     (a, b) to (a + n_alpha, b + n_beta) through physical p; its alpha, beta and
     fixed blocks are gathered separately, so the d=4 walker is never formed.
+
+    fixed_charges are (N_up, N_dn) labels, or particle-number labels N (width 1:
+    a spin-rotated trial used as it is, see number_labels). With N labels the walker
+    label (a, b) meets the fixed MPS's whole N = a + b sector: the walker's channels
+    and the interleave sign (-1)^(n_alpha N_beta) keep their own labels, so nothing
+    else changes. fixed_np's sites may be dense or in mps_cpmc_2d_gpu's block form.
     """
     n = len(qa) - 1
     ia, ib = [_index_1d(q) for q in qa], [_index_1d(q) for q in qb]
+    fixed_charges = [label_array(q) for q in fixed_charges]
+    key = _fixed_key(fixed_charges[0].shape[1])
     it = [_charge_index(q) for q in fixed_charges]
-    shared = [sorted(c for c in it[i] if c[0] in ia[i] and c[1] in ib[i]) for i in range(n + 1)]
+    shared = [sorted(c for c in itertools.product(ia[i], ib[i]) if key(c) in it[i]) for i in range(n + 1)]
     pads = [(max((len(ia[i][c[0]]) for c in shared[i]), default=1),
              max((len(ib[i][c[1]]) for c in shared[i]), default=1),
-             max((len(it[i][c]) for c in shared[i]), default=1)) for i in range(n + 1)]
+             max((len(it[i][key(c)]) for c in shared[i]), default=1)) for i in range(n + 1)]
 
     sites, blocks = [], []
-    exact = sum(len(ia[i][c[0]]) * len(ib[i][c[1]]) * len(it[i][c]) for i in range(n + 1) for c in shared[i])
+    exact = sum(len(ia[i][c[0]]) * len(ib[i][c[1]]) * len(it[i][key(c)]) for i in range(n + 1) for c in shared[i])
     padded = sum(len(shared[i]) * int(np.prod(pads[i])) for i in range(n + 1))
     for site in range(n):
         (Pa, Pb, Pt), (Pa2, Pb2, Pt2) = pads[site], pads[site + 1]
@@ -757,13 +811,13 @@ def make_factorized_plan(qa, qb, fixed_np, fixed_charges) -> ContractionPlan:
                     continue
                 ra, ca_ = ia[site][c[0]], ia[site + 1][c2[0]]
                 rb, cb_ = ib[site][c[1]], ib[site + 1][c2[1]]
-                rt, ct = it[site][c], it[site + 1][c2]
+                rt, ct = it[site][key(c)], it[site + 1][key(c2)]
                 a = np.full((Pa, Pa2), Dla * 2 * Dra, np.int32)
                 a[:len(ra), :len(ca_)] = ra[:, None] * 2 * Dra + na * Dra + ca_[None, :]
                 b = np.full((Pb, Pb2), Dlb * 2 * Drb, np.int32)
                 b[:len(rb), :len(cb_)] = rb[:, None] * 2 * Drb + nb * Drb + cb_[None, :]
                 t = np.zeros((Pt, Pt2))
-                t[:len(rt), :len(ct)] = np.asarray(fixed_np[site])[np.ix_(rt, [p], ct)][:, 0]
+                t[:len(rt), :len(ct)] = _fixed_block(fixed_np[site], rt, p, ct, key(c), key(c2))
                 src.append(s)
                 dst.append(out_index[c2])
                 physical.append(p)
@@ -1133,8 +1187,9 @@ def divisor_at_least(n, k) -> int:
 @tree_util.register_pytree_node_class
 class BatchedMeasCtx:
     """meas_ctx of the batched engine: the DeviceData (trial and H|trial> blocks, exp(-dt K/2), HS factors) as jit
-    arguments, and static diagnostics in the aux data: the trial's bond labels, the energy kernel, <T|H|T> and the
-    H|trial> bond dimensions (the attributes trot.gmps.driver prints, as on trot.meas.mps.MpsMeasCtx)."""
+    arguments, and static diagnostics in the aux data: the trial's identity (bond labels of an MpsTrial, see
+    trial_labels), the energy kernel, <T|H|T> (over all sectors for a RotatedMpsTrial) and the H|trial> bond
+    dimensions (the attributes trot.gmps.driver prints, as on trot.meas.mps.MpsMeasCtx)."""
 
     def __init__(self, data: DeviceData, key: tuple):
         self.data, self.key = data, key
@@ -1152,21 +1207,51 @@ class BatchedMeasCtx:
         return cls(children[0], key)
 
 
-def make_batched_ops(ham_data, trial, plan, params):
-    """trot TrialOps, MeasOps and PropOps for an MpsTrial on this engine.
+def trial_identity(trial):
+    """What build_meas_ctx compares: an MpsTrial's bond labels, a RotatedMpsTrial's bond dimensions and nelec (the
+    rule of trot.meas.mps_rotated.check_rotated_meas_ctx)."""
+    from trot.trial.mps_rotation import RotatedMpsTrial
 
-    plan is trot's MpsWalkerPlan (trot.trial.mps.make_walker_plan): the orbital and bond plans the circuit is
-    compiled from. The step is make_half_step twice (the reference step's arithmetic, RNG use and order); trot's
-    block measures with these ops. Returns (GpuOps, TrialOps, MeasOps, PropOps); trot.gmps.driver.make_mps_cpmc_ops
-    wraps them.
+    if isinstance(trial, RotatedMpsTrial):
+        return ("rotated", trial.bond_dims, tuple(trial.nelec))
+    return trial.charges
+
+
+def trial_labels(trial):
+    """(dense tensors, bond labels) the engine contracts a trial with. An MpsTrial has exact (N_up, N_dn) labels; a
+    RotatedMpsTrial (trot.trial.mps_rotation: no definite S_z, bonds as they are) gets the particle-number labels of
+    its tensors (number_labels), so its contractions stay blocked."""
+    from trot.trial.mps_rotation import RotatedMpsTrial
+
+    tensors = [np.asarray(A) for A in trial.tensors]
+    if not isinstance(trial, RotatedMpsTrial):
+        return tensors, trial.charge_arrays()
+    labels = number_labels(tensors)
+    if labels is None:
+        raise ValueError("the rotated trial mixes particle numbers at some bond, so it has no N labels to block on; "
+                         'use engine="reference" (dense contractions)')
+    if int(labels[-1][0, 0]) != sum(trial.nelec):
+        raise ValueError(f"the trial holds no N = {sum(trial.nelec)} component (its tensors end at N = "
+                         f"{int(labels[-1][0, 0])})")
+    return tensors, labels
+
+
+def make_batched_ops(ham_data, trial, plan, params):
+    """trot TrialOps, MeasOps and PropOps for an MpsTrial or a RotatedMpsTrial on this engine.
+
+    plan is trot's MpsWalkerPlan (trot.trial.mps.make_walker_plan, or make_rotated_walker_plan): the orbital and bond
+    plans the circuit is compiled from. A RotatedMpsTrial is contracted with its N labels (trial_labels): the walker's
+    spin channels stay separate, and H|trial> keeps N labels too. The step is make_half_step twice (the reference
+    step's arithmetic, RNG use and order); trot's block measures with these ops. Returns (GpuOps, TrialOps, MeasOps,
+    PropOps); trot.gmps.driver.make_mps_cpmc_ops and make_rotated_mps_cpmc_ops wrap them.
     """
     if params.propagator != "fast":
         raise ValueError('the batched engine implements the "fast" propagator; use engine="reference" for "slow"')
     linalg, walker_qr = resolve_linalg(params)
     plan_a, plan_b = plan.orbital_plans
     bond_a, bond_b = plan.bond_plans
-    trial_np = [np.asarray(A) for A in trial.tensors]
-    trial_q = trial.charge_arrays()
+    trial_np, trial_q = trial_labels(trial)
+    identity = trial_identity(trial)
     W = hubbard_mpo_from_h1(hubbard_h1(ham_data), float(ham_data.u))
     if params.energy_kernel == "blocked":
         htrial = compress_mps_qn(*trial_times_h(W, trial_np, trial_q))
@@ -1178,7 +1263,7 @@ def make_batched_ops(ham_data, trial, plan, params):
     ops = make_gpu_ops(plan_a, plan_b, bond_a, bond_b, trial_np, trial_q, htrial, _build_prop_ctx(ham_data, params.dt),
                        linalg=linalg, walker_qr=walker_qr, spin_batch=True, energy=params.energy_kernel)
     h_bonds = tuple(int(A.shape[0]) for A in h_np) + (int(h_np[-1].shape[-1]),)
-    meas_ctx = BatchedMeasCtx(ops.data, (trial.charges, params.energy_kernel, float(trial_energy), h_bonds))
+    meas_ctx = BatchedMeasCtx(ops.data, (identity, params.energy_kernel, float(trial_energy), h_bonds))
 
     @jax.jit
     def overlap(walker, trial_data=None):
@@ -1192,7 +1277,7 @@ def make_batched_ops(ham_data, trial, plan, params):
         return ops.energies(ca[None], cb[None], ops.data if ctx is None else ctx.data)[0]
 
     def build_meas_ctx(_ham, trial_data):
-        if trial_data.charges != trial.charges:
+        if trial_identity(trial_data) != identity:
             raise ValueError("the batched ops were built for a different trial (bond labels differ)")
         return meas_ctx
 

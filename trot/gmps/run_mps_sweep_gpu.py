@@ -11,7 +11,10 @@ finishes, to <out>/blocks.jsonl.
         --walkers 2048 --eql 60 --blocks 200 --out sweep_gpu
 
 --trial-rotation BETA rotates the DMRG trial by exp(-i BETA S^y) and projects it onto the walkers' sector (90:
-one-node spin projection); it adds _rot<BETA> to the run tag.
+one-node spin projection); it adds _rot<BETA> to the run tag. --rotated-trial as_is uses the rotated trial as it
+is (no projection, particle-number labels; the same run up to roundoff) and adds _asis. --natural-rdm1 before takes
+the plan reference, bond plans and walker start from the DMRG trial's rdm1 before the rotation (default: after) and
+adds _NObefore.
 """
 import argparse
 import itertools
@@ -41,6 +44,10 @@ parser.add_argument("--dt", type=float, default=0.01)
 parser.add_argument("--tag-suffix", default="", help="appended to every run tag")
 parser.add_argument("--trial-rotation", type=float, default=0.0,
                     help="mps_cpmc_gpu: rotate the trial by exp(-i beta S^y), degrees, and project onto the sector")
+parser.add_argument("--rotated-trial", default="projected", choices=["projected", "as_is"],
+                    help="mps_cpmc_gpu: project the rotated trial onto the sector, or use it as it is (N labels)")
+parser.add_argument("--natural-rdm1", default="after", choices=["after", "before"],
+                    help="mps_cpmc_gpu: natural orbitals of the trial's rdm1 after or before the rotation")
 parser.add_argument("--save-walkers", action="store_true",
                     help="mps_cpmc_gpu: save every block's walkers to <out>/<tag>_walkers.npz and the DMRG trial to "
                          "<out>/dmrg_trial_L<L>_U<U>_chi<trial chi>.npz (the notebooks' formats)")
@@ -61,9 +68,10 @@ failed = []
 for L, U, chi_w in itertools.product(args.L, args.U, args.chi_w):
     tag = f"L{L}_T{args.trial_chi}_w{chi_w}" if U == 4.0 else f"L{L}_U{U:g}_T{args.trial_chi}_w{chi_w}"
     tag += ("_NOplan" if args.plan_reference == "natural" else "") + ("_NOstart" if args.walker_start == "natural" else "")
-    tag += f"_rot{args.trial_rotation:g}" if args.trial_rotation else ""
+    rot = (f"_rot{args.trial_rotation:g}" + ("_asis" if args.rotated_trial == "as_is" else "")
+           if args.trial_rotation else "")
+    tag += rot + ("_NObefore" if args.trial_rotation and args.natural_rdm1 == "before" else "")
     tag += f"_s{args.seed}" + args.tag_suffix
-    rot = f"_rot{args.trial_rotation:g}" if args.trial_rotation else ""
     cfg = (f"L={L}, n_up={L // 2}, n_down={L // 2}, interaction={U}, trial_chi={args.trial_chi}, "
            f"walker_channel_chi={chi_w}, plan_reference={args.plan_reference!r}, walker_start={args.walker_start!r}, "
            f"n_walkers={args.walkers}, n_equilibration={args.eql}, n_blocks={args.blocks}, n_steps={args.steps}, "
@@ -74,7 +82,8 @@ for L, U, chi_w in itertools.product(args.L, args.U, args.chi_w):
     if args.module == "mps_cpmc_gpu":
         cfg += (f", n_chunks={args.n_chunks}, mem_fraction={args.mem_fraction}, linalg={args.linalg!r}, "
                 f"walker_qr={args.walker_qr!r}, energy={args.energy!r}, trial_cache={args.trial_cache!r}, "
-                f"compile_cache={args.compile_cache!r}, trial_rotation={args.trial_rotation}")
+                f"compile_cache={args.compile_cache!r}, trial_rotation={args.trial_rotation}, "
+                f"rotated_trial={args.rotated_trial!r}, natural_rdm1={args.natural_rdm1!r}")
         if args.save_walkers:
             cfg += (f", walker_snapshots={os.path.join(out, tag + '_walkers.npz')!r}, "
                     f"trial_export={os.path.join(out, f'dmrg_trial_L{L}_U{U:g}_chi{args.trial_chi}{rot}.npz')!r}")

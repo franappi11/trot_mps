@@ -76,6 +76,7 @@ from trot.ham.hubbard import HamHubbard
 from trot.prop.hubbard_cpmc_ops import _build_prop_ctx
 from trot.prop.types import PropState, QmcParams
 from trot.stat_utils import blocking_analysis_ratio, reject_outliers
+from trot.trial.mps import _label_sectors, compress_mps_qn, label_array  # noqa: F401  (one copy, N labels too)
 from trot.trial.uhf import UhfTrial, get_rdm1 as uhf_get_rdm1
 from trot.walkers import _qr as qr_with_det
 from trot.gmps.gpu import (  # noqa: F401  (the device engine; re-exported for scripts and tests)
@@ -85,6 +86,7 @@ from trot.gmps.gpu import (  # noqa: F401  (the device engine; re-exported for s
     DeviceData,
     FactorOp,
     GpuOps,
+    N_PHYSICAL,
     ONE_HOT,
     PHYSICAL,
     SECTOR_KINDS,
@@ -95,6 +97,8 @@ from trot.gmps.gpu import (  # noqa: F401  (the device engine; re-exported for s
     _can_group,
     _charge_index,
     _cholesky_qr,
+    _fixed_block,
+    _fixed_key,
     _gate_op,
     _gather_flat,
     _group_op,
@@ -129,8 +133,11 @@ from trot.gmps.gpu import (  # noqa: F401  (the device engine; re-exported for s
     make_half_step,
     memory_model,
     mps_overlap_host,
+    number_labels,
     right_environments,
     run_circuit,
+    trial_identity,
+    trial_labels,
     walker_blocks,
 )
 from trot.gmps.utils import (  # noqa: F401  (byte-identical host primitives)
@@ -197,10 +204,18 @@ class Config:
     spin_batch: bool = True  # convert both spin channels as one batch when their circuits match
     self_check: bool = True  # check one device conversion against the NumPy original at start-up
     trial_cache: str = ""  # directory for cached DMRG trials (skips DMRG when present)
-    # Rotate the DMRG trial by exp(-i beta S^y) on every site (degrees) and project it exactly onto the walkers'
-    # (n_up, n_down) sector (trot.trial.mps.rotate_spin, make_mps_trial). 90 = one-node spin projection: every odd
-    # total spin removed. The plan reference and the walker start then come from the rotated trial's rdm1.
+    # Rotate the DMRG trial by exp(-i beta S^y) on every site (degrees; trot.trial.mps.rotate_spin). 90 = one-node
+    # spin projection: every odd total spin removed. rotated_trial="projected" projects it exactly onto the walkers'
+    # (n_up, n_down) sector (make_mps_trial: (N_up, N_dn) labels); "as_is" keeps the rotated tensors and bonds
+    # (trot.trial.mps_rotation.make_rotated_mps_trial) and blocks every contraction on particle number
+    # (gpu.number_labels): overlaps are sqrt(sector weight) times the projected trial's, local energies and the run
+    # are the same. Either way the plan reference and the walker start come from the rotated trial's rdm1 before
+    # any projection (trot's MpsTrial / RotatedMpsTrial default), so both choices propagate the same walkers.
     trial_rotation: float = 0.0
+    rotated_trial: str = "projected"  # projected, as_is
+    # With trial_rotation: the rdm1 whose natural orbitals give the plan reference, the bond plans and the walker
+    # start: the trial's "after" the rotation (spin averaged at 90 deg) or the DMRG trial's "before" it.
+    natural_rdm1: str = "after"  # after, before
     compile_cache: str = ""  # JAX persistent compilation cache directory
     result_json: str = ""
     block_log: str = ""  # if set, append every block's scalars here as it finishes
@@ -523,8 +538,11 @@ MPO_QN = np.array([[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1], [0, 0]])
 
 def apply_mpo_qn(W, tensors, charges):
     """apply_mpo, carrying the bond labels. The output bond flattens (MPO bond, MPS
-    bond) with the MPO index major, so its label is MPO_QN[a] + q[c]."""
-    out, labels = [], [MPO_QN[:1] + np.asarray(charges[0])]
+    bond) with the MPO index major, so its label is MPO_QN[a] + q[c]; for particle-number
+    labels (width 1, a rotated trial used as it is) the MPO state adds its N."""
+    charges = [label_array(q) for q in charges]
+    mpo_qn = MPO_QN if charges[0].shape[1] == 2 else MPO_QN.sum(axis=1, keepdims=True)
+    out, labels = [], [mpo_qn[:1] + charges[0]]
     last = len(tensors) - 1
     for i, (w, A) in enumerate(zip(W, tensors)):
         if i == 0:
@@ -534,70 +552,9 @@ def apply_mpo_qn(W, tensors, charges):
         T = np.einsum("apqb,cqd->acpbd", w, np.asarray(A))
         dl, cl, d, dr, cr = T.shape
         out.append(T.reshape(dl * cl, d, dr * cr))
-        mpo_right = MPO_QN[5:6] if i == last else MPO_QN
-        labels.append((mpo_right[:, None, :] + np.asarray(charges[i + 1])[None, :, :]).reshape(-1, 2))
+        mpo_right = mpo_qn[5:6] if i == last else mpo_qn
+        labels.append((mpo_right[:, None, :] + charges[i + 1][None, :, :]).reshape(-1, mpo_qn.shape[1]))
     return out, tuple(labels)
-
-
-def _label_sectors(row_labels, column_labels):
-    rows, columns = _charge_index(row_labels), _charge_index(column_labels)
-    return [(c, rows[c], columns[c]) for c in sorted(set(rows) & set(columns))]
-
-
-def compress_mps_qn(tensors, charges, relative_tolerance=1.0e-13):
-    """compress_mps that keeps the (N_alpha, N_beta) bond labels.
-
-    The QR sweep and the SVD sweep factor each charge sector separately and the
-    rank cut is one relative tolerance per bond applied per sector, so no
-    factorisation mixes charges (the dense compress can, at degenerate singular
-    values) and the result can be contracted charge-blocked like the trial.
-    """
-    A = [np.array(t, dtype=float, copy=True) for t in tensors]
-    Q = [np.asarray(q, int).reshape(-1, 2) for q in charges]
-    for i in range(len(A) - 1):
-        Dl, d, Dr = A[i].shape
-        M = A[i].reshape(Dl * d, Dr)
-        rows = (Q[i][:, None, :] + PHYSICAL_CHARGE[None]).reshape(-1, 2)
-        left, right, labels = [], [], []
-        for c, r, k in _label_sectors(rows, Q[i + 1]):
-            q, rr = np.linalg.qr(M[np.ix_(r, k)])
-            lq = np.zeros((Dl * d, q.shape[1]))
-            lq[r] = q
-            rq = np.zeros((q.shape[1], Dr))
-            rq[:, k] = rr
-            left.append(lq)
-            right.append(rq)
-            labels += [c] * q.shape[1]
-        A[i] = np.concatenate(left, axis=1).reshape(Dl, d, -1)
-        A[i + 1] = np.tensordot(np.concatenate(right, axis=0), A[i + 1], axes=1)
-        Q[i + 1] = np.asarray(labels, int).reshape(-1, 2)
-    for i in range(len(A) - 1, 0, -1):
-        Dl, d, Dr = A[i].shape
-        M = A[i].reshape(Dl, d * Dr)
-        columns = (Q[i + 1][None, :, :] - PHYSICAL_CHARGE[:, None, :]).reshape(-1, 2)
-        factors = []
-        for c, r, k in _label_sectors(Q[i], columns):
-            u, s, vh = np.linalg.svd(M[np.ix_(r, k)], full_matrices=False)
-            factors.append((c, r, k, u, s, vh))
-        cut = relative_tolerance * max(max(f[4][0] for f in factors), 1e-300)
-        left, right, labels = [], [], []
-        for c, r, k, u, s, vh in factors:
-            n = int(np.sum(s > cut))
-            if n == 0:
-                continue
-            lu = np.zeros((Dl, n))
-            lu[r] = u[:, :n] * s[:n]
-            rv = np.zeros((n, d * Dr))
-            rv[:, k] = vh[:n]
-            left.append(lu)
-            right.append(rv)
-            labels += [c] * n
-        A[i] = np.concatenate(right, axis=0).reshape(-1, d, Dr)
-        A[i - 1] = np.tensordot(A[i - 1], np.concatenate(left, axis=1), axes=(2, 0))
-        Q[i] = np.asarray(labels, int).reshape(-1, 2)
-    return A, tuple(Q)
-
-
 
 
 def make_block(ops: GpuOps, params: QmcParams, n_chunks: int, energy_chunks: int, record_comb=False):
@@ -782,7 +739,8 @@ class WalkerSnapshots:
 def export_trial(path, cfg, trial_np, trial_charges, dmrg_energy, references, start):
     """The DMRG trial in the format fixed_block_walkers.ipynb loads (its DMRG_FILE): T{i} (d=4 tensors, local
     index n_up + 2 n_dn), H{i} (H|trial>, dense-compressed exactly as the notebook builds it), q{i} (the
-    (N_up, N_dn) bond labels) and e_dmrg; plus its spin-resolved one-body density matrices (gamma), the plan
+    (N_up, N_dn) bond labels; particle numbers N for rotated_trial="as_is") and e_dmrg; plus its spin-resolved
+    one-body density matrices (gamma), the plan
     reference determinant (reference_up/dn: the natural orbitals for plan_reference="natural") and the walkers'
     starting determinant (start_up/dn)."""
     H = compress_mps(apply_mpo(hubbard_mpo(cfg.L, cfg.hopping, cfg.interaction), trial_np))
@@ -868,6 +826,8 @@ class Setup(NamedTuple):
     info: dict
     references: tuple  # plan reference determinants (Ra, Rb)
     trial: tuple  # (dense trial tensors, their labels)
+    htrial: tuple = ()  # compressed H|trial> tensors the energy uses, if kept for export (mps_cpmc_2d_gpu)
+    rdm1: np.ndarray | None = None  # (2, L, L) trial rdm1 the "natural" plan reference and walker start use
 
 
 def resolve_backend_options(cfg: Config):
@@ -901,16 +861,34 @@ def build(cfg: Config = CFG, verbose=True) -> Setup:
     say(f"L={cfg.L} ({cfg.n_up},{cfg.n_down}), U={cfg.interaction}")
 
     trial_np, trial_charges, dmrg_energy = load_or_run_trial(cfg)
-    sector_weight = 1.0
+    sector_weight, trial_rdm1 = 1.0, None
     if cfg.trial_rotation:
+        if cfg.natural_rdm1 == "before":
+            trial_rdm1 = np.stack(one_rdm(trial_np))  # the DMRG trial's, before the rotation
+        elif cfg.natural_rdm1 != "after":
+            raise ValueError("natural_rdm1 must be 'after' or 'before'")
         from trot.trial.mps import make_mps_trial, rotate_spin, spin_rotation_y
+        from trot.trial.mps_rotation import make_rotated_mps_trial
 
-        rotated = make_mps_trial(rotate_spin(trial_np, spin_rotation_y(cfg.trial_rotation)),
-                                 nelec=(cfg.n_up, cfg.n_down))
-        trial_np, trial_charges = [np.asarray(A) for A in rotated.tensors], rotated.charge_arrays()
-        sector_weight = rotated.sector_weight
-        say(f"trial rotated by {cfg.trial_rotation:g} deg about y and projected onto ({cfg.n_up},{cfg.n_down}): "
-            f"sector weight {sector_weight:.6f}, bonds max {max(rotated.bond_dims)}")
+        R, nelec = spin_rotation_y(cfg.trial_rotation), (cfg.n_up, cfg.n_down)
+        if cfg.rotated_trial == "projected":
+            rotated = make_mps_trial(rotate_spin(trial_np, R), nelec=nelec)
+            trial_np, trial_charges = [np.asarray(A) for A in rotated.tensors], rotated.charge_arrays()
+            sector_weight = rotated.sector_weight
+            say(f"trial rotated by {cfg.trial_rotation:g} deg about y and projected onto ({cfg.n_up},{cfg.n_down}): "
+                f"sector weight {sector_weight:.6f}, bonds max {max(rotated.bond_dims)}")
+        elif cfg.rotated_trial == "as_is":
+            rotated = make_rotated_mps_trial(trial_np, R, nelec=nelec)
+            trial_np, trial_charges = trial_labels(rotated)
+            sector_weight = None  # not computed: nothing is projected
+            say(f"trial rotated by {cfg.trial_rotation:g} deg about y, used as it is (particle-number labels): "
+                f"bonds max {max(rotated.bond_dims)}")
+        else:
+            raise ValueError("rotated_trial must be 'projected' or 'as_is'")
+        if trial_rdm1 is None:
+            trial_rdm1 = np.asarray(rotated.rdm1)
+        say(f"natural orbitals (plan reference, bond plans, walker start) from the trial's rdm1 "
+            f"{cfg.natural_rdm1} the rotation")
     trial = tuple(jnp.asarray(A) for A in trial_np)
     np.testing.assert_allclose(float(contract_real(trial, trial)), 1.0, atol=1e-10)
     mpo = hubbard_mpo(cfg.L, cfg.hopping, cfg.interaction)
@@ -923,8 +901,12 @@ def build(cfg: Config = CFG, verbose=True) -> Setup:
 
     determinants = {"rhf": (Ca, Cb)}
     if "natural" in (cfg.plan_reference, cfg.walker_start):
-        gamma_a, gamma_b = one_rdm(trial_np)
-        np.testing.assert_allclose([np.trace(gamma_a), np.trace(gamma_b)], [cfg.n_up, cfg.n_down], atol=1e-8)
+        if trial_rdm1 is None:
+            trial_rdm1 = np.stack(one_rdm(trial_np))
+            np.testing.assert_allclose(np.trace(trial_rdm1, axis1=1, axis2=2), [cfg.n_up, cfg.n_down], atol=1e-8)
+        else:  # a rotated trial's <N_up> - <N_dn> is cos(beta) (N_up - N_dn) before the projection
+            np.testing.assert_allclose(np.trace(trial_rdm1, axis1=1, axis2=2).sum(), cfg.n_up + cfg.n_down, atol=1e-8)
+        gamma_a, gamma_b = trial_rdm1
         Na, occupations = natural_orbitals(gamma_a, cfg.n_up)
         Nb, _ = natural_orbitals(gamma_b, cfg.n_down)
         determinants["natural"] = (Na, Nb)
@@ -992,7 +974,7 @@ def build(cfg: Config = CFG, verbose=True) -> Setup:
                 backend=jax.default_backend(), walker_d4_chi=max(len(x) * len(y) for x, y in zip(qa, qb)),
                 overlap_plan=ops.overlap_plan.stats)
     return Setup(cfg, system, ham, ops, params, trial_data, (plan_a, plan_b), (bond_a, bond_b),
-                 n_chunks, energy_chunks, memory, info, (Ra, Rb), (trial_np, trial_charges))
+                 n_chunks, energy_chunks, memory, info, (Ra, Rb), (trial_np, trial_charges), rdm1=trial_rdm1)
 
 
 def main(cfg=CFG):
@@ -1023,6 +1005,8 @@ def main(cfg=CFG):
                       CHI_PROP=cfg.walker_channel_chi, E_DMRG=setup.info["dmrg_energy"],
                       E_TRIAL=setup.info["trial_energy"], plan_reference=cfg.plan_reference,
                       walker_start=cfg.walker_start, orbital_plan=cfg.orbital_plan, EPS=cfg.occupation_tolerance,
+                      trial_rotation=cfg.trial_rotation, rotated_trial=cfg.rotated_trial,
+                      natural_rdm1=cfg.natural_rdm1,
                       trial_file=cfg.trial_export, tag=cfg.tag, module="mps_cpmc_gpu", device=setup.info["device"])
         snapshots = WalkerSnapshots(cfg.walker_snapshots, cfg.n_equilibration + cfg.n_blocks + 1, cfg.n_walkers,
                                     cfg.L, cfg.n_up, cfg.n_down, config)

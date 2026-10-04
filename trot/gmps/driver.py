@@ -94,12 +94,17 @@ def make_mps_cpmc_ops(ham_data, trial_data: MpsTrial, sys, params) -> MpsCpmcOps
 def make_rotated_mps_cpmc_ops(ham_data, trial_data: RotatedMpsTrial, sys, params) -> MpsCpmcOps:
     """Walker plan and trot ops for a RotatedMpsTrial (no S_z projection) with QmcParamsMps.
 
-    Overlap, local energy and the fast sweep contract densely (the trial has no bond labels), so
-    params.energy_kernel is ignored; everything else follows make_mps_cpmc_ops.
+    params.engine as in make_mps_cpmc_ops. The batched engine blocks every contraction on the
+    trial's particle-number labels (trot.gmps.gpu.trial_labels) and keeps the walker's spin
+    channels apart; the reference engine contracts densely with the d=4 walker and ignores
+    params.energy_kernel. Everything else follows make_mps_cpmc_ops.
     """
     if not isinstance(trial_data, RotatedMpsTrial):
         raise TypeError("trial_data must be a RotatedMpsTrial (see make_rotated_mps_trial)")
     plan = make_rotated_walker_plan(ham_data, trial_data, sys, params)
+    if gpu.resolve_engine(params) == "batched":
+        engine, trial_ops, meas_ops, prop_ops = gpu.make_batched_ops(ham_data, trial_data, plan, params)
+        return MpsCpmcOps(plan, trial_ops, meas_ops, prop_ops, engine)
     return MpsCpmcOps(
         plan=plan,
         trial_ops=make_rotated_trial_ops(plan),
@@ -128,7 +133,9 @@ def _print_diagnostics(ham_data, trial, ops, params, meas_ctx, dmrg) -> None:
     plan_a, plan_b = plan.orbital_plans
     gates = lambda p: int(p.block_sizes.sum() - len(p.block_sizes))
     print(f"MPS trial: norb={trial.norb}, nelec={trial.nelec}, bonds {list(trial.bond_dims)}")
-    if trial.sector_weight < 1.0 - 1.0e-12:
+    if isinstance(trial, RotatedMpsTrial):
+        print("  used as it is: no definite (N_up, N_dn); contractions blocked on particle number")
+    elif trial.sector_weight < 1.0 - 1.0e-12:
         print(
             f"  projected onto the walkers' sector, which holds {trial.sector_weight:.6f} of the norm"
         )
@@ -136,7 +143,7 @@ def _print_diagnostics(ham_data, trial, ops, params, meas_ctx, dmrg) -> None:
         print(f"  DMRG Davidson energy {dmrg.davidson_energy:.12f} (two-site, not variational)")
         print(f"  DMRG variational energy {dmrg.variational_energy:.12f}")
     print(
-        f"  <T|H|T>/<T|T> = {meas_ctx.trial_energy:.12f} ({meas_ctx.kernel} kernel, "
+        f"  <T|H|T>/<T|T> = {meas_ctx.trial_energy:.12f} ({getattr(meas_ctx, 'kernel', 'dense')} kernel, "
         f"H|T> bonds max {max(meas_ctx.h_bond_dims)})"
     )
     print(
@@ -165,6 +172,8 @@ def _print_diagnostics(ham_data, trial, ops, params, meas_ctx, dmrg) -> None:
             f"{gpu.circuit_stats(ops.engine.converter.circuits[0])}; overlap plan {ops.engine.overlap_plan.stats}"
         )
         return
+    if isinstance(trial, RotatedMpsTrial):
+        return  # dense reference contractions: no charge-blocked layout to report
     report = contraction_report(contraction_layout(plan, trial.charges).contraction)
     print(
         f"  overlap environment entries {report}, dense/padded "
@@ -188,7 +197,8 @@ def run_qmc_mps(
 
     trial_data: None (pyblock3 DMRG with params.trial_chi, dmrg_sweeps, dmrg_seed), an MpsTrial,
       a pyblock3 MPS, a DenseMps/Gmps-like object or (tensors, charges). Spin-rotated trials are
-      projected onto the walkers' (N_up, N_dn) sector.
+      projected onto the walkers' (N_up, N_dn) sector, except a RotatedMpsTrial, which is used as
+      it is (make_rotated_mps_cpmc_ops).
     params: QmcParamsMps. block_fn: blocks.block, or e.g. make_block_logger(...) for a JSONL log.
     Returns trot's QmcResult.
     """
@@ -205,9 +215,12 @@ def run_qmc_mps(
             ham_data, sys, chi=params.trial_chi, n_sweeps=params.dmrg_sweeps, seed=params.dmrg_seed
         )
         trial = dmrg.trial
+    elif isinstance(trial_data, RotatedMpsTrial):
+        trial = trial_data
     else:
         trial = as_mps_trial(trial_data, nelec=sys.nelec)
-    ops = make_mps_cpmc_ops(ham_data, trial, sys, params)
+    make_ops = make_rotated_mps_cpmc_ops if isinstance(trial, RotatedMpsTrial) else make_mps_cpmc_ops
+    ops = make_ops(ham_data, trial, sys, params)
     meas_ctx = ops.meas_ops.build_meas_ctx(ham_data, trial)
     prop_ctx = ops.prop_ops.build_prop_ctx(ham_data, ops.trial_ops.get_rdm1(trial), params)
     _print_diagnostics(ham_data, trial, ops, params, meas_ctx, dmrg)
