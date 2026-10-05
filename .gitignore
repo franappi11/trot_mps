@@ -8,6 +8,7 @@ __pycache__/
 # Output files
 runs/
 *.npz
+*.log
 
 # OS
 .DS_Store
