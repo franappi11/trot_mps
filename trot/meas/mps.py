@@ -35,6 +35,7 @@ from trot.trial.mps import (
     convert_walker,
     extract_channel_blocks,
     extract_fixed_blocks,
+    label_array,
     mps_overlap_fn,
 )
 
@@ -167,7 +168,8 @@ CHANNEL_CHARGE = np.array([[1, 0], [-1, 0], [0, 1], [0, -1]])  # c†a, ca, c†
 
 
 def trial_times_h(W, trial_np, trial_charges):
-    """H|trial>, uncompressed, with exact (N_alpha, N_beta) bond labels.
+    """H|trial>, uncompressed, with exact (N_alpha, N_beta) bond labels, or exact particle-number
+    labels N for a trial labelled by N alone (labels of width 1, e.g. a spin-rotated MPS).
 
     Bond index (channel, trial) is labelled with the trial's label plus the charge that
     the channel's open operator has put left of the cut (the opening order of
@@ -175,8 +177,12 @@ def trial_times_h(W, trial_np, trial_charges):
     Padding channels that a bond never uses are dropped.
     """
     n, D = len(trial_np), W.shape[1]
+    trial_charges = [label_array(q) for q in trial_charges]
+    width = trial_charges[0].shape[1]
     delta = np.zeros((D, 2), int)
     delta[1:-1] = np.tile(CHANNEL_CHARGE, ((D - 2) // 4, 1))
+    if width == 1:
+        delta = delta.sum(axis=1, keepdims=True)
     active = (
         [np.zeros(1, int)]
         + [np.flatnonzero(np.any(W[b - 1] != 0, axis=(0, 1, 2))) for b in range(1, n)]
@@ -190,7 +196,7 @@ def trial_times_h(W, trial_np, trial_charges):
         dl, cl, d, dr, cr = T.shape
         tensors.append(T.reshape(dl * cl, d, dr * cr))
     charges = tuple(
-        (delta[active[b]][:, None, :] + np.asarray(trial_charges[b])[None]).reshape(-1, 2)
+        (delta[active[b]][:, None, :] + trial_charges[b][None]).reshape(-1, width)
         for b in range(n + 1)
     )
     return tensors, charges

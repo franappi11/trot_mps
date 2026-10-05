@@ -238,57 +238,81 @@ def _label_sectors(row_labels, column_labels):
     return [(c, rows[c], columns[c]) for c in sorted(set(rows) & set(columns))]
 
 
+def label_array(labels) -> np.ndarray:
+    """One bond's labels as a (D, width) int array: width 2 for (N_up, N_dn) labels, 1 for particle-number
+    labels N (a (D,) array is read as N labels)."""
+    q = np.asarray(labels, int)
+    return q.reshape(len(q), -1)
+
+
+def physical_charge(width: int) -> np.ndarray:
+    """What each local state |0>, |up>, |dn>, |up dn> adds to a bond label of the given width:
+    (n_up, n_dn) for (N_up, N_dn) labels, n_up + n_dn for N labels."""
+    if width == 2:
+        return PHYSICAL_CHARGE
+    if width == 1:
+        return PHYSICAL_CHARGE.sum(axis=1, keepdims=True)
+    raise ValueError(f"bond labels must be (N_up, N_dn) pairs or particle numbers N, got width {width}")
+
+
 def compress_mps_qn(tensors, charges, relative_tolerance=1.0e-13):
-    """compress_mps that keeps the (N_alpha, N_beta) bond labels.
+    """compress_mps that keeps the bond labels: (N_alpha, N_beta) pairs, or particle numbers N
+    (labels of width 1, as for a spin-rotated MPS without definite S_z).
 
     The QR sweep and the SVD sweep factor each charge sector separately and the
     rank cut is one relative tolerance per bond applied per sector, so no
     factorisation mixes charges (the dense compress can, at degenerate singular
     values) and the result can be contracted charge-blocked like the trial.
+
+    The R factors (QR sweep) and U S factors (SVD sweep) are block diagonal in the
+    charge, so each is multiplied into the neighbouring tensor one sector at a time,
+    on that sector's rows or columns only. A dense product (the earlier code) gives
+    the same numbers up to summation order and costs about one factor of the number
+    of sectors more: minutes on the host at bond 18 x 256 (4x4 lattice).
     """
     A = [np.array(t, dtype=float, copy=True) for t in tensors]
-    Q = [np.asarray(q, int).reshape(-1, 2) for q in charges]
+    Q = [label_array(q) for q in charges]
+    width = Q[0].shape[1]
+    physical = physical_charge(width)
     for i in range(len(A) - 1):
         Dl, d, Dr = A[i].shape
         M = A[i].reshape(Dl * d, Dr)
-        rows = (Q[i][:, None, :] + PHYSICAL_CHARGE[None]).reshape(-1, 2)
-        left, right, labels = [], [], []
-        for c, r, k in _label_sectors(rows, Q[i + 1]):
-            q, rr = np.linalg.qr(M[np.ix_(r, k)])
-            lq = np.zeros((Dl * d, q.shape[1]))
-            lq[r] = q
-            rq = np.zeros((q.shape[1], Dr))
-            rq[:, k] = rr
-            left.append(lq)
-            right.append(rq)
-            labels += [c] * q.shape[1]
-        A[i] = np.concatenate(left, axis=1).reshape(Dl, d, -1)
-        A[i + 1] = np.tensordot(np.concatenate(right, axis=0), A[i + 1], axes=1)
-        Q[i + 1] = np.asarray(labels, int).reshape(-1, 2)
+        rows = (Q[i][:, None, :] + physical[None]).reshape(-1, width)
+        factors = [(c, r, k, *np.linalg.qr(M[np.ix_(r, k)])) for c, r, k in _label_sectors(rows, Q[i + 1])]
+        new = sum(q.shape[1] for *_, q, _ in factors)
+        following = A[i + 1].reshape(Dr, -1)
+        left, right, labels, start = np.zeros((Dl * d, new)), np.zeros((new, following.shape[1])), [], 0
+        for c, r, k, q, rr in factors:
+            m = q.shape[1]
+            left[r, start:start + m] = q
+            right[start:start + m] = rr @ following[k]
+            labels += [c] * m
+            start += m
+        A[i] = left.reshape(Dl, d, new)
+        A[i + 1] = right.reshape((new,) + A[i + 1].shape[1:])
+        Q[i + 1] = np.asarray(labels, int).reshape(-1, width)
     for i in range(len(A) - 1, 0, -1):
         Dl, d, Dr = A[i].shape
         M = A[i].reshape(Dl, d * Dr)
-        columns = (Q[i + 1][None, :, :] - PHYSICAL_CHARGE[:, None, :]).reshape(-1, 2)
+        columns = (Q[i + 1][None, :, :] - physical[:, None, :]).reshape(-1, width)
         factors = []
         for c, r, k in _label_sectors(Q[i], columns):
             u, s, vh = np.linalg.svd(M[np.ix_(r, k)], full_matrices=False)
             factors.append((c, r, k, u, s, vh))
         cut = relative_tolerance * max(max(f[4][0] for f in factors), 1e-300)
-        left, right, labels = [], [], []
-        for c, r, k, u, s, vh in factors:
-            n = int(np.sum(s > cut))
-            if n == 0:
-                continue
-            lu = np.zeros((Dl, n))
-            lu[r] = u[:, :n] * s[:n]
-            rv = np.zeros((n, d * Dr))
-            rv[:, k] = vh[:n]
-            left.append(lu)
-            right.append(rv)
+        kept = [(c, r, k, u, s, vh, int(np.sum(s > cut))) for c, r, k, u, s, vh in factors]
+        kept = [f for f in kept if f[-1] > 0]
+        new = sum(f[-1] for f in kept)
+        preceding = A[i - 1].reshape(-1, Dl)
+        left, right, labels, start = np.zeros((preceding.shape[0], new)), np.zeros((new, d * Dr)), [], 0
+        for c, r, k, u, s, vh, n in kept:
+            right[start:start + n, k] = vh[:n]
+            left[:, start:start + n] = preceding[:, r] @ (u[:, :n] * s[:n])
             labels += [c] * n
-        A[i] = np.concatenate(right, axis=0).reshape(-1, d, Dr)
-        A[i - 1] = np.tensordot(A[i - 1], np.concatenate(left, axis=1), axes=(2, 0))
-        Q[i] = np.asarray(labels, int).reshape(-1, 2)
+            start += n
+        A[i] = right.reshape(new, d, Dr)
+        A[i - 1] = left.reshape(A[i - 1].shape[:2] + (new,))
+        Q[i] = np.asarray(labels, int).reshape(-1, width)
     return A, tuple(Q)
 
 
