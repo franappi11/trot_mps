@@ -1,9 +1,0 @@
-job:    7104536 on worker5187
-python: /mnt/home/fnappi/.trot_venv/bin/python dmrg_reference.py
-args:   --L 48 --U 12--chi-w --chi 200 --out sweep_T8/reference.jsonl
-start:  Thu Sep 24 21:06:33 EDT 2026
-env: 3.11.11 jax 0.4.28 trot /mnt/home/fnappi/trot_mps/trot/__init__.py
-usage: dmrg_reference.py [-h] --L L --U U [--chi CHI] [--sweeps SWEEPS] --out
-                         OUT
-dmrg_reference.py: error: argument --U: invalid float value: '12--chi-w'
-finish: Thu Sep 24 21:06:41 EDT 2026  rc=2

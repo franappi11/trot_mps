@@ -1,8 +1,0 @@
-job:    7104682 on worker5165
-python: /mnt/home/fnappi/.trot_venv/bin/python run_mps_sweep.py
-args:   --L 32 --U 8 --chi-w 4 --trial-chi 8 --walkers 200 --eql 60 --blocks 200 --out sweep_T8
-start:  Thu Sep 24 21:45:36 EDT 2026
-env: 3.11.11 jax 0.4.28 trot /mnt/home/fnappi/trot_mps/trot/__init__.py mkl_def ok
-[21:56:18] L32_U8_T8_w4_NOplan_NOstart_s1234  rc=127  640 s
-1 run(s) failed: L32_U8_T8_w4_NOplan_NOstart_s1234
-finish: Thu Sep 24 21:56:18 EDT 2026  rc=1
