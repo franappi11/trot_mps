@@ -136,7 +136,38 @@ def _is_slow_test(item: pytest.Item) -> bool:
         callspec = getattr(item, "callspec", None)
         return callspec is not None and callspec.params.get("walker_kind") != "restricted"
 
+    if path in ("test_mps_cpmc.py", "test_mps_rotation.py", "test_mps_rotated.py"):
+        if test_name == "test_step_matches_trot_slow_cpmc_on_a_nodal_trial":
+            return True
+        if test_name in _MPS_CAPSTONES:
+            callspec = getattr(item, "callspec", None)
+            return callspec is not None and callspec.id not in _MPS_CAPSTONES[test_name]
+
     return False
+
+
+# One capstone case of each kind runs by default; the full matrix needs --run-slow.
+_MPS_CAPSTONES = {
+    "test_sd_and_sd_as_mps_cpmc_runs_are_identical": {
+        "plain-uhf-32",
+        "floor-uhf-32",
+        "nodal-slow-vs-fast",
+        "floor-uhf-32-slow",
+    },
+    "test_rotated_ghf_and_rotated_sd_mps_runs_are_identical": {
+        "rotation-32-plain",
+        "reflection-33-floor",
+    },
+    "test_rotated_ghf_and_mpo_rotated_mps_runs_are_identical": {
+        "mpo-rotation-32-plain",
+        "mpo-reflection-33-floor",
+        "mpo-rotation-32-to-23",
+    },
+    "test_three_rotation_approaches_and_the_rotated_ghf_run_identically": {
+        "three-rotation-32-plain",
+        "three-reflection-33-floor",
+    },
+}
 
 
 def _is_integration_test(item: pytest.Item) -> bool:

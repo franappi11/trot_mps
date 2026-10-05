@@ -14,9 +14,13 @@ runs/
 *.tex
 *.jsonl
 *.sh
+*.csv
 
 # OS
 .DS_Store
 Thumbs.db
 
 pyrightconfig.json
+
+# Julia env
+trot/gmps/itensor_gmps_env/
