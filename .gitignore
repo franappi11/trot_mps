@@ -9,6 +9,11 @@ __pycache__/
 runs/
 *.npz
 *.log
+*.pdf
+*.png
+*.tex
+*.jsonl
+*.sh
 
 # OS
 .DS_Store
