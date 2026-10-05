@@ -32,11 +32,7 @@ params = QmcParamsMps(
     walker_channel_chi=4,
 )
 
-# One call: pyblock3 DMRG trial, then trot's run_qmc.
-run = run_qmc_mps(sys=sys, params=params, ham_data=ham)
-
-# The same run assembled by hand. trial_data can also be mps_trial_from_sd(Ca, Cb), or a
-# spin-rotated MPS passed through make_mps_trial(tensors, nelec=...).
+#Call pyblock3 drmg to initilize the trial and the Hamiltonian MPO
 trial = make_dmrg_trial(ham, sys, chi=params.trial_chi, n_sweeps=params.dmrg_sweeps).trial
 ops = make_mps_cpmc_ops(ham, trial, sys, params)
 prop_ctx = ops.prop_ops.build_prop_ctx(ham, ops.trial_ops.get_rdm1(trial), params)
