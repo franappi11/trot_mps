@@ -538,10 +538,12 @@ def device_channel_angles(C, plans):
             continue
         block = jnp.stack(rows[k:k + B], axis=-2)  # (spins, B, N)
         occupied = np.array([bool(p.occupation[k]) for p in plans])
-        complete_qr = np.array([bool(p.exact_for_all_walkers and not p.occupation[k]) for p in plans])
+        complete_qr = np.array([bool(p.exact_for_all_walkers and not p.occupation[k] and B > C.shape[-1])
+                                for p in plans])
         if complete_qr.any():
-            # B exceeds the occupied count, so the last complete-QR vector lies
-            # exactly in null(block.T): the required empty mode.
+            # B exceeds the number of walker orbitals, so the last complete-QR
+            # vector lies exactly in null(block.T): the required empty mode
+            # (for B <= N the eigh branch is used, as in utils.channel_angles).
             vectors, _ = jnp.linalg.qr(block, mode="complete")
             v_qr = vectors[..., -1]
         if not complete_qr.all():

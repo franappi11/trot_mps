@@ -142,6 +142,7 @@ def _print_diagnostics(ham_data, trial, ops, params, meas_ctx, dmrg) -> None:
     if dmrg is not None:
         print(f"  DMRG Davidson energy {dmrg.davidson_energy:.12f} (two-site, not variational)")
         print(f"  DMRG variational energy {dmrg.variational_energy:.12f}")
+        print(f"  DMRG initial state: {dmrg.init}")
     print(
         f"  <T|H|T>/<T|T> = {meas_ctx.trial_energy:.12f} ({getattr(meas_ctx, 'kernel', 'dense')} kernel, "
         f"H|T> bonds max {max(meas_ctx.h_bond_dims)})"
@@ -212,7 +213,12 @@ def run_qmc_mps(
         from trot.gmps.dmrg import make_dmrg_trial
 
         dmrg = make_dmrg_trial(
-            ham_data, sys, chi=params.trial_chi, n_sweeps=params.dmrg_sweeps, seed=params.dmrg_seed
+            ham_data,
+            sys,
+            chi=params.trial_chi,
+            n_sweeps=params.dmrg_sweeps,
+            seed=params.dmrg_seed,
+            init=params.dmrg_init,
         )
         trial = dmrg.trial
     elif isinstance(trial_data, RotatedMpsTrial):

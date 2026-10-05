@@ -39,6 +39,8 @@ parser.add_argument("--U", type=float, nargs="+", default=[4.0])
 parser.add_argument("--plan-reference", default="natural", choices=["natural", "rhf"])
 parser.add_argument("--walker-start", default="natural", choices=["natural", "rhf"])
 parser.add_argument("--dmrg-sweeps", type=int, default=20)
+parser.add_argument("--dmrg-init", default="auto", choices=["auto", "neel", "random", "warm"],
+                    help="mps_cpmc_gpu: DMRG initial state (auto = Neel at half filling; warm = load build_warm_trials.py output from --trial-cache)")
 parser.add_argument("--orbital-plan", default="adaptive", choices=["adaptive", "rank_exact", "maximal"])
 parser.add_argument("--dt", type=float, default=0.01)
 parser.add_argument("--tag-suffix", default="", help="appended to every run tag")
@@ -83,7 +85,7 @@ for L, U, chi_w in itertools.product(args.L, args.U, args.chi_w):
         cfg += (f", n_chunks={args.n_chunks}, mem_fraction={args.mem_fraction}, linalg={args.linalg!r}, "
                 f"walker_qr={args.walker_qr!r}, energy={args.energy!r}, trial_cache={args.trial_cache!r}, "
                 f"compile_cache={args.compile_cache!r}, trial_rotation={args.trial_rotation}, "
-                f"rotated_trial={args.rotated_trial!r}, natural_rdm1={args.natural_rdm1!r}")
+                f"rotated_trial={args.rotated_trial!r}, natural_rdm1={args.natural_rdm1!r}, dmrg_init={args.dmrg_init!r}")
         if args.save_walkers:
             cfg += (f", walker_snapshots={os.path.join(out, tag + '_walkers.npz')!r}, "
                     f"trial_export={os.path.join(out, f'dmrg_trial_L{L}_U{U:g}_chi{args.trial_chi}{rot}.npz')!r}")

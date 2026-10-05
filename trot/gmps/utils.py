@@ -139,9 +139,13 @@ def channel_angles(C, plan: OrbitalPlan, xp=jnp):
         if B == 1:
             continue
         block = xp.stack(rows[k:k + B])
-        if plan.exact_for_all_walkers and not plan.occupation[k]:
-            # B > number of occupied orbitals, so the last complete-QR vector
+        if plan.exact_for_all_walkers and not plan.occupation[k] and B > C.shape[1]:
+            # B > number of walker orbitals, so the last complete-QR vector
             # lies exactly in null(block.T): it is the required empty mode.
+            # For B <= N (late gates of the maximal plan) that holds only when
+            # the block's leading columns are independent, which fails for
+            # special walkers (e.g. natural orbitals with degenerate
+            # occupations); the eigh branch below is exact there.
             vectors, _ = xp.linalg.qr(block, mode="complete")
             v = vectors[:, -1]
         else:

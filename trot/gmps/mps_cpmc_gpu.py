@@ -174,6 +174,11 @@ class Config:
     trial_chi: int = 64
     dmrg_sweeps: int = 14
     dmrg_seed: int = 0
+    # DMRG initial state: "neel" (the Neel product state, sweeps directly at trial_chi; no domain walls), "random"
+    # (random MPS with a warm-up at a larger bond; low trial_chi on long chains gets stuck with domain walls, e.g. the
+    # L=100 chi=16 trial with 4), "auto" (neel at half filling, else random) or "warm" (load a build_warm_trials.py
+    # trial from trial_cache, never run DMRG). Cache files are tagged _neel / _warm; random keeps the old names.
+    dmrg_init: str = "auto"
     # rank_exact is exact for every full-rank walker before bond truncation.
     # adaptive is cheaper but is only guaranteed for the reference determinant.
     # maximal is exact but usually creates more gates than rank_exact.
@@ -412,6 +417,18 @@ def hubbard_dmrg_mpo(hamiltonian, cfg: Config):
 def run_dmrg(hamiltonian, cfg: Config):
     np.random.seed(cfg.dmrg_seed)
     mpo = hubbard_dmrg_mpo(hamiltonian, cfg)
+    if dmrg_init(cfg) == "neel":
+        # Neel product state, then sweeps directly at trial_chi: a warm-up at a larger bond with strong noise would
+        # wash the seed out. trot.gmps.dmrg (imported here, it needs pyblock3) holds the one implementation.
+        from trot.gmps.dmrg import neel_states, product_mps
+
+        mps = product_mps(hamiltonian, neel_states(hopping_matrix(cfg.L, cfg.hopping), (cfg.n_up, cfg.n_down)))
+        n = cfg.dmrg_sweeps
+        result = MPE(mps, mpo, mps).dmrg(bdims=[cfg.trial_chi] * n, noises=[1.0e-6] * (n - 2) + [0.0] * 2,
+                                         dav_thrds=[1.0e-10], iprint=-1, n_sweeps=n)
+        print("DMRG initial state: Neel product state")
+        return mps, float(result.energies[-1])
+    print("DMRG initial state: random MPS (warm-up schedule)")
     mps = hamiltonian.build_mps(cfg.trial_chi)
     # Warm up at a larger bond dimension with stronger noise, then truncate to
     # trial_chi: sweeping at chi=8 from a random start got stuck at L=48,
@@ -493,9 +510,23 @@ def constrain_ratio(ratio, weight_floor):
 # Host: trial cache, reference conversion, charge-labelled H|trial>
 # ============================================================================
 
+def dmrg_init(cfg):
+    """The DMRG initial state cfg asks for: "neel", "random" or "warm" ("auto": neel when the open chain's Neel
+    state, up on even sites and down on odd ones or the reverse, has (n_up, n_down))."""
+    if cfg.dmrg_init not in ("auto", "neel", "random", "warm"):
+        raise ValueError(f"dmrg_init must be auto, neel, random or warm, got {cfg.dmrg_init!r}")
+    neel = sorted((cfg.n_up, cfg.n_down)) == [cfg.L // 2, (cfg.L + 1) // 2]
+    if cfg.dmrg_init == "neel" and not neel:
+        raise ValueError(f"no Neel product state with (n_up, n_down) = ({cfg.n_up}, {cfg.n_down}) on L={cfg.L}")
+    if cfg.dmrg_init == "auto":
+        return "neel" if neel else "random"
+    return cfg.dmrg_init
+
+
 def _trial_cache_file(cfg):
+    tag = {"random": "", "neel": "_neel", "warm": "_warm"}[dmrg_init(cfg)]
     name = (f"L{cfg.L}_n{cfg.n_up}-{cfg.n_down}_t{cfg.hopping:g}_U{cfg.interaction:g}"
-            f"_chi{cfg.trial_chi}_sw{cfg.dmrg_sweeps}_seed{cfg.dmrg_seed}.npz")
+            f"_chi{cfg.trial_chi}_sw{cfg.dmrg_sweeps}_seed{cfg.dmrg_seed}{tag}.npz")
     return Path(cfg.trial_cache) / name
 
 
@@ -513,6 +544,8 @@ def load_or_run_trial(cfg):
             energy = float(data["energy"])
         print(f"trial loaded from {path}")
         return tensors, charges, energy
+    if dmrg_init(cfg) == "warm":
+        raise FileNotFoundError(f"dmrg_init='warm' loads build_warm_trials.py output, but {path} does not exist")
     if MPE is None:
         raise ImportError("pyblock3 is needed to run DMRG (or point trial_cache at a cached trial)")
     mps, energy = run_dmrg(build_dmrg_hamiltonian(cfg), cfg)
