@@ -4,9 +4,8 @@ make_dmrg_trial(ham_data, sys, chi=..., n_sweeps=..., seed=...) runs DMRG with t
 Hubbard MPO (bond dimension ~6 on a chain, 2 + 4 x open hoppings in general) and returns the
 densified trial (trot.trial.mps.MpsTrial) together with the Davidson and variational energies.
 
-The cfg-based build_dmrg_hamiltonian / hubbard_dmrg_mpo / run_dmrg are the legacy API of
-trot/gmps/mps_cpmc_new.py (open chain from cfg.L and cfg.hopping); they keep their behaviour
-exactly, including run_dmrg seeding numpy's global RNG with cfg.dmrg_seed.
+dmrg_h1 is the general entry point (any h1, the "terms" or "qc" MPO, the chain's warm-up schedule or the lattice's
+plain schedule and bond ramp) that trot.gmps.trials caches.
 """
 
 from __future__ import annotations
@@ -18,7 +17,6 @@ from pyblock3.algebra.mpe import MPE
 from pyblock3.fcidump import FCIDUMP
 from pyblock3.hamiltonian import Hamiltonian
 
-from trot.ham.hubbard import hopping_matrix
 from trot.meas.mps import hubbard_h1
 from trot.trial.mps import MpsTrial, mps_trial_from_pyblock3
 
@@ -90,6 +88,68 @@ def dmrg_core(hamiltonian, mpo, *, chi, n_sweeps):
     return mps, float(result.energies[-1])
 
 
+def lattice_dmrg_schedule(chi, n_sweeps, bdims=()):
+    """The schedule mps_cpmc_2d_gpu used: chi (or a ramp, last entry repeating) with noise 1e-5 on the first six
+    sweeps (or until the ramp is done), the rest noiseless."""
+    if not bdims:
+        return [chi] * n_sweeps, [1.0e-5] * min(6, n_sweeps) + [0.0]
+    ramp = list(bdims)
+    if len(ramp) >= n_sweeps:
+        raise ValueError("n_sweeps must exceed the ramp's length so the final bond gets noiseless sweeps")
+    return ramp + [ramp[-1]] * (n_sweeps - len(ramp)), [1.0e-5] * max(6, len(ramp)) + [0.0]
+
+
+def dmrg_h1(h1, u, nelec, *, chi, n_sweeps, seed=0, mpo="terms", schedule="warmup", bdims=(), tol=None,
+            iprint=-1):
+    """DMRG ground state of the Hubbard model with one-body matrix h1 (any real symmetric h1).
+
+    mpo: "terms" (built from h1's nonzero entries and U, bond 2 + 4 x open hoppings) or "qc" (pyblock3's
+      build_qc_mpo, U as a general two-electron tensor; bond ~n^2/2 before compression).
+    schedule: "warmup" (dmrg_schedule: a larger bond and stronger noise first, n_sweeps at chi after it; the chain
+      production schedule) or "plain" (lattice_dmrg_schedule: chi or the ramp bdims for n_sweeps sweeps; the square-
+      lattice production schedule). tol is passed to pyblock3 when given.
+    numpy's global RNG is seeded with seed and restored afterwards.
+
+    Returns (tensors, charges, davidson_energy, sweep_energies, variational_energy): dense tensors with (N_up, N_dn)
+    bond labels (trot.gmps.utils.densify_with_charges), the last two-site Davidson energy (not variational), all
+    sweeps' energies and <mps|H|mps>/<mps|mps>.
+    """
+    from trot.gmps.utils import densify_with_charges
+
+    h1 = np.asarray(h1, dtype=float)
+    nelec = (int(nelec[0]), int(nelec[1]))
+    hamiltonian = make_pyblock3_hamiltonian(h1, nelec, u=u if mpo == "qc" else None)
+    if mpo == "terms":
+        operator = hubbard_pyblock3_mpo(hamiltonian, h1, u)
+    elif mpo == "qc":
+        operator = hamiltonian.build_qc_mpo().compress(cutoff=1.0e-12)[0]
+    else:
+        raise ValueError("mpo must be 'terms' or 'qc'")
+    if schedule == "warmup":
+        if bdims:
+            raise ValueError("a bond ramp (bdims) needs schedule='plain'")
+        bond_dims, noises = dmrg_schedule(int(chi), int(n_sweeps))
+    elif schedule == "plain":
+        bond_dims, noises = lattice_dmrg_schedule(int(chi), int(n_sweeps), tuple(bdims))
+    else:
+        raise ValueError("schedule must be 'warmup' or 'plain'")
+    options = dict(bdims=bond_dims, noises=noises, dav_thrds=[1.0e-10], iprint=iprint,
+                   n_sweeps=len(bond_dims) if schedule == "warmup" else int(n_sweeps))
+    if tol is not None:
+        options["tol"] = tol
+    state = np.random.get_state()
+    try:
+        np.random.seed(seed)
+        mps = hamiltonian.build_mps(bond_dims[0] if schedule == "plain" else int(chi))
+        result = MPE(mps, operator, mps).dmrg(**options)
+    finally:
+        np.random.set_state(state)
+    energies = [float(e) for e in result.energies]
+    variational = float(MPE(mps, operator, mps)[0:2].expectation) / float(mps @ mps)
+    tensors, charges = densify_with_charges(mps, len(h1))
+    return tensors, charges, energies[-1], energies, variational
+
+
 class DmrgTrial(NamedTuple):
     trial: MpsTrial
     davidson_energy: float  # two-site energy before the last truncation, not variational
@@ -119,24 +179,3 @@ def make_dmrg_trial(ham_data, sys, *, chi, n_sweeps=14, seed=0) -> DmrgTrial:
     variational = float(MPE(mps, mpo, mps)[0:2].expectation) / float(mps @ mps)
     trial = mps_trial_from_pyblock3(mps, nelec=nelec)
     return DmrgTrial(trial, davidson, variational, mps)
-
-
-# Legacy cfg-based API of trot/gmps/mps_cpmc_new.py (cfg needs L, hopping, interaction, n_up,
-# n_down, trial_chi, dmrg_sweeps, dmrg_seed). Duck-typed: importing Config would be circular.
-
-
-def build_dmrg_hamiltonian(cfg):
-    return make_pyblock3_hamiltonian(
-        hopping_matrix(cfg.L, cfg.hopping), (cfg.n_up, cfg.n_down), u=cfg.interaction
-    )
-
-
-def hubbard_dmrg_mpo(hamiltonian, cfg):
-    """Hubbard-chain MPO from its ~6L operator terms (bond dimension ~6)."""
-    return hubbard_pyblock3_mpo(hamiltonian, hopping_matrix(cfg.L, cfg.hopping), cfg.interaction)
-
-
-def run_dmrg(hamiltonian, cfg):
-    np.random.seed(cfg.dmrg_seed)
-    mpo = hubbard_dmrg_mpo(hamiltonian, cfg)
-    return dmrg_core(hamiltonian, mpo, chi=cfg.trial_chi, n_sweeps=cfg.dmrg_sweeps)

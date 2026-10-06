@@ -152,16 +152,16 @@ _MPS_CAPSTONES = {
         "plain-uhf-32",
         "floor-uhf-32",
         "nodal-slow-vs-fast",
-        "floor-uhf-32-slow",
     },
     "test_rotated_ghf_and_rotated_sd_mps_runs_are_identical": {
         "rotation-32-plain",
         "reflection-33-floor",
     },
-    "test_rotated_ghf_and_mpo_rotated_mps_runs_are_identical": {
+    "test_rotated_ghf_and_rotated_mps_runs_are_identical": {
         "mpo-rotation-32-plain",
         "mpo-reflection-33-floor",
         "mpo-rotation-32-to-23",
+        "as-is-reflection-33-floor",
     },
     "test_three_rotation_approaches_and_the_rotated_ghf_run_identically": {
         "three-rotation-32-plain",

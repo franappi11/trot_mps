@@ -9,6 +9,7 @@ __pycache__/
 runs/
 *.npz
 *.log
+*.out
 *.pdf
 *.png
 *.tex

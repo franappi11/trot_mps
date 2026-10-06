@@ -1,11 +1,12 @@
-"""Wall-free low-bond DMRG trials for the GPU runs, written in mps_cpmc_gpu's trial-cache format.
+"""Wall-free low-bond DMRG trials for the GPU runs, written in the trial-cache format of trot.gmps.trials.
 
 Random-start DMRG at small bond on long chains converges to states with domain walls of the staggered
 magnetisation (see rotated_dmrg_trial_study.warm_dmrg). This script runs DMRG at --warm (random start),
 compresses that state to each --chi, re-optimises it there, and saves every trial as
-<out>/L{L}_n{N_up}-{N_dn}_t{t}_U{U}_chi{chi}_sw{sweeps}_seed{seed}.npz, the name mps_cpmc_gpu derives
-from its Config, with the keys it reads (A{i}, q{i}, energy) plus a description. Point the GPU driver
-at the directory with --trial-cache <out>; --dmrg-sweeps and --dmrg-seed must match --sweeps and --seed.
+<out>/L{L}_n{N_up}-{N_dn}_t{t}_U{U}_chi{chi}_sw{sweeps}_seed{seed}.npz, the chain cache name of
+trot.gmps.trials.trial_cache_file, with the keys it reads (A{i}, q{i}, energy) plus a description. Point
+run_mps_cpmc.py at the directory with --trial-cache <out>; --dmrg-sweeps and --dmrg-seed must match --sweeps
+and --seed.
 
     ~/.trot/bin/python trot/gmps/build_warm_trials.py --L 100 --U 8 --chi 8 16 --warm 32 \\
         --out trot/gmps/trial_cache_warm

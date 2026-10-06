@@ -1,23 +1,25 @@
 """MPS trial wave functions for CPMC with Slater-determinant walkers (Hubbard model).
 
-The trial is a dense, charge-labelled d=4 MPS in the local basis |0>, |up>, |dn>, |up dn>,
-indexed n_up + 2*n_dn, with |up dn> = c+_up c+_dn |0> and fermion operators ordered site by
-site with up before down. Bond labels are (N_up, N_dn) counted from the left. Walkers stay
-Slater determinants: each spin channel is converted to a charge-labelled Gaussian MPS
-(Fishman-White, trot.gmps.utils) whenever an overlap is needed, and the overlap is a
-charge-blocked contraction against the trial.
+The trial (MpsTrial, trial_data) is a dense, charge-labelled d=4 MPS in the local basis |0>, |up>, |dn>, |up dn>,
+indexed n_up + 2*n_dn, with |up dn> = c+_up c+_dn |0> and fermion operators ordered site by site with up before
+down. Its bond labels, counted from the left, are (N_up, N_dn) pairs when it has the walkers' definite (N_up, N_dn),
+and particle numbers N when it has not (a spin-rotated MPS used as it is): the walkers are S_z eigenstates and the
+Hubbard Hamiltonian conserves S_z, so <T|W> and <T|H|W> pick the walkers' sector by themselves, and the CPMC
+trajectory is that of the trial projected onto it. make_mps_trial reads the labels off the tensors when none are
+given; it never projects. rotate_mps_trial (trot.trial.mps_rotation) rotates a trial straight into one sector.
 
-Trials that do not conserve N_up and N_dn separately (for example spin-rotated ones, see
-rotate_spin) are projected exactly onto the walkers' (N_up, N_dn) sector. The walkers are S_z
-eigenstates and the Hubbard Hamiltonian conserves S_z, so overlaps and local energies, and hence
-the whole CPMC trajectory, are unchanged by the projection.
+Walkers stay Slater determinants. The walker plan (make_walker_plan) freezes the gate circuit that converts each
+spin channel to a charge-labelled Gaussian MPS (Fishman-White, trot.gmps.utils) on one reference determinant; the
+batched engine of the plan (trot.gmps.engine, cached on the plan) does the conversions and the charge-blocked
+contractions. make_mps_trial_ops gives trot's TrialOps; trot.meas.mps and trot.prop.mps_cpmc give the measurement
+and propagation ops on the same plan.
 """
 
 from __future__ import annotations
 
 import sys
 from dataclasses import dataclass, field
-from typing import Any, NamedTuple
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -25,20 +27,17 @@ import numpy as np
 from jax import tree_util
 
 from trot.core.ops import TrialOps
+from trot.gmps import engine
 from trot.gmps.utils import (
-    channel_mps,
+    PHYSICAL_CHARGE,
     combined_charges,
+    label_array,
     make_orbital_plan,
+    number_labels,
     plan_bonds,
     sd_to_gmps,
+    sz_labels,
 )
-from trot.walkers import _qr as qr_with_det
-
-
-""""
-Convetions for the particle charges:(N_up,N_down)
-"""
-PHYSICAL_CHARGE = np.array([[0, 0], [1, 0], [0, 1], [1, 1]])
 
 
 def _require_x64() -> None:
@@ -46,7 +45,6 @@ def _require_x64() -> None:
         raise RuntimeError(
             "MPS-CPMC needs float64: enable jax_enable_x64 (trot.config.configure_once() does)."
         )
-
 
 def one_rdm(tensors):
     """Spin-resolved one-body density matrices <c^dag_i,sigma c_j,sigma> of a real
@@ -96,153 +94,11 @@ def _charge_index(labels):
     return {charge: np.asarray(indices, int) for charge, indices in grouped.items()}
 
 
-def make_contraction_plan(walker_charges, trial_charges):
-    """Prepare dense padded charge blocks for repeated walker/trial contractions."""
-    n = len(walker_charges) - 1
-    walker_index = [_charge_index(q) for q in walker_charges]
-    trial_index = [_charge_index(q) for q in trial_charges]
-    shared, walker_pad, trial_pad = [], [], []
-    for bond in range(n + 1):
-        charges = sorted(set(walker_index[bond]) & set(trial_index[bond]))
-        shared.append(charges)
-        walker_pad.append(max(map(lambda q: len(walker_index[bond][q]), charges), default=0))
-        trial_pad.append(max(map(lambda q: len(trial_index[bond][q]), charges), default=0))
-
-    sites = []
-    for site in range(n):
-        incoming = {q: i for i, q in enumerate(shared[site])}
-        outgoing = {q: i for i, q in enumerate(shared[site + 1])}
-        src, dst, rows, columns, masks, physical = [], [], [], [], [], []
-        for charge in shared[site]:
-            left_indices = walker_index[site][charge]
-            for p, delta in enumerate(PHYSICAL_CHARGE):
-                next_charge = tuple(np.asarray(charge) + delta)
-                if next_charge not in outgoing:
-                    continue
-                right_indices = walker_index[site + 1][next_charge]
-                shape = (walker_pad[site], walker_pad[site + 1])
-                r = np.zeros(shape, int)
-                c = np.zeros(shape, int)
-                mask = np.zeros(shape)
-                r[: len(left_indices), : len(right_indices)] = left_indices[:, None]
-                c[: len(left_indices), : len(right_indices)] = right_indices[None, :]
-                mask[: len(left_indices), : len(right_indices)] = 1.0
-                src.append(incoming[charge])
-                dst.append(outgoing[next_charge])
-                rows.append(r)
-                columns.append(c)
-                masks.append(mask)
-                physical.append(p)
-        sites.append(
-            dict(
-                src=np.asarray(src, int),
-                dst=np.asarray(dst, int),
-                rows=np.stack(rows),
-                columns=np.stack(columns),
-                mask=np.stack(masks),
-                physical=np.asarray(physical, int),
-                n_out=len(shared[site + 1]),
-            )
-        )
-    return dict(
-        sites=tuple(sites),
-        shared=shared,
-        walker_pad=walker_pad,
-        trial_pad=trial_pad,
-        walker_index=walker_index,
-        trial_index=trial_index,
-        n=n,
-    )
-
-
-def extract_fixed_blocks(tensors, plan):
-    blocks = []
-    for site, layout in enumerate(plan["sites"]):
-        out = np.zeros((len(layout["src"]), plan["trial_pad"][site], plan["trial_pad"][site + 1]))
-        for t, (qin, qout, p) in enumerate(zip(layout["src"], layout["dst"], layout["physical"])):
-            charge_in = plan["shared"][site][qin]
-            charge_out = plan["shared"][site + 1][qout]
-            rows = plan["trial_index"][site][charge_in]
-            columns = plan["trial_index"][site + 1][charge_out]
-            out[t, : len(rows), : len(columns)] = np.asarray(tensors[site])[
-                np.ix_(rows, [p], columns)
-            ][:, 0]
-        blocks.append(jnp.asarray(out))
-    return tuple(blocks)
-
-
-def make_channel_block_maps(plan, alpha_charges, beta_charges):
-    """Map allowed combined-spin blocks back to the two channel tensors."""
-    maps = []
-    for site, layout in enumerate(plan["sites"]):
-        left_beta = len(beta_charges[site])
-        right_beta = len(beta_charges[site + 1])
-        physical = layout["physical"]
-        beta_left = layout["rows"] % left_beta
-        maps.append(
-            dict(
-                alpha_left=layout["rows"] // left_beta,
-                beta_left=beta_left,
-                alpha_right=layout["columns"] // right_beta,
-                beta_right=layout["columns"] % right_beta,
-                n_alpha=(physical % 2)[:, None, None],
-                n_beta=(physical // 2)[:, None, None],
-                sign=layout["mask"]
-                * (-1.0) ** ((physical % 2)[:, None, None] * beta_charges[site][beta_left]),
-            )
-        )
-    return tuple(maps)
-
-
-def extract_channel_blocks(alpha_mps, beta_mps, channel_maps):
-    """Build only the charge blocks needed by the overlap, never the dense d=4 MPS."""
-    blocks = []
-    for Aa, Ab, m in zip(alpha_mps, beta_mps, channel_maps):
-        a = Aa[m["alpha_left"], m["n_alpha"], m["alpha_right"]]
-        b = Ab[m["beta_left"], m["n_beta"], m["beta_right"]]
-        blocks.append(m["sign"] * a * b)
-    return tuple(blocks)
-
-
-def blocked_contract_from_blocks(walker_blocks, trial_blocks, plan):
-    env = jnp.ones((1, plan["walker_pad"][0], plan["trial_pad"][0]))
-    for wb, tb, layout in zip(walker_blocks, trial_blocks, plan["sites"]):
-        incoming = env[layout["src"]]
-        temp = jnp.einsum("tij,tik->tjk", wb, incoming)
-        contributions = jnp.einsum("tjk,tkl->tjl", temp, tb)
-        env = jax.ops.segment_sum(contributions, layout["dst"], num_segments=layout["n_out"])
-    return env.reshape(())
-
-
-def contraction_report(plan):
-    exact = dense = padded = 0
-    for bond in range(plan["n"] + 1):
-        for charge in plan["shared"][bond]:
-            exact += len(plan["walker_index"][bond][charge]) * len(
-                plan["trial_index"][bond][charge]
-            )
-        dense += sum(map(len, plan["walker_index"][bond].values())) * sum(
-            map(len, plan["trial_index"][bond].values())
-        )
-        padded += len(plan["shared"][bond]) * plan["walker_pad"][bond] * plan["trial_pad"][bond]
-    return dict(
-        dense=dense,
-        exact_blocks=exact,
-        padded_blocks=padded,
-        transitions=sum(len(site["src"]) for site in plan["sites"]),
-    )
-
 
 def _label_sectors(row_labels, column_labels):
     rows, columns = _charge_index(row_labels), _charge_index(column_labels)
     return [(c, rows[c], columns[c]) for c in sorted(set(rows) & set(columns))]
 
-
-def label_array(labels) -> np.ndarray:
-    """One bond's labels as a (D, width) int array: width 2 for (N_up, N_dn) labels, 1 for particle-number
-    labels N (a (D,) array is read as N labels)."""
-    q = np.asarray(labels, int)
-    return q.reshape(len(q), -1)
 
 
 def physical_charge(width: int) -> np.ndarray:
@@ -317,7 +173,7 @@ def compress_mps_qn(tensors, charges, relative_tolerance=1.0e-13):
 
 
 # ---------------------------------------------------------------------------------------------
-# Sector projection and spin rotations
+# Labels and spin rotations
 # ---------------------------------------------------------------------------------------------
 
 
@@ -349,80 +205,6 @@ def _valid_sz_labels(tensors, charges, nelec) -> bool:
     return True
 
 
-def project_to_sector(tensors, nelec, charges=None):
-    """Exact projection of a real d=4 MPS onto the (N_up, N_dn) = nelec sector.
-
-    Works for any input labelling (SZ labels, total-N labels or none): every bond index is
-    split into (old index, N_up so far, N_dn so far), entries are kept only where the counts
-    match the physical charge, and labels that cannot reach nelec at the right end are pruned.
-    The result is compressed sector by sector (compress_mps_qn), so it carries exact SZ labels
-    and contracts charge-blocked. Valid SZ input that already ends at nelec is returned
-    unchanged.
-
-    Returns (tensors, charges, norm2) with norm2 = <P T|P T>. Raises ValueError when the
-    sector holds less than 1e-12 of the norm.
-    """
-    A = [np.asarray(t, dtype=float) for t in tensors]
-    nup, ndn = (int(x) for x in nelec)
-    if charges is not None and _valid_sz_labels(A, charges, (nup, ndn)):
-        Q = tuple(np.asarray(q, int).reshape(-1, 2) for q in charges)
-        return A, Q, _norm2(A)
-
-    L = len(A)
-    nonzero = [a != 0 for a in A]
-    shape = (nup + 1, ndn + 1)
-
-    def shifted(R, delta, sign):
-        """R shifted by sign*delta on the (u, d) axes, zero filled."""
-        out = np.zeros_like(R)
-        du, dd = sign * delta
-        u0, u1 = max(0, du), min(shape[0], shape[0] + du)
-        d0, d1 = max(0, dd), min(shape[1], shape[1] + dd)
-        out[:, u0:u1, d0:d1] = R[:, u0 - du : u1 - du, d0 - dd : d1 - dd]
-        return out
-
-    reach = [np.zeros((1,) + shape, bool)]
-    reach[0][0, 0, 0] = True
-    for s in range(L):
-        nxt = np.zeros((A[s].shape[2],) + shape, bool)
-        for p, delta in enumerate(PHYSICAL_CHARGE):
-            moved = shifted(reach[s].astype(float), delta, +1)
-            nxt |= np.einsum("auv,ab->buv", moved, nonzero[s][:, p, :].astype(float)) > 0
-        reach.append(nxt)
-    alive: list[np.ndarray] = [np.zeros((0,) + shape, bool)] * (L + 1)
-    alive[L] = np.zeros((1,) + shape, bool)
-    alive[L][0, nup, ndn] = reach[L][0, nup, ndn]
-    for s in range(L - 1, -1, -1):
-        back = np.zeros_like(reach[s])
-        for p, delta in enumerate(PHYSICAL_CHARGE):
-            ahead = np.einsum("ab,buv->auv", nonzero[s][:, p, :].astype(float), alive[s + 1])
-            back |= shifted(ahead, delta, -1) > 0
-        alive[s] = reach[s] & back
-
-    norm_total = _norm2(A)
-    states = [np.argwhere(a) for a in alive]  # rows (index, n_up, n_dn), sorted
-    if len(states[0]) == 0:
-        raise ValueError(f"the trial has no weight in the walkers' sector {(nup, ndn)}")
-    order = [np.lexsort((st[:, 0], st[:, 2], st[:, 1])) for st in states]  # group by label
-    states = [st[o] for st, o in zip(states, order)]
-    projected = []
-    for s in range(L):
-        left, right = states[s], states[s + 1]
-        B = np.zeros((len(left), 4, len(right)))
-        for p, delta in enumerate(PHYSICAL_CHARGE):
-            match = np.all(left[:, None, 1:] + delta == right[None, :, 1:], axis=-1)
-            B[:, p, :] = A[s][left[:, 0][:, None], p, right[:, 0][None, :]] * match
-        projected.append(B)
-    labels = tuple(st[:, 1:].copy() for st in states)
-    projected, labels = compress_mps_qn(projected, labels)
-    norm2 = _norm2(projected)
-    if not norm2 > 1.0e-12 * norm_total:
-        raise ValueError(
-            f"the trial has no weight in the walkers' sector {(nup, ndn)} "
-            f"(projected norm^2 {norm2:.3e} of {norm_total:.3e})"
-        )
-    return projected, labels, norm2
-
 
 def spin_rotation_unitary(R) -> np.ndarray:
     """Site operator of a real orthogonal spin rotation R in the local basis |0>,|up>,|dn>,|up dn>.
@@ -445,8 +227,9 @@ def spin_rotation_unitary(R) -> np.ndarray:
 def rotate_spin(tensors, R):
     """Apply the spin rotation R on every site: A'[a, p, b] = sum_s M[p, s] A[a, s, b].
 
-    The result conserves the total particle number but in general not N_up and N_dn; pass it
-    to make_mps_trial, which projects it onto the walkers' sector. Note that
+    The result conserves the total particle number but in general not N_up and N_dn: make_mps_trial uses it as it
+    is, with particle-number labels, and trot.trial.mps_rotation.rotate_mps_trial rotates a trial straight into
+    one (N_up, N_dn) sector. Note that
     np.einsum('ijk,jl', A, M) applies M^T instead (wrong unless M is symmetric), and that a
     4x4 matrix without the det(R) entry on |up dn> is not a fermionic spin rotation.
     """
@@ -464,15 +247,14 @@ def spin_rotation_y(beta_deg) -> np.ndarray:
     return np.array([[np.cos(b), -np.sin(b)], [np.sin(b), np.cos(b)]])
 
 
+
 # ---------------------------------------------------------------------------------------------
 # The trial
 # ---------------------------------------------------------------------------------------------
 
 
 def _hashable_charges(charges) -> tuple:
-    return tuple(
-        tuple(tuple(pair) for pair in np.asarray(q, int).reshape(-1, 2).tolist()) for q in charges
-    )
+    return tuple(tuple(tuple(row) for row in label_array(q).tolist()) for q in charges)
 
 
 @tree_util.register_pytree_node_class
@@ -480,42 +262,47 @@ def _hashable_charges(charges) -> tuple:
 class MpsTrial:
     """Charge-labelled d=4 MPS trial (trial_data for MPS-CPMC).
 
-    tensors: L site tensors (D_left, 4, D_right), local index n_up + 2*n_dn, normalised.
-    rdm1: (2, L, L) spin-diagonal blocks <c+_i,s c_j,s> of the trial's 1-RDM (of the
-      unprojected trial for spin-rotated input); trot starts walkers from its natural orbitals.
-    charges: static aux, L+1 bond labels, each a tuple of (N_up, N_dn) pairs.
-    sector_weight: static aux, <P T|P T>/<T|T> kept by the sector projection (1.0 for SZ input).
+    tensors: L site tensors (D_left, 4, D_right), local index n_up + 2*n_dn, normalised (all sectors together).
+    rdm1: (2, L, L) spin-diagonal blocks <c+_i,s c_j,s> of the trial's 1-RDM (before any projection for a rotated
+      trial); trot starts walkers from its natural orbitals.
+    charges: static aux, L+1 bond labels: tuples of (N_up, N_dn) pairs for a trial in the walkers' sector, of
+      particle numbers (N,) for a trial without a definite (N_up, N_dn), used as it is.
+    nelec: static aux, the walkers' (N_up, N_dn).
+    sector_weight: static aux, <P T|P T>/<T|T> of the walkers' sector when known: 1.0 for (N_up, N_dn) input, the
+      kept weight for rotate_mps_trial, None for a trial used as it is (overlaps are then sqrt(sector_weight) times
+      those of the projected trial, local energies the same).
     """
 
     tensors: tuple
     rdm1: Any
     charges: tuple
-    sector_weight: float = 1.0
+    nelec: tuple
+    sector_weight: float | None = 1.0
 
     @property
     def norb(self) -> int:
         return len(self.tensors)
 
     @property
-    def nelec(self) -> tuple[int, int]:
-        nup, ndn = self.charges[-1][0]
-        return int(nup), int(ndn)
-
-    @property
     def bond_dims(self) -> tuple[int, ...]:
         return tuple(len(q) for q in self.charges)
 
+    @property
+    def label_width(self) -> int:
+        """2 for (N_up, N_dn) labels, 1 for particle-number labels."""
+        return len(self.charges[0][0])
+
     def charge_arrays(self) -> tuple[np.ndarray, ...]:
-        return tuple(np.asarray(q, int).reshape(-1, 2) for q in self.charges)
+        return tuple(np.asarray(q, int).reshape(-1, self.label_width) for q in self.charges)
 
     def tree_flatten(self):
-        return (tuple(self.tensors), self.rdm1), (self.charges, self.sector_weight)
+        return (tuple(self.tensors), self.rdm1), (self.charges, self.nelec, self.sector_weight)
 
     @classmethod
     def tree_unflatten(cls, aux, children):
         tensors, rdm1 = children
-        charges, sector_weight = aux
-        return cls(tensors=tuple(tensors), rdm1=rdm1, charges=charges, sector_weight=sector_weight)
+        charges, nelec, sector_weight = aux
+        return cls(tensors=tuple(tensors), rdm1=rdm1, charges=charges, nelec=nelec, sector_weight=sector_weight)
 
 
 def _real_tensors(tensors) -> list[np.ndarray]:
@@ -539,14 +326,16 @@ def _real_tensors(tensors) -> list[np.ndarray]:
     return out
 
 
+
 def make_mps_trial(tensors, charges=None, *, nelec, rdm1=None) -> MpsTrial:
-    """Build trial_data from a real d=4 MPS.
+    """Build trial_data from a real d=4 MPS; nothing is projected or truncated.
 
     tensors: L arrays (D_left, 4, D_right) in the local basis described in the module docstring.
-    charges: optional L+1 bond labels. Valid (N_up, N_dn) labels ending at nelec are used as
-      they are; anything else (total-N labels, None) triggers the exact sector projection.
+    charges: optional L+1 bond labels. (N_up, N_dn) labels that the tensors respect and that end at nelec are used
+      as they are; otherwise (N_up, N_dn) labels are read off the nonzero entries, and when the MPS has no definite
+      (N_up, N_dn) (a spin-rotated MPS), particle-number labels: the trial is then used as it is.
     nelec: (N_up, N_dn) of the walkers.
-    rdm1: optional (2, L, L); defaults to one_rdm of the unprojected tensors.
+    rdm1: optional (2, L, L); defaults to one_rdm of the tensors.
     """
     _require_x64()
     if isinstance(charges, (tuple, list)) and len(charges) == 2:
@@ -557,6 +346,8 @@ def make_mps_trial(tensors, charges=None, *, nelec, rdm1=None) -> MpsTrial:
     A = _real_tensors(tensors)
     nup, ndn = (int(x) for x in nelec)
     L = len(A)
+    if not (0 <= nup <= L and 0 <= ndn <= L):
+        raise ValueError(f"{(nup, ndn)} is not a sector of {L} sites")
     if rdm1 is None:
         rdm1 = np.stack(one_rdm(A))
     else:
@@ -565,15 +356,32 @@ def make_mps_trial(tensors, charges=None, *, nelec, rdm1=None) -> MpsTrial:
         rdm1 = np.asarray(rdm1, dtype=float)
         if rdm1.shape != (2, L, L):
             raise ValueError(f"rdm1 must have shape (2, {L}, {L}), got {rdm1.shape}")
-    norm_total = _norm2(A)
-    projected, labels, norm2 = project_to_sector(A, (nup, ndn), charges)
+    norm2 = _norm2(A)
+    if not norm2 > 0.0:
+        raise ValueError("the trial MPS has zero norm")
     if abs(norm2 - 1.0) > 1.0e-12:
-        projected = [projected[0] / np.sqrt(norm2)] + list(projected[1:])
+        A = [A[0] / np.sqrt(norm2)] + A[1:]
+    if charges is not None and _valid_sz_labels(A, charges, (nup, ndn)):
+        labels, weight = tuple(label_array(q) for q in charges), 1.0
+    else:
+        labels, weight = sz_labels(A), 1.0
+        if labels is not None and tuple(labels[-1][0]) != (nup, ndn):
+            raise ValueError(
+                f"the trial has (N_up, N_dn) = {tuple(int(x) for x in labels[-1][0])} and the walkers {(nup, ndn)}: "
+                "their overlaps vanish (rotate it with trot.trial.mps_rotation.rotate_mps_trial)"
+            )
+        if labels is None:
+            labels, weight = number_labels(A), None
+            if labels is None:
+                raise ValueError("the MPS mixes particle numbers at some bond, so it has no labels to block on")
+            if int(labels[-1][0, 0]) != nup + ndn:
+                raise ValueError(f"the trial has N = {int(labels[-1][0, 0])} and the walkers {nup + ndn}")
     return MpsTrial(
-        tensors=tuple(jnp.asarray(t) for t in projected),
+        tensors=tuple(jnp.asarray(t) for t in A),
         rdm1=jnp.asarray(rdm1),
         charges=_hashable_charges(labels),
-        sector_weight=float(norm2 / norm_total),
+        nelec=(nup, ndn),
+        sector_weight=weight,
     )
 
 
@@ -653,8 +461,10 @@ class MpsWalkerPlan:
 
     orbital_plans and bond_plans fix the gate circuit and the kept count of every charge block
     for each spin channel (trot.gmps.utils.make_orbital_plan / plan_bonds). channel_charges and
-    walker_charges are the resulting static bond labels. Lives in the ops closures (never a jit
-    argument). caches holds per-plan layouts and jitted kernels; they are freed with the plan.
+    walker_charges are the resulting static bond labels. sector_buckets and walker_qr set how the
+    batched engine factors the sector blocks and orthonormalises the walkers (QmcParamsMps). Lives
+    in the ops closures (never a jit argument). caches holds the plan's engine (trot.gmps.engine:
+    converter, layouts, kernels, jitted functions); it is freed with the plan.
     """
 
     orbital_plans: tuple
@@ -664,6 +474,8 @@ class MpsWalkerPlan:
     reference: tuple
     nelec: tuple
     norb: int
+    sector_buckets: tuple = ()
+    walker_qr: str = "auto"
     caches: dict = field(default_factory=dict, compare=False, repr=False)
 
 
@@ -681,8 +493,14 @@ def make_walker_plan_from_reference(
     occupation_tolerance=1.0e-10,
     walker_channel_chi=None,
     walker_cutoff=0.0,
+    sector_buckets=(),
+    walker_qr="auto",
 ) -> MpsWalkerPlan:
     """Freeze the gate circuit and the per-sector kept counts on the determinant (Ra, Rb)."""
+    engine.resolve_walker_qr(walker_qr)  # validates
+    buckets = tuple(int(b) for b in sector_buckets)
+    if any(b < 1 for b in buckets) or list(buckets) != sorted(set(buckets)):
+        raise ValueError(f"sector_buckets must be increasing positive sizes, got {sector_buckets!r}")
     Ra, Rb = np.asarray(Ra, dtype=float), np.asarray(Rb, dtype=float)
     if Ra.shape[1] == 0 or Rb.shape[1] == 0:
         raise ValueError("MPS walkers need at least one electron of each spin")
@@ -692,11 +510,11 @@ def make_walker_plan_from_reference(
     if walker_channel_chi is not None or walker_cutoff:
         bond_a = plan_bonds(Ra, plan_a, walker_channel_chi, walker_cutoff)
         bond_b = plan_bonds(Rb, plan_b, walker_channel_chi, walker_cutoff)
-    qa, _ = qr_with_det(jnp.asarray(Ra))
-    qb, _ = qr_with_det(jnp.asarray(Rb))
-    _, qa_charge, _ = channel_mps(qa, plan_a, bond_a)
-    _, qb_charge, _ = channel_mps(qb, plan_b, bond_b)
-    return MpsWalkerPlan(
+    # the walker labels are those of the compiled conversion circuit (host bookkeeping, no numerics); the circuit is
+    # what the plan's engine runs, so it goes into the plan's cache
+    converter = engine.make_converter(plan_a, plan_b, bond_a, bond_b, spin_batch=True, buckets=buckets or None)
+    qa_charge, qb_charge = converter.charges
+    plan = MpsWalkerPlan(
         orbital_plans=(plan_a, plan_b),
         bond_plans=(bond_a, bond_b),
         channel_charges=(tuple(qa_charge), tuple(qb_charge)),
@@ -704,16 +522,20 @@ def make_walker_plan_from_reference(
         reference=(Ra, Rb),
         nelec=(Ra.shape[1], Rb.shape[1]),
         norb=Ra.shape[0],
+        sector_buckets=buckets,
+        walker_qr=walker_qr,
     )
+    plan.caches["converter"] = converter
+    return plan
 
 
 def make_walker_plan(ham_data, trial: MpsTrial, sys_, params) -> MpsWalkerPlan:
     """The walker plan for a run: reference determinant chosen by params.plan_reference.
 
-    "natural": the most occupied natural orbitals of trial.rdm1; 
-    "rhf": the lowest eigenvectors of ham_data.h1. 
-    Settings come from QmcParamsMps (orbital_plan, occupation_tolerance,
-    walker_channel_chi, walker_cutoff).
+    "natural": the most occupied natural orbitals of trial.rdm1;
+    "rhf": the lowest eigenvectors of ham_data.h1.
+    Settings come from QmcParamsMps (orbital_plan, occupation_tolerance, walker_channel_chi,
+    walker_cutoff, sector_buckets, walker_qr).
     """
     _require_x64()
     if not isinstance(trial, MpsTrial):
@@ -743,104 +565,43 @@ def make_walker_plan(ham_data, trial: MpsTrial, sys_, params) -> MpsWalkerPlan:
         occupation_tolerance=params.occupation_tolerance,
         walker_channel_chi=params.walker_channel_chi,
         walker_cutoff=params.walker_cutoff,
+        sector_buckets=getattr(params, "sector_buckets", ()),
+        walker_qr=getattr(params, "walker_qr", "auto"),
     )
 
 
 # ---------------------------------------------------------------------------------------------
-# Contraction layouts, gathers and the overlap
+# The overlap and the trial ops
 # ---------------------------------------------------------------------------------------------
-
-
-class ContractionLayout(NamedTuple):
-    contraction: dict  # make_contraction_plan(walker charges, other charges)
-    channel_maps: tuple  # make_channel_block_maps for the plan's channel labels
-    gather: tuple  # per site (rows (T, pad_l), physical (T,), cols (T, pad_r)), int32
-
-
-def _separable_gather(contraction, dims):
-    out = []
-    for site, layout in enumerate(contraction["sites"]):
-        n_transitions = len(layout["src"])
-        rows = np.full((n_transitions, contraction["trial_pad"][site]), dims[site], np.int32)
-        cols = np.full(
-            (n_transitions, contraction["trial_pad"][site + 1]), dims[site + 1], np.int32
-        )
-        for t, (qin, qout) in enumerate(zip(layout["src"], layout["dst"])):
-            r = contraction["trial_index"][site][contraction["shared"][site][qin]]
-            c = contraction["trial_index"][site + 1][contraction["shared"][site + 1][qout]]
-            rows[t, : len(r)] = r
-            cols[t, : len(c)] = c
-        out.append((rows, np.asarray(layout["physical"], np.int32), cols))
-    return tuple(out)
-
-
-def contraction_layout(plan: MpsWalkerPlan, charges: tuple) -> ContractionLayout:
-    """Static layout pairing the plan's walker labels with another MPS's labels (cached)."""
-    key = ("layout", charges)
-    layout = plan.caches.get(key)
-    if layout is None:
-        other = tuple(np.asarray(q, int).reshape(-1, 2) for q in charges)
-        contraction = make_contraction_plan(plan.walker_charges, other)
-        channel_maps = make_channel_block_maps(contraction, *plan.channel_charges)
-        gather = _separable_gather(contraction, [len(q) for q in other])
-        layout = ContractionLayout(contraction, channel_maps, gather)
-        plan.caches[key] = layout
-    return layout
-
-
-def gather_blocks(tensors, gather):
-    """Padded charge blocks of an MPS; the values equal extract_fixed_blocks'."""
-    return tuple(
-        jnp.asarray(A)
-        .at[rows[:, :, None], phys[:, None, None], cols[:, None, :]]
-        .get(mode="fill", fill_value=0.0)
-        for A, (rows, phys, cols) in zip(tensors, gather)
-    )
-
-
-def convert_walker(walker, plan: MpsWalkerPlan):
-    """Orthonormalise an SD walker and convert each spin channel to an MPS (static labels)."""
-    ca, cb = walker
-    for c in (ca, cb):
-        if not jnp.issubdtype(jnp.result_type(c), jnp.floating):
-            raise TypeError(
-                "MPS-CPMC walkers must be real floating-point arrays (cpmc.init_prop_state "
-                "applies jnp.real; do the same for state= or initial walkers)"
-            )
-    plan_a, plan_b = plan.orbital_plans
-    bond_a, bond_b = plan.bond_plans
-    qa, det_ra = qr_with_det(ca)
-    qb, det_rb = qr_with_det(cb)
-    alpha, qa_charge, gauge_a = channel_mps(qa, plan_a, bond_a)
-    beta, qb_charge, gauge_b = channel_mps(qb, plan_b, bond_b)
-    prefactor = det_ra * det_rb * gauge_a * gauge_b
-    return alpha, qa_charge, beta, qb_charge, prefactor
-
-
-def overlap_from_blocks(walker, trial_blocks, layout: ContractionLayout, plan: MpsWalkerPlan):
-    alpha, _, beta, _, prefactor = convert_walker(walker, plan)
-    walker_blocks = extract_channel_blocks(alpha, beta, layout.channel_maps)
-    value = prefactor * blocked_contract_from_blocks(
-        walker_blocks, trial_blocks, layout.contraction
-    )
-    return jnp.real(value)
 
 
 def check_trial(trial, plan: MpsWalkerPlan) -> None:
     if not isinstance(trial, MpsTrial):
         raise TypeError(f"MPS-CPMC trial_data must be an MpsTrial, got {type(trial).__name__}")
-    if trial.nelec != tuple(plan.nelec) or trial.norb != plan.norb:
+    if tuple(trial.nelec) != tuple(plan.nelec) or trial.norb != plan.norb:
         raise ValueError(
             f"trial (norb={trial.norb}, nelec={trial.nelec}) does not match the walker plan "
             f"(norb={plan.norb}, nelec={tuple(plan.nelec)})"
         )
 
 
+def check_walker(walker) -> None:
+    for c in walker:
+        if not jnp.issubdtype(jnp.result_type(c), jnp.floating):
+            raise TypeError(
+                "MPS-CPMC walkers must be real floating-point arrays (init_prop_state applies jnp.real; "
+                "do the same for state= or initial walkers)"
+            )
+
+
 def mps_overlap(walker, trial: MpsTrial, plan: MpsWalkerPlan):
-    """<trial|walker> for one SD walker, a real float64 scalar."""
+    """<trial|walker> for one SD walker, a real float64 scalar: the plan's engine with the trial's blocks
+    gathered from trial.tensors."""
     check_trial(trial, plan)
-    layout = contraction_layout(plan, trial.charges)
-    return overlap_from_blocks(walker, gather_blocks(trial.tensors, layout.gather), layout, plan)
+    check_walker(walker)
+    kernels = engine.kernels_for(plan, trial.charges, energy=None)
+    data = engine.DeviceData(engine.fixed_blocks(trial.tensors, kernels.overlap_plan), (), (), None, None)
+    return kernels.overlap_one(walker[0], walker[1], data)
 
 
 def mps_overlap_fn(plan: MpsWalkerPlan):
@@ -853,5 +614,5 @@ def mps_overlap_fn(plan: MpsWalkerPlan):
 
 
 def make_mps_trial_ops(plan: MpsWalkerPlan) -> TrialOps:
-    """TrialOps for an MpsTrial: overlap and rdm1. CPMC fast updates live in the prop step."""
+    """TrialOps for an MpsTrial: overlap and rdm1. CPMC updates live in the prop step (trot.prop.mps_cpmc)."""
     return TrialOps(overlap=mps_overlap_fn(plan), get_rdm1=get_rdm1)

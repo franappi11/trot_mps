@@ -3,7 +3,9 @@
 Every reference comes from tests/helpers/hubbard_fock.py (exact Fock-space enumeration), from
 trot's GHF Hubbard kernel or from pyblock3, never from the MPS code under test. The MPO identity
 uses random MPS on five h1 (U=3.7); the trials live on an L=6 open chain and on a 2x3 lattice
-periodic in x (doubled rungs) with two on-site terms, U=4, (N_up, N_dn) = (3, 2).
+periodic in x (doubled rungs) with two on-site terms, U=4, (N_up, N_dn) = (3, 2). The spin-rotated
+determinant has no definite (N_up, N_dn), so make_mps_trial uses it as it is (particle-number
+labels): the walkers pick their sector, and the local energies are those of the projected trial.
 """
 
 from trot import config
@@ -21,9 +23,9 @@ import scipy.linalg
 
 from tests.helpers import hubbard_fock as hf
 from trot.core.system import System
+from trot.gmps import engine
 from trot.gmps.utils import sd_to_gmps
 from trot.ham.hubbard import HamHubbard, hopping_matrix, square_hopping_matrix
-from trot.meas import mps as meas_mps
 from trot.meas.ghf import energy_kernel_hubbard_u
 from trot.meas.mps import (
     MpsMeasCtx,
@@ -34,14 +36,15 @@ from trot.meas.mps import (
     make_mps_meas_ops_hubbard,
     trial_times_h,
 )
+from trot.prop.hubbard_cpmc_ops import _build_prop_ctx
 from trot.trial.ghf import GhfTrial
 from trot.trial.mps import (
-    PHYSICAL_CHARGE,
     compress_mps_qn,
     make_mps_trial,
     make_walker_plan_from_reference,
     mps_trial_from_sd,
     natural_orbitals,
+    physical_charge,
     rotate_spin,
 )
 
@@ -93,8 +96,11 @@ def _random_mps(L, rng):
 
 
 def _rotated_sd_trial(Ca, Cb):
+    """The spin-rotated determinant: no definite (N_up, N_dn), so make_mps_trial uses it as it is."""
     tensors = [np.asarray(t) for t in sd_to_gmps(Ca, Cb, mode="maximal").tensors]
-    return make_mps_trial(rotate_spin(tensors, R), nelec=NELEC)
+    trial = make_mps_trial(rotate_spin(tensors, R), nelec=NELEC)
+    assert trial.label_width == 1 and trial.sector_weight is None
+    return trial
 
 
 def _natural_reference(trial):
@@ -151,16 +157,19 @@ def _mps_energies(case, plan_kind, kernel):
 
 
 def _assert_labels_respected(tensors, charges):
-    """(N_up, N_dn) bond labels from (0, 0) to NELEC that every nonzero entry respects."""
+    """Bond labels from zero to NELEC, (N_up, N_dn) pairs or particle numbers N, that every nonzero entry respects."""
+    width = np.shape(charges[0])[1]
     assert len(charges) == len(tensors) + 1
-    np.testing.assert_array_equal(charges[0], [[0, 0]])
-    np.testing.assert_array_equal(charges[-1], [list(NELEC)])
+    np.testing.assert_array_equal(charges[0], [[0] * width])
+    np.testing.assert_array_equal(charges[-1], [list(NELEC) if width == 2 else [sum(NELEC)]])
     for s, A in enumerate(tensors):
         A = np.asarray(A)
         assert A.shape[0] == len(charges[s]) and A.shape[2] == len(charges[s + 1])
-        for p, delta in enumerate(PHYSICAL_CHARGE):
+        for p, delta in enumerate(physical_charge(width)):
             left, right = np.nonzero(A[:, p, :])
-            np.testing.assert_array_equal(charges[s + 1][right], charges[s][left] + delta)
+            reached = np.asarray(charges[s])[left][:, 0] >= 0  # -1: an index nothing reaches (its block is zero)
+            np.testing.assert_array_equal(np.asarray(charges[s + 1])[right[reached]],
+                                          np.asarray(charges[s])[left[reached]] + delta)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -193,14 +202,14 @@ def sd_chain():
 
 @pytest.fixture(scope="module")
 def rotated_sd_chain():
-    """L=6 chain: the spin-rotated determinant, projected onto (3, 2) by make_mps_trial."""
+    """L=6 chain: the spin-rotated determinant, used as it is (particle-number labels, every sector)."""
     h1 = hopping_matrix(6, 1.0)
     Ca, Cb = hf.staggered_determinant(h1, *NELEC)
     trial = _rotated_sd_trial(Ca, Cb)
     case = _case(h1, trial, _natural_reference(trial), seed=3)
     case.C = np.kron(R, np.eye(6)) @ cast(np.ndarray, scipy.linalg.block_diag(Ca, Cb))
-    a = hf.ghf_amplitudes(case.C, *NELEC).ravel()
-    case.trial_energy = float(a @ case.H @ a) / float(a @ a)
+    v = hf.ghf_full_vector(case.C)  # the trial used as it is spans every sector with N = 5
+    case.trial_energy = float(v @ hf.apply_hubbard_full(h1, U, v)) / float(v @ v)
     return case
 
 
@@ -229,7 +238,7 @@ def case(request):
 
 
 # ---------------------------------------------------------------------------------------------
-# 1-3: MPOs
+# 1-2: MPOs
 # ---------------------------------------------------------------------------------------------
 
 
@@ -255,52 +264,18 @@ def test_mpo_from_h1_chain_limit_is_hubbard_mpo(L, t):
     assert W.shape == reference.shape and np.array_equal(W, reference)
 
 
-def test_scripts_reexport_meas_objects():
-    """mps_cpmc_2d and mps_cpmc_new use the very objects of trot.meas.mps / trot.ham.hubbard."""
-    pytest.importorskip("pyblock3")
-    from trot.gmps import mps_cpmc_2d, mps_cpmc_new
-
-    for name in ("hubbard_mpo_from_h1", "apply_mpo", "trial_times_h", "CHANNEL_CHARGE"):
-        assert getattr(mps_cpmc_2d, name) is getattr(meas_mps, name), name
-    assert mps_cpmc_2d.square_hopping_matrix is square_hopping_matrix
-    assert mps_cpmc_new.hubbard_mpo is meas_mps.hubbard_mpo
-
-
-def _apply_mpo_old(W, tensors):
-    """apply_mpo of trot/gmps/mps_cpmc_new.py before the refactor (last site: channel 5:6)."""
-    out = []
-    for i, (operator, A) in enumerate(zip(W, tensors)):
-        if i == 0:
-            operator = operator[:1]
-        if i == len(tensors) - 1:
-            operator = operator[:, :, :, 5:6]
-        T = np.einsum("apqb,cqd->acpbd", operator, np.asarray(A))
-        dl, cl, d, dr, cr = T.shape
-        out.append(T.reshape(dl * cl, d, dr * cr))
-    return out
-
-
-def test_apply_mpo_bitwise_equals_old_code_on_chain_mpo():
-    """On the six-channel chain MPO apply_mpo is bitwise the pre-refactor 5:6 version."""
-    W = hubbard_mpo(6, 1.0, 4.0)
-    tensors = _random_mps(6, np.random.default_rng(7))
-    new, old = apply_mpo(W, tensors), _apply_mpo_old(W, tensors)
-    assert len(new) == len(old) == 6
-    for a, b in zip(new, old):
-        assert a.shape == b.shape and a.dtype == b.dtype
-        assert a.tobytes() == b.tobytes()
-
-
 # ---------------------------------------------------------------------------------------------
-# 4: H|trial> with bond labels
+# 3: H|trial> with bond labels
 # ---------------------------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("case", ["ed_2x3", "rotated_sd_2x3"], indirect=True)
 def test_trial_times_h_is_labelled_h_trial(case):
-    """trial_times_h is exactly H|T> with valid labels; compress_mps_qn keeps vector and labels."""
+    """trial_times_h is exactly H|T> with valid labels ((N_up, N_dn) for the ED trial, N for the rotated one);
+    compress_mps_qn keeps vector and labels."""
     W = hubbard_mpo_from_h1(case.h1, U)
     tensors, charges = trial_times_h(W, case.trial.tensors, case.trial.charge_arrays())
+    assert np.shape(charges[0])[1] == case.trial.label_width
     _assert_labels_respected(tensors, charges)  # (a)
 
     got = hf.mps_full_vector(tensors)
@@ -316,7 +291,7 @@ def test_trial_times_h_is_labelled_h_trial(case):
 
 
 # ---------------------------------------------------------------------------------------------
-# 5-7: local energies
+# 4-6: local energies
 # ---------------------------------------------------------------------------------------------
 
 
@@ -368,22 +343,25 @@ def test_energy_matches_ghf_hubbard_kernel(case, kernel):
 
 
 # ---------------------------------------------------------------------------------------------
-# 8: the measurement context
+# 7: the measurement context
 # ---------------------------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("kernel", KERNELS)
 def test_meas_ctx_is_pytree_holding_one_kernel(ed_2x3, kernel):
-    """MpsMeasCtx flattens to its blocks and back; only the chosen kernel's H|T> is stored."""
-    ctx, L = ed_2x3.ctx["exact", kernel], ed_2x3.trial.norb
+    """MpsMeasCtx flattens to its padded blocks and back; only the chosen kernel's H|T> is stored. Its kernels
+    are the plan's cached engine and data(prop_ctx) its DeviceData."""
+    ctx, L, plan = ed_2x3.ctx["exact", kernel], ed_2x3.trial.norb, ed_2x3.plans["exact"]
     assert isinstance(ctx, MpsMeasCtx) and ctx.kernel == kernel
-    assert ctx.plan is ed_2x3.plans["exact"]
+    assert ctx.plan is plan and ctx.trial_charges == ed_2x3.trial.charges
+    assert len(ctx.trial_blocks) == len(ctx.h_blocks) == L
     if kernel == "blocked":
-        assert ctx.h_tensors is None and ctx.h_blocks is not None and len(ctx.h_blocks) == L
-    else:
-        assert ctx.h_blocks is None and ctx.h_tensors is not None and len(ctx.h_tensors) == L
+        assert ctx.h_charges is not None and ctx.dense_trial == ()
+    else:  # the dense H|T> tensors and the trial tensors
+        assert ctx.h_charges is None and len(ctx.dense_trial) == L
     leaves, treedef = jax.tree_util.tree_flatten(ctx)
-    assert len(leaves) == 2 * L and all(isinstance(x, jax.Array) for x in leaves)
+    n_leaves = (2 if kernel == "blocked" else 3) * L
+    assert len(leaves) == n_leaves and all(isinstance(x, jax.Array) for x in leaves)
     rebuilt = jax.tree_util.tree_unflatten(treedef, leaves)
     assert isinstance(rebuilt, MpsMeasCtx) and rebuilt.key == ctx.key
     assert all(a is b for a, b in zip(jax.tree_util.tree_leaves(rebuilt), leaves))
@@ -392,32 +370,48 @@ def test_meas_ctx_is_pytree_holding_one_kernel(ed_2x3, kernel):
     for a, b in zip(jax.tree_util.tree_leaves(passed), leaves):
         np.testing.assert_array_equal(a, b)
 
+    kernels = ctx.kernels
+    assert kernels is engine.kernels_for(plan, ctx.trial_charges, ctx.h_charges, kernel)
+    assert kernels.energy_kind == kernel
+    assert kernels.overlap_plan is engine.layout_for(plan, ctx.trial_charges)
+    assert (kernels.energy_plan is None) == (kernel == "dense")
+    prop_ctx = _build_prop_ctx(ed_2x3.ham, 0.05)
+    for data, propagation in ((ctx.data(), None), (ctx.data(prop_ctx), prop_ctx)):
+        assert isinstance(data, engine.DeviceData)
+        assert data.trial is ctx.trial_blocks and data.htrial is ctx.h_blocks
+        assert data.dense_trial is ctx.dense_trial
+        if propagation is None:
+            assert data.exp_h1_half is None and data.hs is None
+        else:
+            assert data.exp_h1_half is prop_ctx.exp_h1_half and data.hs is prop_ctx.hs_constant
+
 
 @pytest.mark.parametrize("kernel", KERNELS)
 def test_energy_kernel_rejects_mismatched_ctx(ed_2x3, kernel):
-    """The energy kernel raises ValueError for no ctx, another plan's ctx or the other kernel's."""
-    other = "dense" if kernel == "blocked" else "blocked"
-    energy = ed_2x3.ops["exact", kernel].kernels["energy"]
-    walker = ed_2x3.walkers[0]
+    """The energy kernel raises ValueError for no ctx, another plan's ctx or another trial's ctx."""
+    ops = ed_2x3.ops["exact", kernel]
+    other = mps_trial_from_sd(*hf.staggered_determinant(ed_2x3.h1, *NELEC))
+    assert other.charges != ed_2x3.trial.charges
     bad = [
         (None, "build_meas_ctx"),
         (ed_2x3.ctx["truncated", kernel], "different walker plan"),
-        (ed_2x3.ctx["exact", other], f"holds the '{other}' kernel"),
+        (ops.build_meas_ctx(ed_2x3.ham, other), "different trial"),
     ]
     for ctx, message in bad:
         with pytest.raises(ValueError, match=message):
-            energy(walker, ed_2x3.ham, ctx, ed_2x3.trial)
+            ops.kernels["energy"](ed_2x3.walkers[0], ed_2x3.ham, ctx, ed_2x3.trial)
 
 
 @pytest.mark.parametrize("kernel", KERNELS)
 @pytest.mark.parametrize("case", ENERGY_CASES, indirect=True)
 def test_ctx_trial_energy_is_trial_expectation(case, kernel):
-    """ctx.trial_energy is <T|H|T>/<T|T>: E0 for the ED trial, the determinant energy for SDs."""
+    """ctx.trial_energy is <T|H|T>/<T|T>: E0 for the ED trial, the determinant energy for SDs (over every
+    sector for the rotated determinant used as it is)."""
     assert abs(case.ctx["exact", kernel].trial_energy - case.trial_energy) < 1e-10
 
 
 # ---------------------------------------------------------------------------------------------
-# 9: hubbard_h1
+# 8: hubbard_h1
 # ---------------------------------------------------------------------------------------------
 
 
@@ -465,7 +459,7 @@ def test_hubbard_h1_symmetrises_tiny_asymmetry_exactly():
 
 
 # ---------------------------------------------------------------------------------------------
-# 10: pyblock3 DMRG trial
+# 9: pyblock3 DMRG trial
 # ---------------------------------------------------------------------------------------------
 
 

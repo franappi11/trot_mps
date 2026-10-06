@@ -1,10 +1,13 @@
-"""Tests for trot/trial/mps.py: the MpsTrial pytree, trials from determinants, dense MPS and DMRG,
-the exact (N_up, N_dn) sector projection, spin rotations, walker plans and the blocked overlap.
+"""Tests for trot/trial/mps.py: the MpsTrial pytree, trials from determinants, dense MPS and DMRG, the bond labels
+make_mps_trial reads ((N_up, N_dn) pairs or particle numbers N; it never projects), spin rotations, walker plans,
+the engine's walker conversion and the overlap of make_mps_trial_ops.
 
-Every reference comes from tests/helpers/hubbard_fock.py (exact Fock-space enumeration), from
-trot's GHF trial or from pyblock3, never from the MPS code under test. Systems: an L=6 open chain
-(t=1, U=4) with nelec (3, 3) and (3, 2), and a 2x3 lattice periodic in x (doubled rungs) with two
-on-site terms, U=4, (3, 2).
+Every reference comes from tests/helpers/hubbard_fock.py (exact Fock-space enumeration), from the NumPy host oracle
+of the conversion (trot.gmps.engine.channel_mps_host), from trot's GHF trial or from pyblock3, never from the MPS code
+under test. Systems: an L=6 open chain (t=1, U=4) with nelec (3, 3) and (3, 2), and a 2x3 lattice periodic in x
+(doubled rungs) with two on-site terms, U=4, (3, 2). The lattice trials are the ED ground state and a determinant
+with (N_up, N_dn) labels, and the spin-rotated determinant used as it is (N labels) and projected onto (3, 2)
+(rotate_mps_trial).
 """
 
 from trot import config
@@ -28,8 +31,9 @@ import scipy.linalg
 
 from tests.helpers import hubbard_fock as hf
 from trot.core.system import System
+from trot.gmps import engine
 from trot.gmps import utils as gmps_utils
-from trot.gmps.utils import combine_channels, sd_to_gmps
+from trot.gmps.utils import combine_channels, combined_charges, sd_to_gmps
 from trot.ham.hubbard import HamHubbard, hopping_matrix, square_hopping_matrix
 from trot.meas.mps import hubbard_mpo_from_h1, trial_times_h
 from trot.prop.types import QmcParamsMps
@@ -37,12 +41,9 @@ from trot.trial.ghf import GhfTrial, get_rdm1_block_diag, overlap_u
 from trot.trial.mps import (
     PHYSICAL_CHARGE,
     MpsTrial,
+    _hashable_charges,
     as_mps_trial,
     compress_mps_qn,
-    contraction_layout,
-    convert_walker,
-    extract_fixed_blocks,
-    gather_blocks,
     make_mps_trial,
     make_mps_trial_ops,
     make_walker_plan,
@@ -50,10 +51,11 @@ from trot.trial.mps import (
     mps_overlap,
     mps_trial_from_pyblock3,
     mps_trial_from_sd,
-    project_to_sector,
     rotate_spin,
     spin_rotation_unitary,
 )
+from trot.trial.mps_rotation import rotate_mps_trial
+from trot.walkers import _qr as qr_with_det
 from trot.walkers import vmap_chunked
 
 REPO = Path(__file__).resolve().parents[1]
@@ -65,8 +67,9 @@ E_L4 = -1.953145308685  # exact, L=4 open chain, (2, 2), U=4
 THETA = 0.7
 ROTATION = np.array([[np.cos(THETA), -np.sin(THETA)], [np.sin(THETA), np.cos(THETA)]])
 REFLECTION = np.array([[np.cos(THETA), np.sin(THETA)], [np.sin(THETA), -np.cos(THETA)]])
+SWAP = np.array([[0.0, 1.0], [1.0, 0.0]])  # up <-> down
 SPIN_MAPS = {"rotation": ROTATION, "reflection": REFLECTION}
-TRIALS = ("ed", "sd", "rotated_sd")
+TRIALS = ("ed", "sd", "rotated_sd", "projected_sd")
 PLAN_SETTINGS = {
     "exact": dict(orbital_plan="maximal", walker_channel_chi=None),
     "truncated": dict(orbital_plan="adaptive", walker_channel_chi=2),
@@ -95,6 +98,18 @@ def _ghf_orbitals(R, Ca, Cb):
     return np.kron(R, np.eye(len(Ca))) @ scipy.linalg.block_diag(Ca, Cb)
 
 
+def _make_trials(psi, Ca, Cb):
+    """The lattice trials: the ED ground state and SD(Ca, Cb) with (N_up, N_dn) labels, and SD rotated by ROTATION
+    used as it is (N labels, sector_weight None) and projected onto NELEC (rotate_mps_trial, sector_weight w)."""
+    sd = mps_trial_from_sd(Ca, Cb)
+    return {
+        "ed": make_mps_trial(*hf.exact_mps_from_sector_state(psi, L, *NELEC), nelec=NELEC),
+        "sd": sd,
+        "rotated_sd": make_mps_trial(rotate_spin(_sd_tensors(Ca, Cb), ROTATION), nelec=NELEC),
+        "projected_sd": rotate_mps_trial(sd, ROTATION),
+    }
+
+
 def _jnp_walker(wa, wb):
     return jnp.asarray(wa), jnp.asarray(wb)
 
@@ -119,6 +134,27 @@ def _sd_overlaps(tensors, walkers):
     return np.array([hf.overlap_with_sd(amplitudes, wa, wb) for wa, wb in walkers])
 
 
+def _engine_walker_mps(walker, convert, labels):
+    """An SD walker converted by a plan's engine: trot's QR, the compiled circuit (convert), channels interleaved.
+    Returns the d=4 tensors and the prefactor det R_a det R_b g_a g_b."""
+    (qa, det_a), (qb, det_b) = (qr_with_det(jnp.asarray(C)) for C in walker)
+    alpha, beta, (gauge_a, gauge_b) = convert(qa, qb)
+    tensors, _ = combine_channels(alpha, labels[0], beta, labels[1])
+    return [np.asarray(t) for t in tensors], float(det_a * det_b * gauge_a * gauge_b)
+
+
+def _host_walker_mps(walker, plan):
+    """The same with the NumPy host oracle of the conversion (engine.channel_mps_host) on the plan's frozen circuit."""
+    parts, prefactor = [], 1.0
+    for C, orbital_plan, bond_plan in zip(walker, plan.orbital_plans, plan.bond_plans):
+        Q, det_r = qr_with_det(jnp.asarray(C))
+        tensors, charges, gauge = engine.channel_mps_host(np.asarray(Q), orbital_plan, bond_plan)
+        parts += [tensors, charges]
+        prefactor *= float(det_r) * gauge
+    tensors, _ = combine_channels(*parts)
+    return [np.asarray(t) for t in tensors], prefactor
+
+
 def _scaled(got, want):
     """c * want with the one free global constant c = got / want at the largest |want| entry."""
     got, want = np.asarray(got), np.asarray(want)
@@ -138,18 +174,26 @@ def _assert_close_up_to_constant(got, want, tol):
     np.testing.assert_allclose(got, scaled, rtol=0, atol=tol * np.abs(scaled).max())
 
 
+def _assert_close(got, want, tol):
+    np.testing.assert_allclose(got, want, rtol=0, atol=tol * np.abs(want).max())
+
+
 def _assert_labels_respected(tensors, charges, nelec):
-    """(N_up, N_dn) bond labels from (0, 0) to nelec that every nonzero entry respects."""
-    Q = [np.asarray(q, int).reshape(-1, 2) for q in charges]
+    """Bond labels from 0 to nelec that every nonzero entry respects: (N_up, N_dn) pairs, or particle numbers N
+    (width 1; an index that no nonzero entry reaches is labelled -1, and the entries leaving it are not checked)."""
+    Q = [np.asarray(q, int).reshape(len(q), -1) for q in charges]
+    width = Q[0].shape[1]
+    physical = PHYSICAL_CHARGE if width == 2 else PHYSICAL_CHARGE.sum(axis=1, keepdims=True)
     assert len(Q) == len(tensors) + 1
-    np.testing.assert_array_equal(Q[0], [[0, 0]])
-    np.testing.assert_array_equal(Q[-1], [list(nelec)])
+    np.testing.assert_array_equal(Q[0], [[0] * width])
+    np.testing.assert_array_equal(Q[-1], [list(nelec) if width == 2 else [sum(nelec)]])
     for s, A in enumerate(tensors):
         A = np.asarray(A)
         assert A.shape[0] == len(Q[s]) and A.shape[2] == len(Q[s + 1])
-        for p, delta in enumerate(PHYSICAL_CHARGE):
+        for p, delta in enumerate(physical):
             left, right = np.nonzero(A[:, p, :])
-            np.testing.assert_array_equal(Q[s + 1][right], Q[s][left] + delta)
+            reached = np.all(Q[s][left] >= 0, axis=1)
+            np.testing.assert_array_equal(Q[s + 1][right[reached]], Q[s][left[reached]] + delta)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -169,19 +213,17 @@ def chain():
 
 @pytest.fixture(scope="module")
 def lattice():
-    """2x3 lattice, (3, 2): ED ground state, three trials with oracles, walkers, walker plans."""
+    """2x3 lattice, (3, 2): ED ground state, four trials with oracles, walkers, walker plans."""
     h1 = _lattice_h1()
     E0, psi = hf.ground_state(h1, U, *NELEC)
     Ca, Cb = hf.staggered_determinant(h1, *NELEC)
-    trials = {
-        "ed": make_mps_trial(*hf.exact_mps_from_sector_state(psi, L, *NELEC), nelec=NELEC),
-        "sd": mps_trial_from_sd(Ca, Cb),
-        "rotated_sd": make_mps_trial(rotate_spin(_sd_tensors(Ca, Cb), ROTATION), nelec=NELEC),
-    }
+    trials = _make_trials(psi, Ca, Cb)
+    rotated_ghf = hf.ghf_amplitudes(_ghf_orbitals(ROTATION, Ca, Cb), *NELEC)
     oracles = {  # independent alpha-block amplitudes, each proportional to its trial's
         "ed": psi,
         "sd": hf.sd_amplitudes(Ca, Cb),
-        "rotated_sd": hf.ghf_amplitudes(_ghf_orbitals(ROTATION, Ca, Cb), *NELEC),
+        "rotated_sd": rotated_ghf,
+        "projected_sd": rotated_ghf,
     }
     ham = HamHubbard(h1=jnp.asarray(h1), u=U)
     sys_ = System(norb=L, nelec=NELEC, walker_kind="unrestricted")
@@ -218,40 +260,46 @@ def dmrg_2x3(lattice):
 # ---------------------------------------------------------------------------------------------
 
 
-def test_mps_trial_is_a_pytree_with_static_labels(lattice):
-    """MpsTrial flattens to L tensors + rdm1, labels and sector weight are its hashable aux."""
-    trial, other = lattice.trials["sd"], lattice.trials["ed"]
+@pytest.mark.parametrize("name", TRIALS)
+def test_mps_trial_is_a_pytree_with_static_labels(lattice, name):
+    """MpsTrial flattens to L tensors + rdm1; charges, nelec and sector_weight are its hashable aux, kept by the
+    round trip and static inside jit. Rebuilt from scratch it has the same tree structure, other trials not."""
+    trial = lattice.trials[name]
     leaves, treedef = jax.tree_util.tree_flatten(trial)
     assert len(leaves) == L + 1
     assert all(a is b for a, b in zip(leaves, (*trial.tensors, trial.rdm1)))
     _, aux = trial.tree_flatten()
-    assert aux == (trial.charges, trial.sector_weight)
+    assert aux == (trial.charges, trial.nelec, trial.sector_weight) and trial.nelec == NELEC
     hash(aux)
 
     rebuilt = jax.tree_util.tree_unflatten(treedef, leaves)
     assert isinstance(rebuilt, MpsTrial)
-    assert rebuilt.charges == trial.charges and rebuilt.sector_weight == trial.sector_weight
+    assert (rebuilt.charges, rebuilt.nelec, rebuilt.sector_weight) == aux
+    assert rebuilt.label_width == trial.label_width and rebuilt.bond_dims == trial.bond_dims
     assert all(a is b for a, b in zip(jax.tree_util.tree_leaves(rebuilt), leaves))
 
     def first_sum(t):
-        assert t.charges == trial.charges and t.nelec == NELEC  # aux stays Python data in jit
+        assert (t.charges, t.nelec, t.sector_weight) == aux  # aux stays Python data in jit
         return t.tensors[0].sum()
 
     np.testing.assert_allclose(
         jax.jit(first_sum)(trial), np.asarray(trial.tensors[0]).sum(), rtol=0, atol=1e-14
     )
     passed = jax.jit(lambda t: t)(trial)
-    assert isinstance(passed, MpsTrial) and passed.charges == trial.charges
+    assert isinstance(passed, MpsTrial)
+    assert (passed.charges, passed.nelec, passed.sector_weight) == aux
 
     assert jax.tree_util.tree_structure(trial) == treedef
     assert jax.tree_util.tree_structure(rebuilt) == treedef
-    assert jax.tree_util.tree_structure(mps_trial_from_sd(*lattice.sd)) == treedef
-    assert other.charges != trial.charges
-    assert jax.tree_util.tree_structure(other) != treedef
+    again = _make_trials(lattice.psi, *lattice.sd)[name]
+    assert jax.tree_util.tree_structure(again) == treedef
+    for other, other_trial in lattice.trials.items():
+        if other != name:
+            assert jax.tree_util.tree_structure(other_trial) != treedef
 
 
 # ---------------------------------------------------------------------------------------------
-# 2-5: trials from determinants, sector projection and spin rotations
+# 2-6: trials from determinants, bond labels and spin rotations
 # ---------------------------------------------------------------------------------------------
 
 
@@ -273,52 +321,67 @@ def test_trial_from_sd_is_exact(chain, nelec):
     np.testing.assert_allclose(hf.dense_rdm1(want, L, nup, ndn), projectors, rtol=0, atol=1e-13)
 
     assert trial.charges[0] == ((0, 0),) and trial.charges[-1] == ((nup, ndn),)
-    assert trial.nelec == nelec and trial.norb == L
+    assert trial.nelec == nelec and trial.norb == L and trial.label_width == 2
     np.testing.assert_array_equal(PHYSICAL_CHARGE, [[p % 2, p // 2] for p in range(4)])
     _assert_labels_respected(trial.tensors, trial.charges, nelec)
     assert abs(trial.sector_weight - 1.0) < 1e-12
 
 
-def test_project_to_sector_is_the_exact_projection(chain, lattice):
-    """project_to_sector is P|T> with SZ labels, keeps valid SZ input and rejects empty sectors."""
-    Ca, Cb = chain.sd[NELEC]
-    gmps = sd_to_gmps(Ca, Cb, mode="maximal")
+def test_make_mps_trial_reads_the_labels_off_the_tensors(lattice):
+    """Without valid charges make_mps_trial reads the labels off the nonzero entries and projects nothing:
+    (N_up, N_dn) labels for a sector state (sector_weight 1), particle-number labels for the spin-rotated
+    determinant (used as it is, sector_weight None). Labels the tensors violate are ignored, not an error."""
+    # (a) the exact MPS of the ED ground state, with and without its labels
+    tensors, charges = hf.exact_mps_from_sector_state(lattice.psi, L, *NELEC)
+    labelled = make_mps_trial(tensors, charges, nelec=NELEC)
+    read = make_mps_trial(tensors, nelec=NELEC)
+    assert read.charges == labelled.charges == _hashable_charges(charges)
+    assert read.charges == _hashable_charges(gmps_utils.sz_labels(tensors))
+    assert read.label_width == 2 and read.sector_weight == 1.0 and read.nelec == NELEC
+    assert all(np.array_equal(a, b) for a, b in zip(read.tensors, labelled.tensors))
+    _assert_labels_respected(read.tensors, read.charges, NELEC)
+
+    # (b) the spin-rotated determinant has no definite (N_up, N_dn): particle-number labels, bonds unchanged
+    gmps = sd_to_gmps(*lattice.sd, mode="maximal")
     rotated = rotate_spin([np.asarray(t) for t in gmps.tensors], ROTATION)
+    assert gmps_utils.sz_labels(rotated) is None
+    as_is = make_mps_trial(rotated, nelec=NELEC)
+    stale = make_mps_trial(rotated, gmps.charges, nelec=NELEC)  # the unrotated labels: violated, ignored
+    assert as_is.label_width == 1 and as_is.sector_weight is None and as_is.nelec == NELEC
+    assert stale.charges == as_is.charges == _hashable_charges(gmps_utils.number_labels(rotated))
+    assert stale.sector_weight is None
+    assert all(np.array_equal(a, b) for a, b in zip(stale.tensors, as_is.tensors))
+    assert as_is.bond_dims == tuple(len(q) for q in gmps.charges)
+    for q, q_sz in zip(as_is.charge_arrays(), gmps.charges):  # reached indices keep N = N_up + N_dn
+        reached = q[:, 0] >= 0
+        np.testing.assert_array_equal(q[reached, 0], np.asarray(q_sz).sum(axis=1)[reached])
+    _assert_labels_respected(as_is.tensors, as_is.charges, NELEC)
+    vector = hf.mps_full_vector(rotated)
+    _assert_close(hf.mps_full_vector(as_is.tensors), vector / np.linalg.norm(vector), 1e-13)
+
+
+def test_make_mps_trial_rejects_trials_the_walkers_cannot_see(lattice):
+    """(N_up, N_dn) labels that end at another sector, particle-number labels that end at another N, and an MPS
+    that mixes particle numbers (no labels to block on) are errors; the mirrored sector is accepted."""
+    tensors, _ = hf.exact_mps_from_sector_state(lattice.psi, L, *NELEC)
+    swapped = rotate_spin(tensors, SWAP)  # the (3, 2) ground state moved whole into (2, 3)
+    with pytest.raises(ValueError, match=r"\(N_up, N_dn\) = \(2, 3\) and the walkers \(3, 2\)"):
+        make_mps_trial(swapped, nelec=NELEC)
+    mirrored = make_mps_trial(swapped, nelec=(2, 3))
+    assert mirrored.label_width == 2 and mirrored.sector_weight == 1.0 and mirrored.nelec == (2, 3)
+    _assert_labels_respected(mirrored.tensors, mirrored.charges, (2, 3))
+    vector = hf.mps_full_vector(swapped)
+    np.testing.assert_allclose(np.sum(hf.sector_from_full(vector, L, 2, 3) ** 2), vector @ vector, rtol=1e-12)
+
+    rotated = rotate_spin(_sd_tensors(*lattice.sd), ROTATION)
+    with pytest.raises(ValueError, match="the trial has N = 5 and the walkers 6"):
+        make_mps_trial(rotated, nelec=(3, 3))
+
     rng = np.random.default_rng(7)
     bonds = [1, 4, 8, 8, 4, 1]
-    unlabelled = [rng.standard_normal((bonds[i], 4, bonds[i + 1])) for i in range(5)]
-
-    # (a) the spin-rotated determinant onto (3, 2); (b) an unlabelled random MPS onto (2, 2)
-    results = {}
-    for name, tensors, nelec in (("a", rotated, NELEC), ("b", unlabelled, (2, 2))):
-        projected, charges, norm2 = project_to_sector(tensors, nelec)
-        want = hf.sector_from_full(hf.mps_full_vector(tensors), len(tensors), *nelec)
-        got = hf.mps_sector_amplitudes(projected, *nelec)
-        np.testing.assert_allclose(got, want, rtol=0, atol=1e-12 * np.abs(want).max())
-        np.testing.assert_allclose(norm2, np.sum(want**2), rtol=1e-12)
-        _assert_labels_respected(projected, charges, nelec)
-        results[name] = projected, charges, norm2
-    # labels that the tensors violate (the unrotated determinant's) are ignored, not an error
-    stale = project_to_sector(rotated, NELEC, gmps.charges)
-    assert all(np.array_equal(x, y) for x, y in zip(stale[0], results["a"][0]))
-    assert all(np.array_equal(x, y) for x, y in zip(stale[1], results["a"][1]))
-
-    # (c) valid SZ labels that end at nelec: returned unchanged (sd_to_gmps output, and the
-    # projection of (a), so projecting twice is projecting once). Not hf.exact_mps_from_sector_state:
-    # its last SVD remainder breaks its labels by ~1e-15, which correctly triggers the projection.
-    for tensors, charges in ((gmps.tensors, gmps.charges), results["a"][:2]):
-        out, out_charges, norm2 = project_to_sector(tensors, NELEC, charges)
-        assert len(out) == len(tensors) and len(out_charges) == len(charges)
-        assert all(np.array_equal(x, np.asarray(y)) for x, y in zip(out, tensors))
-        assert all(np.array_equal(x, np.asarray(y)) for x, y in zip(out_charges, charges))
-        vector = hf.mps_full_vector(tensors)
-        np.testing.assert_allclose(norm2, vector @ vector, rtol=1e-12)
-
-    # (d) the spin swap maps the (3, 2) determinant into (2, 3): no (3, 2) weight is left
-    swapped = rotate_spin([np.asarray(t) for t in gmps.tensors], [[0.0, 1.0], [1.0, 0.0]])
-    with pytest.raises(ValueError, match="no weight"):
-        make_mps_trial(swapped, nelec=NELEC)
-    assert abs(make_mps_trial(swapped, nelec=(2, 3)).sector_weight - 1.0) < 1e-12
+    mixed = [rng.standard_normal((bonds[i], 4, bonds[i + 1])) for i in range(5)]
+    with pytest.raises(ValueError, match="mixes particle numbers"):
+        make_mps_trial(mixed, nelec=(2, 2))
 
 
 @pytest.mark.parametrize("spin_map", list(SPIN_MAPS))
@@ -356,49 +419,56 @@ def test_rotate_spin_is_the_ghf_determinant(chain, spin_map):
 
 @pytest.mark.parametrize("spin_map", list(SPIN_MAPS))
 def test_rotated_trial_rdm1_is_the_ghf_block_diagonal(chain, spin_map):
-    """The rotated trial's rdm1 is get_rdm1_block_diag of the rotated GhfTrial (unprojected)."""
+    """The rotated trial's rdm1, as it is and projected (rotate_mps_trial), is get_rdm1_block_diag of the rotated
+    GhfTrial (the unprojected state's), so both start the walkers where the GHF trial does."""
     R = SPIN_MAPS[spin_map]
     Ca, Cb = chain.sd[NELEC]
-    trial = make_mps_trial(rotate_spin(_sd_tensors(Ca, Cb), R), nelec=NELEC)
     want = get_rdm1_block_diag(GhfTrial(mo_coeff=jnp.asarray(_ghf_orbitals(R, Ca, Cb))))
-    np.testing.assert_allclose(trial.rdm1, want, rtol=0, atol=1e-12)
+    as_is = make_mps_trial(rotate_spin(_sd_tensors(Ca, Cb), R), nelec=NELEC)
+    projected = rotate_mps_trial(mps_trial_from_sd(Ca, Cb), R)
+    for trial in (as_is, projected):
+        np.testing.assert_allclose(trial.rdm1, want, rtol=0, atol=1e-12)
 
 
 # ---------------------------------------------------------------------------------------------
-# 6-9: walker plans, conversion and the overlap
+# 7-12: walker plans, the engine's conversion and the overlap
 # ---------------------------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("orbital_plan", ["maximal", "rank_exact"])
 def test_exact_plans_convert_walkers_exactly(chain, orbital_plan):
-    """Exact plan, no truncation: prefactor * MPS(W) is SD(W) for non-orthonormal walkers W."""
+    """Exact plan, no truncation: the engine's conversion (engine.converter_for) of the QR'd walker times
+    det R_a det R_b g_a g_b is SD(W) by enumeration, for non-orthonormal walkers W; its labels are the plan's."""
     Ca, Cb = chain.sd[NELEC]
     plan = make_walker_plan_from_reference(
         Ca, Cb, orbital_plan=orbital_plan, walker_channel_chi=None
     )
+    converter = engine.converter_for(plan)
+    convert = jax.jit(converter.convert)
+    labels = combined_charges(*converter.charges)
+    assert len(labels) == len(plan.walker_charges) == L + 1
+    assert all(np.array_equal(x, y) for x, y in zip(labels, plan.walker_charges))
     for wa, wb in _walkers(chain.h1, 8, seed=6, all_nonorthonormal=True):
-        alpha, qa, beta, qb, prefactor = convert_walker(_jnp_walker(wa, wb), plan)
-        tensors, charges = combine_channels(alpha, qa, beta, qb)
-        got = float(prefactor) * hf.mps_sector_amplitudes(tensors, *NELEC)
-        want = hf.sd_amplitudes(wa, wb)
-        np.testing.assert_allclose(got, want, rtol=0, atol=1e-11 * np.abs(want).max())
-        assert all(np.array_equal(x, y) for x, y in zip(charges, plan.walker_charges))
-        _assert_labels_respected(tensors, charges, NELEC)
+        tensors, prefactor = _engine_walker_mps((wa, wb), convert, converter.charges)
+        got = prefactor * hf.mps_sector_amplitudes(tensors, *NELEC)
+        _assert_close(got, hf.sd_amplitudes(wa, wb), 1e-11)
+        _assert_labels_respected(tensors, labels, NELEC)
 
 
 @pytest.mark.parametrize("name", TRIALS)
 def test_overlap_matches_enumeration(lattice, name):
-    """The jitted overlap is <T|SD(W)> by enumeration; vmap and vmap_chunked give the same."""
+    """The jitted overlap (exact walker plan) is <T|SD(W)> by enumeration, the trial's NELEC amplitudes against
+    det(Wa[A]) det(Wb[B]), for (N_up, N_dn) and N labels alike, and proportional to the independent oracle's;
+    vmap and vmap_chunked give the same."""
     trial = lattice.trials[name]
     overlap = make_mps_trial_ops(lattice.plans[name, "exact"]).overlap
     walkers = [_jnp_walker(wa, wb) for wa, wb in lattice.walkers]
     first = overlap(walkers[0], trial)
     assert first.dtype == jnp.float64 and first.shape == ()
     got = np.array([float(overlap(w, trial)) for w in walkers])
-    own = hf.mps_sector_amplitudes(trial.tensors, *NELEC)
-    for amplitudes in (own, lattice.oracles[name]):
-        want = np.array([hf.overlap_with_sd(amplitudes, wa, wb) for wa, wb in lattice.walkers])
-        _assert_close_up_to_constant(got, want, 1e-10)
+    _assert_close(got, _sd_overlaps(trial.tensors, lattice.walkers), 1e-10)
+    oracle = np.array([hf.overlap_with_sd(lattice.oracles[name], wa, wb) for wa, wb in lattice.walkers])
+    _assert_close_up_to_constant(got, oracle, 1e-10)
 
     batch = tuple(jnp.stack(x) for x in zip(*walkers))
     vmapped = jax.vmap(overlap, in_axes=((0, 0), None))(batch, trial)
@@ -408,8 +478,9 @@ def test_overlap_matches_enumeration(lattice, name):
 
 
 @pytest.mark.parametrize("name", TRIALS)
-def test_truncated_overlap_equals_dense_contraction(lattice, name):
-    """chi=2 adaptive plan: the blocked overlap is prefactor * <T|MPS(W)> contracted densely."""
+def test_truncated_overlap_equals_the_host_conversion(lattice, name):
+    """chi=2 adaptive plan: the overlap is prefactor * <T|MPS(W)>, with MPS(W) converted by the NumPy host oracle
+    (engine.channel_mps_host) on the plan's frozen circuit and contracted densely."""
     trial = lattice.trials[name]
     plan = lattice.plans[name, "truncated"]
     overlap = make_mps_trial_ops(plan).overlap
@@ -418,36 +489,95 @@ def test_truncated_overlap_equals_dense_contraction(lattice, name):
     blocked, dense, untruncated = [], [], []
     for wa, wb in lattice.walkers:
         walker = _jnp_walker(wa, wb)
-        alpha, qa, beta, qb, prefactor = convert_walker(walker, plan)
-        tensors, _ = combine_channels(alpha, qa, beta, qb)
-        dense.append(float(prefactor) * (hf.mps_full_vector(tensors) @ trial_vector))
+        tensors, prefactor = _host_walker_mps((wa, wb), plan)
+        dense.append(prefactor * (hf.mps_full_vector(tensors) @ trial_vector))
         blocked.append(float(overlap(walker, trial)))
         untruncated.append(float(exact(walker, trial)))
-    np.testing.assert_allclose(blocked, dense, rtol=1e-11, atol=0)
+    np.testing.assert_allclose(blocked, dense, rtol=1e-10, atol=0)
     # sanity: the truncation is real
     assert np.abs(np.array(blocked) / np.array(untruncated) - 1.0).max() > 1e-6
 
 
 @pytest.mark.parametrize("kind", list(PLAN_SETTINGS))
-def test_separable_gather_equals_extract_fixed_blocks(lattice, kind):
-    """gather_blocks (eager and in-graph) is bitwise the host extract_fixed_blocks padding."""
-    trial = lattice.trials["ed"]
-    layout = contraction_layout(lattice.plans["ed", kind], trial.charges)
-    want = extract_fixed_blocks([np.asarray(A) for A in trial.tensors], layout.contraction)
-    eager = gather_blocks(trial.tensors, layout.gather)
-    jitted = jax.jit(lambda tensors: gather_blocks(tensors, layout.gather))(trial.tensors)
+def test_rotated_trial_overlaps_are_sqrt_w_times_the_projected(lattice, kind):
+    """Walkers are S_z eigenstates: on one walker plan the rotated trial used as it is (N labels) has overlaps
+    sqrt(w) times those of the projected trial (rotate_mps_trial, sector_weight w), exact or truncated walkers;
+    w is the as-is trial's NELEC weight by enumeration."""
+    as_is, projected = lattice.trials["rotated_sd"], lattice.trials["projected_sd"]
+    weight = projected.sector_weight
+    np.testing.assert_allclose(
+        weight, np.sum(hf.mps_sector_amplitudes(as_is.tensors, *NELEC) ** 2), rtol=1e-12
+    )
+    assert 1e-3 < weight < 0.9, "the rotation must move weight between sectors"
+    overlap = make_mps_trial_ops(lattice.plans["projected_sd", kind]).overlap
+    walkers = [_jnp_walker(wa, wb) for wa, wb in lattice.walkers]
+    got = np.array([float(overlap(w, as_is)) for w in walkers])
+    want = np.sqrt(weight) * np.array([float(overlap(w, projected)) for w in walkers])
+    _assert_close(got, want, 1e-10)
+
+
+@pytest.mark.parametrize("name", ["ed", "rotated_sd"])
+@pytest.mark.parametrize("kind", list(PLAN_SETTINGS))
+def test_trial_blocks_gathered_in_graph_equal_the_host_padding(lattice, kind, name):
+    """engine.fixed_blocks of the trial tensors (eager and in-graph, as mps_overlap gathers them) is bitwise the host
+    padding (xp=np) of the plan's layout, for (N_up, N_dn) and N labels."""
+    trial = lattice.trials[name]
+    layout = engine.layout_for(lattice.plans[name, kind], trial.charges)
+    want = engine.fixed_blocks([np.asarray(A) for A in trial.tensors], layout, xp=np)
+    eager = engine.fixed_blocks(trial.tensors, layout)
+    jitted = jax.jit(lambda tensors: engine.fixed_blocks(tensors, layout))(trial.tensors)
     assert len(want) == len(eager) == len(jitted) == L
     for w, e, j in zip(want, eager, jitted):
-        assert np.array_equal(e, w) and np.array_equal(j, w)
+        assert np.array_equal(np.asarray(e), w) and np.array_equal(np.asarray(j), w)
+
+
+def test_walker_plan_carries_the_engine_settings(lattice, monkeypatch):
+    """make_walker_plan takes sector_buckets and walker_qr from QmcParamsMps (defaults (8, 16), "auto") for every
+    trial, and the plan's engine (engine.kernels_for, cached on the plan) is built with them; the buckets change the
+    padding only, so the overlaps are those of the default plan."""
+    ham = HamHubbard(h1=jnp.asarray(lattice.h1), u=U)
+    sys_ = System(norb=L, nelec=NELEC, walker_kind="unrestricted")
+    for trial in lattice.trials.values():
+        default = make_walker_plan(ham, trial, sys_, QmcParamsMps(seed=0))
+        assert default.sector_buckets == (8, 16) and default.walker_qr == "auto"
+        assert default.nelec == NELEC and default.norb == L
+    trial = lattice.trials["rotated_sd"]
+    params = QmcParamsMps(seed=0, sector_buckets=(2, 4), walker_qr="native", **PLAN_SETTINGS["exact"])
+    plan = make_walker_plan(ham, trial, sys_, params)
+    assert plan.sector_buckets == (2, 4) and plan.walker_qr == "native"
+
+    seen = {}
+    make_converter, make_kernels = engine.make_converter, engine.make_kernels
+
+    def converter_spy(*args, **kwargs):
+        seen["buckets"] = kwargs["buckets"]
+        return make_converter(*args, **kwargs)
+
+    def kernels_spy(*args, **kwargs):
+        seen["walker_qr"] = args[4]
+        return make_kernels(*args, **kwargs)
+
+    monkeypatch.setattr(engine, "make_converter", converter_spy)
+    monkeypatch.setattr(engine, "make_kernels", kernels_spy)
+    kernels = engine.kernels_for(plan, trial.charges, energy=None)
+    assert seen == {"buckets": (2, 4), "walker_qr": "native"}
+    assert engine.kernels_for(plan, trial.charges, energy=None) is kernels
+
+    overlap = make_mps_trial_ops(plan).overlap
+    reference = make_mps_trial_ops(lattice.plans["rotated_sd", "exact"]).overlap
+    walkers = [_jnp_walker(wa, wb) for wa, wb in lattice.walkers]
+    want = np.array([float(reference(w, trial)) for w in walkers])
+    _assert_close(np.array([float(overlap(w, trial)) for w in walkers]), want, 1e-11)
 
 
 # ---------------------------------------------------------------------------------------------
-# 10-12: validation, duck typing and the compress copy
+# 13-15: validation, duck typing and the per-sector compression
 # ---------------------------------------------------------------------------------------------
 
 
 def test_validation_errors(chain, lattice):
-    """Bad shapes, nelec mismatch, positional nelec, complex data and wrong trials all raise."""
+    """Bad shapes and sectors, nelec mismatch, positional nelec, complex data, zero norm, bad rdm1, wrong trials
+    and complex walkers all raise."""
     rng = np.random.default_rng(10)
     bad_shapes = {
         "4, D_right": [(1, 3, 2), (2, 3, 1)],  # physical dimension 3
@@ -462,8 +592,11 @@ def test_validation_errors(chain, lattice):
     gmps = sd_to_gmps(Ca, Cb, mode="maximal")
     tensors = [np.asarray(t) for t in gmps.tensors]
     trial = make_mps_trial(tensors, gmps.charges, nelec=NELEC)
+    rdm1 = np.asarray(trial.rdm1)
     with pytest.raises(ValueError, match="trial has nelec"):
         as_mps_trial(trial, nelec=(2, 2))
+    with pytest.raises(ValueError, match="is not a sector"):
+        make_mps_trial(tensors, nelec=(L + 1, 0))
     with pytest.raises(TypeError, match="keyword-only argument: 'nelec'"):
         make_mps_trial(tensors, NELEC)  # pyright: ignore[reportCallIssue]  # nelec is keyword-only
     with pytest.raises(TypeError, match="nelec by keyword"):
@@ -471,24 +604,32 @@ def test_validation_errors(chain, lattice):
     with pytest.raises(TypeError, match="complex tensors"):
         make_mps_trial([t.astype(complex) for t in tensors], nelec=NELEC)
     with pytest.raises(TypeError, match="rdm1 must be real"):
-        make_mps_trial(
-            tensors, gmps.charges, nelec=NELEC, rdm1=np.asarray(trial.rdm1).astype(complex)
-        )
+        make_mps_trial(tensors, gmps.charges, nelec=NELEC, rdm1=rdm1.astype(complex))
+    with pytest.raises(ValueError, match="rdm1 must have shape"):
+        make_mps_trial(tensors, gmps.charges, nelec=NELEC, rdm1=rdm1[0])
+    with pytest.raises(ValueError, match="zero norm"):
+        make_mps_trial([np.zeros_like(t) for t in tensors], nelec=NELEC, rdm1=rdm1)
 
+    ham = HamHubbard(h1=jnp.asarray(lattice.h1), u=U)
+    sys_ = System(norb=L, nelec=NELEC, walker_kind="unrestricted")
     plan = lattice.plans["sd", "exact"]
     overlap = make_mps_trial_ops(plan).overlap
     walker = _jnp_walker(*lattice.walkers[0])
     complex_walker = (walker[0].astype(jnp.complex128), walker[1])
     with pytest.raises(TypeError, match="real floating-point"):
-        convert_walker(complex_walker, plan)
+        mps_overlap(complex_walker, lattice.trials["sd"], plan)
     with pytest.raises(TypeError, match="real floating-point"):
         overlap(complex_walker, lattice.trials["sd"])
     other = mps_trial_from_sd(*hf.staggered_determinant(lattice.h1, 3, 3))
     with pytest.raises(ValueError, match="does not match the walker plan"):
         overlap(walker, other)
+    with pytest.raises(ValueError, match="does not match the system"):
+        make_walker_plan(ham, other, sys_, QmcParamsMps(seed=0))
     ghf = GhfTrial(mo_coeff=jnp.asarray(scipy.linalg.block_diag(*lattice.sd)))
     with pytest.raises(TypeError, match="must be an MpsTrial"):
         mps_overlap(walker, ghf, plan)  # pyright: ignore[reportArgumentType]
+    with pytest.raises(TypeError, match="must be an MpsTrial"):
+        make_walker_plan(ham, ghf, sys_, QmcParamsMps(seed=0))  # pyright: ignore[reportArgumentType]
 
 
 def test_as_mps_trial_accepts_gmps_from_a_second_module_copy(chain):
@@ -509,25 +650,27 @@ def test_as_mps_trial_accepts_gmps_from_a_second_module_copy(chain):
     assert all(np.array_equal(a, b) for a, b in zip(got.tensors, want.tensors))
 
 
-def test_compress_mps_qn_is_bitwise_the_gpu_module_copy(lattice):
-    """trot.trial.mps.compress_mps_qn is bitwise trot.gmps.mps_cpmc_gpu.compress_mps_qn."""
-    gpu = pytest.importorskip("trot.gmps.mps_cpmc_gpu")
-    trial = lattice.trials["rotated_sd"]
+@pytest.mark.parametrize("name", ["projected_sd", "rotated_sd"])
+def test_compress_mps_qn_keeps_the_state_and_the_labels(lattice, name):
+    """compress_mps_qn factors each charge sector on its own: H|trial> (trial_times_h, (N_up, N_dn) or N labels)
+    and a generic MPS with the same labels and sparsity come back as the same state by enumeration, with labels
+    the tensors respect and smaller bonds."""
+    trial = lattice.trials[name]
     W = hubbard_mpo_from_h1(lattice.h1, U)
-    tensors, charges = trial_times_h(W, trial.tensors, trial.charge_arrays())
+    tensors, charges = trial_times_h(W, [np.asarray(A) for A in trial.tensors], trial.charge_arrays())
     rng = np.random.default_rng(12)
-    # same labels and sparsity, generic singular values
     scrambled = [np.where(A != 0, rng.standard_normal(A.shape), 0.0) for A in tensors]
     for inputs in (tensors, scrambled):
-        ours, our_charges = compress_mps_qn(inputs, charges)
-        theirs, their_charges = gpu.compress_mps_qn(inputs, charges)
-        assert len(ours) == len(theirs) == L and len(our_charges) == len(their_charges) == L + 1
-        assert all(np.array_equal(a, b) for a, b in zip(ours, theirs))
-        assert all(np.array_equal(a, b) for a, b in zip(our_charges, their_charges))
+        out, out_charges = compress_mps_qn(inputs, charges)
+        assert len(out) == L and len(out_charges) == L + 1
+        assert np.shape(out_charges[0])[1] == trial.label_width
+        _assert_close(hf.mps_full_vector(out), hf.mps_full_vector(inputs), 1e-11)
+        _assert_labels_respected(out, out_charges, NELEC)
+        assert sum(map(len, out_charges)) < sum(map(len, charges))
 
 
 # ---------------------------------------------------------------------------------------------
-# 13-14: pyblock3 optional / pyblock3 DMRG trials
+# 16-17: pyblock3 optional / pyblock3 DMRG trials
 # ---------------------------------------------------------------------------------------------
 
 
@@ -558,17 +701,22 @@ PYBLOCK3_FREE_SCRIPT = textwrap.dedent("""
     import numpy as np
 
     import trot.gmps.driver
+    import trot.gmps.engine
+    import trot.gmps.trials
     import trot.gmps.utils
     import trot.ham.hubbard
     import trot.meas.mps
     import trot.prop.mps_cpmc
     import trot.trial.mps
+    import trot.trial.mps_rotation
 
     rng = np.random.default_rng(0)
     Ca = np.linalg.qr(rng.standard_normal((3, 2)))[0]
     Cb = np.linalg.qr(rng.standard_normal((3, 1)))[0]
     trial = trot.trial.mps.mps_trial_from_sd(Ca, Cb)
-    assert trial.nelec == (2, 1), trial.nelec
+    assert trial.nelec == (2, 1) and trial.label_width == 2, trial.nelec
+    rotated = trot.trial.mps_rotation.rotate_mps_trial(trial, trot.trial.mps.spin_rotation_y(90.0))
+    assert rotated.label_width == 2 and 0.0 < rotated.sector_weight <= 1.0, rotated.sector_weight
     loaded = [m for m in sys.modules if m == "pyblock3" or m.startswith("pyblock3.")]
     assert "pyblock3" not in sys.modules and not loaded, loaded
     print("PYBLOCK3_FREE_OK")
@@ -576,7 +724,7 @@ PYBLOCK3_FREE_SCRIPT = textwrap.dedent("""
 
 
 def test_mps_stack_imports_and_builds_trials_without_pyblock3():
-    """With pyblock3 unimportable the MPS-CPMC modules import and mps_trial_from_sd works."""
+    """With pyblock3 unimportable the MPS-CPMC modules import and SD trials are built and rotated."""
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(REPO), env.get("PYTHONPATH")]))
     env.setdefault("JAX_PLATFORMS", "cpu")
@@ -596,9 +744,10 @@ def test_dmrg_trial_densifies_identically_and_is_exact(lattice, dmrg_2x3):
     """All pyblock3 paths give one trial; chi=64 DMRG on 6 sites is the ED state (E, rdm1)."""
     dense = gmps_utils.densify(dmrg_2x3.mps)
     want = make_mps_trial(dense.tensors, dense.charges, nelec=NELEC)
+    assert want.label_width == 2 and want.sector_weight == 1.0
     for trial in (mps_trial_from_pyblock3(dmrg_2x3.mps), dmrg_2x3.trial):
         assert trial.charges == want.charges and trial.sector_weight == want.sector_weight
-        assert len(trial.tensors) == L
+        assert trial.nelec == NELEC and len(trial.tensors) == L
         assert all(np.array_equal(a, b) for a, b in zip(trial.tensors, want.tensors))
         assert np.array_equal(trial.rdm1, want.rdm1)
     assert abs(dmrg_2x3.variational_energy - lattice.E0) < 1e-9

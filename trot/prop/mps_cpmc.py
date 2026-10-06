@@ -1,268 +1,185 @@
 """CPMC propagation for MPS trials (trot.trial.mps) with locally cached HS updates.
 
-One step: a one-body half step, a diagonal HS sweep over the sites, a second one-body half step,
-and population control, exactly as trot's CPMC. The sweep converts each walker once and caches
-left/right environments, so both field proposals at every site cost one environment contraction.
+One step: a one-body half step, a diagonal HS sweep over the sites, a second one-body half step, and population
+control, exactly as trot's CPMC. The sweep converts each walker once and caches its right environments, so both
+field proposals at every site cost one environment contraction (trot.gmps.engine.field_sweep, batched over walkers).
 
-Semantics: the overlap after each site is the recomputed overlap of the chosen proposal
-(fresh-overlap semantics, as in trot.prop.cpmc_slow), and ratios at or below weight_floor are
-zeroed as in trot.prop.cpmc. trot.prop.cpmc instead accumulates overlaps *= floored ratio, so
-when *both* proposals at a site are floored it stores a zero overlap and kills the walker, while
-this step (and cpmc_slow) keeps it with weight times 1e-13. The trajectories are identical
-whenever that event does not occur.
+Semantics: the overlap after each site is the recomputed overlap of the chosen proposal (fresh-overlap semantics,
+as in trot.prop.cpmc_slow), and ratios at or below weight_floor are zeroed as in trot.prop.cpmc. trot.prop.cpmc
+instead accumulates overlaps *= floored ratio, so when *both* proposals at a site are floored it stores a zero
+overlap and kills the walker, while this step (and cpmc_slow) keeps it with weight times 1e-13. The trajectories
+are identical whenever that event does not occur.
 
-make_prop_ops(ham_data, sys, plan) is the trot-native factory: the trial comes from trial_data,
-and the padded trial blocks from meas_ctx (built by the MPS meas_ops). make_fast_prop_ops and
-make_fast_sweep are the legacy closure-based API of trot/gmps/mps_cpmc_new.py; they ignore
-trial_data and run the same cores.
+make_prop_ops(ham_data, sys, plan) is the factory, as trot.prop.cpmc.make_prop_ops: prop_ctx is trot's
+HubbardCpmcCtx (exp(-dt K/2) and the HS factors) and the trial blocks come from meas_ctx (trot.meas.mps), which
+also names the plan's engine. block is the MPS measurement block for trot.driver.run_qmc: trot.prop.blocks.block
+with 2 n + 1 walker conversions per block of n steps (blocks.block, which also works, needs 2 n + 4).
 """
 
 from __future__ import annotations
 
 from functools import partial
+from typing import Callable
 
 import jax
+import jax.experimental
 import jax.numpy as jnp
 import numpy as np
+from jax import lax
 
 from trot import walkers as wk
-from trot.meas.mps import check_meas_ctx
-from trot.prop.cpmc import init_prop_state
-from trot.prop.cpmc_slow import cpmc_step as cpmc_slow_step
-from trot.prop.hubbard_cpmc_ops import _build_prop_ctx, make_hubbard_cpmc_ops
+from trot.gmps import engine
+from trot.meas.mps import MpsMeasCtx, check_meas_ctx
+from trot.prop.blocks import BlockObs
+from trot.prop.hubbard_cpmc_ops import _build_prop_ctx
 from trot.prop.types import PropOps, PropState
-from trot.trial.mps import (
-    MpsWalkerPlan,
-    contraction_layout,
-    convert_walker,
-    extract_channel_blocks,
-    overlap_from_blocks,
-    rhf_orbitals,
-)
+from trot.sharding import shard_prop_state
+from trot.trial.mps import MpsWalkerPlan, rhf_orbitals
+from trot.walkers import init_walkers
 
 
-def right_environments(walker_blocks, trial_blocks, plan):
-    right = [jnp.ones((1, plan["walker_pad"][-1], plan["trial_pad"][-1]))]
-    for site in range(plan["n"] - 1, -1, -1):
-        layout = plan["sites"][site]
-        wb, tb = walker_blocks[site], trial_blocks[site]
-        following = right[-1][layout["dst"]]
-        temp = jnp.einsum("tij,tjk->tik", wb, following)
-        contributions = jnp.einsum("tik,tlk->til", temp, tb)
-        right.append(
-            jax.ops.segment_sum(
-                contributions, layout["src"], num_segments=len(plan["shared"][site])
-            )
-        )
-    return tuple(reversed(right))
+def _start_values(meas_ctx: MpsMeasCtx):
+    """Jitted overlaps and local energies of a batch of given starting walkers (cached on the plan)."""
+    key = ("start_values",) + tuple(meas_ctx.key[1:4])
+    fn = meas_ctx.plan.caches.get(key)
+    if fn is None:
+        kernels = meas_ctx.kernels
+
+        @partial(jax.jit, static_argnames=("n_chunks",))
+        def fn(ca, cb, data, n_chunks):
+            overlaps = engine.chunked(lambda a, b: kernels.overlaps(a, b, data), n_chunks, ca, cb)
+            energies = engine.chunked(lambda a, b: kernels.energies(a, b, data), n_chunks, ca, cb)
+            return overlaps, energies
+
+        meas_ctx.plan.caches[key] = fn
+    return fn
 
 
-def constrain_ratio(ratio, weight_floor):
-    """trot's cpmc_step rule: zero every overlap ratio at or below the floor.
+def init_prop_state(*, sys, ham_data, trial_ops, trial_data, meas_ops, params, meas_ctx=None, initial_walkers=None,
+                    initial_e_estimate=None, rdm1=None, mesh=None) -> PropState:
+    """trot.prop.cpmc.init_prop_state for MPS trials.
 
-    This is also the constrained-path condition (a sign change gives ratio <= 0),
-    so it cannot be dropped; weight_floor=0 keeps only the constraint.
+    Walkers start from the natural orbitals of trial_ops.get_rdm1(trial_data), or of the free-fermion determinant
+    of ham_data.h1 when params.walker_start == "rhf" (unless rdm1 or initial_walkers are given). init_walkers
+    repeats one determinant, so it is converted once (the engine's jitted probe) and its overlap and local energy
+    are broadcast: a batched program over the walkers costs as much compile time as the block itself (~10 min at
+    L=100). Given initial_walkers are converted as a batch. The scalar leaves have strong dtypes, so the jitted
+    block compiles once.
     """
-    return jnp.where(ratio <= weight_floor, 0.0, ratio)
+    start = getattr(params, "walker_start", "natural")
+    if start not in ("natural", "rhf"):
+        raise ValueError(f"walker_start must be 'natural' or 'rhf', got {start!r}")
+    if meas_ctx is None:
+        meas_ctx = meas_ops.build_meas_ctx(ham_data, trial_data)
+    given = initial_walkers is not None
+    if not given:
+        if rdm1 is None and start == "rhf":
+            Ra, Rb = rhf_orbitals(ham_data, sys.nelec)
+            rdm1 = jnp.asarray(np.stack([Ra @ Ra.T, Rb @ Rb.T]))
+        if rdm1 is None:
+            rdm1 = trial_ops.get_rdm1(trial_data)
+        initial_walkers = init_walkers(sys=sys, rdm1=rdm1, n_walkers=params.n_walkers)
+    ca, cb = (jnp.real(w) for w in initial_walkers)
+    n = ca.shape[0]
+    data = meas_ctx.data()
+    if given:
+        overlaps, energies = _start_values(meas_ctx)(ca, cb, data, engine.divisor_at_least(n, params.n_chunks))
+    else:
+        values = meas_ctx.kernels.jit_probe(ca[0], cb[0], data)
+        overlaps = jnp.full((n,), values["overlap"], dtype=jnp.result_type(float))
+        energies = values["energy"]
+    e_est = jnp.mean(energies) if initial_e_estimate is None else jnp.asarray(initial_e_estimate)
+    e_est = e_est.astype(jnp.result_type(float))
+    state = PropState((ca, cb), jnp.ones((n,)), overlaps, jax.random.PRNGKey(int(params.seed)), e_est, e_est,
+                      jnp.zeros((), jnp.int64))
+    return shard_prop_state(state, mesh)
 
 
-def fast_sweep(
-    ca, cb, randoms, hs, weight_floor, *, convert, channel_maps, trial_blocks, contraction
-):
-    """One-conversion diagonal HS sweep of one walker against fixed trial blocks.
-
-    Returns (ca, cb, overlap_in, overlap_out, weight_factor, node_count).
-    """
-    alpha, beta, prefactor = convert(ca, cb)
-    walker_blocks = extract_channel_blocks(alpha, beta, channel_maps)
-    right = right_environments(walker_blocks, trial_blocks, contraction)
-    overlap_in = prefactor * right[0][0, 0, 0]
-
-    left = jnp.ones((1, contraction["walker_pad"][0], contraction["trial_pad"][0]))
-    overlap, log_weight = overlap_in, jnp.zeros(())
-    nodes = jnp.zeros((), jnp.int64)
-    diagonal = jnp.stack((jnp.ones(2), hs[:, 0], hs[:, 1], hs[:, 0] * hs[:, 1]), axis=1)
-
-    for site, (wb, tb, layout) in enumerate(zip(walker_blocks, trial_blocks, contraction["sites"])):
-        temp = jnp.einsum("tij,tik->tjk", wb, left[layout["src"]])
-        local = jnp.einsum("tjk,tkl->tjl", temp, tb)
-        by_transition = jnp.einsum("tjl,tjl->t", local, right[site + 1][layout["dst"]])
-        marginal = jax.ops.segment_sum(by_transition, layout["physical"], num_segments=4)
-
-        proposed = prefactor * (diagonal @ marginal)
-        ratios = constrain_ratio(proposed / overlap, weight_floor)
-        nodes += jnp.sum(ratios <= 0.0, dtype=jnp.int64)
-        probabilities = 0.5 * ratios
-        norm = probabilities.sum() + 1.0e-13
-        field = jnp.where(randoms[site] < probabilities[0] / norm, 0, 1)
-        chosen_diagonal = diagonal[field]
-        overlap = proposed[field]
-        log_weight += jnp.log(norm)
-
-        ca = ca.at[site].multiply(hs[field, 0])
-        cb = cb.at[site].multiply(hs[field, 1])
-        left = jax.ops.segment_sum(
-            chosen_diagonal[layout["physical"]][:, None, None] * local,
-            layout["dst"],
-            num_segments=layout["n_out"],
-        )
-    return ca, cb, overlap_in, overlap, jnp.exp(log_weight), nodes
-
-
-def make_fast_sweep(convert_channels, channel_maps, trial_blocks, plan):
-    """Build the one-conversion HS sweep for a fixed trial and static layouts (legacy API).
-
-    The result is called as sweep(ca, cb, randoms, hs, weight_floor).
-    """
-    return partial(
-        fast_sweep,
-        convert=convert_channels,
-        channel_maps=channel_maps,
-        trial_blocks=trial_blocks,
-        contraction=plan,
-    )
-
-
-def mps_cpmc_step(state, *, params, prop_ctx, cpmc_ops, sweep_fn, overlap_fn, overlap_arg):
-    """One CPMC step. sweep_fn(ca, cb, randoms, hs, floor) per walker; overlap_fn(walker, overlap_arg)."""
-    key, subkey = jax.random.split(state.rng_key)
-    nwalkers = wk.n_walkers(state.walkers)
-    randoms = jax.random.uniform(subkey, (nwalkers, cpmc_ops.n_sites()))
-    floor, cap = float(params.weight_floor), float(params.weight_cap)
-
-    walkers = cpmc_ops.apply_one_body_half(state.walkers, prop_ctx)
-    sweep_many = wk.vmap_chunked(sweep_fn, params.n_chunks, in_axes=(0, 0, 0, None, None))
-    ca, cb, overlap_half, overlaps, weight_factor, node_step = sweep_many(
-        walkers[0], walkers[1], randoms, prop_ctx.hs_constant, floor
-    )
-
-    ratio = constrain_ratio(jnp.real(overlap_half / state.overlaps), floor)
-    nodes = jnp.sum(ratio <= 0.0, dtype=jnp.int64) + jnp.sum(node_step, dtype=jnp.int64)
-    weights = state.weights * ratio
-    weights = jnp.where(weights > cap, 0.0, weights) * weight_factor
-    walkers = (ca, cb)
-
-    walkers = cpmc_ops.apply_one_body_half(walkers, prop_ctx)
-    overlap_many = wk.vmap_chunked(overlap_fn, params.n_chunks, in_axes=(0, None))
-    overlaps_new = jnp.real(overlap_many(walkers, overlap_arg))
-    ratio = constrain_ratio(jnp.real(overlaps_new / overlaps), floor)
-    nodes += jnp.sum(ratio <= 0.0, dtype=jnp.int64)
-    weights *= ratio
-    weights = jnp.where(weights > cap, 0.0, weights)
-
-    weights *= jnp.exp(prop_ctx.dt * state.pop_control_ene_shift)
-    weights = jnp.where(weights > cap, 0.0, weights)
-    average = jnp.clip(jnp.mean(weights), min=1.0e-300)
-    shift = state.e_estimate - params.pop_control_damping * jnp.log(average) / prop_ctx.dt
-    return PropState(
-        walkers, weights, overlaps_new, key, shift, state.e_estimate, state.node_encounters + nodes
-    )
-
-
-def init_prop_state_typed(**kwargs):
-    state = init_prop_state(**kwargs)
-    return state._replace(node_encounters=jnp.zeros((), dtype=jnp.int64))
-
-
-def make_fast_prop_ops(ham_data, walker_kind, overlap_fn, sweep_fn):
-    """Legacy PropOps around closures that hold the trial (trial_data is ignored)."""
-    cpmc_ops = make_hubbard_cpmc_ops(ham_data, walker_kind)
-
-    def step(state, *, params, ham_data, trial_data, trial_ops, meas_ops, meas_ctx, prop_ctx):
-        return mps_cpmc_step(
-            state,
-            params=params,
-            prop_ctx=prop_ctx,
-            cpmc_ops=cpmc_ops,
-            sweep_fn=sweep_fn,
-            overlap_fn=overlap_fn,
-            overlap_arg=trial_data,
-        )
-
-    return PropOps(
-        init_prop_state=init_prop_state_typed,
-        build_prop_ctx=lambda h, _trial, p: _build_prop_ctx(h, p.dt),
-        step=step,
-    )
-
-
-def _convert_for_sweep(ca, cb, plan):
-    alpha, _, beta, _, prefactor = convert_walker((ca, cb), plan)
-    return alpha, beta, prefactor
-
-
-def make_prop_ops(ham_data, sys, plan: MpsWalkerPlan, *, propagator: str = "fast") -> PropOps:
-    """PropOps for MPS-CPMC with trial_data = MpsTrial and meas_ctx = MpsMeasCtx.
-
-    propagator="fast": the cached-environment sweep of this module (one walker conversion
-    per sweep). propagator="slow": trot.prop.cpmc_slow's step unchanged, which converts the
-    walker for every field proposal through meas_ops.overlap. The two agree for exact
-    conversions whenever the weight floor never acts (always at weight_floor=0); cpmc_slow
-    floors half the ratio, and re-truncates truncated walkers after every field.
-
-    init_prop_state starts the walkers as trot does, from the natural orbitals of
-    trial_ops.get_rdm1(trial_data), or from the free-fermion determinant of ham_data.h1 when
-    params.walker_start == "rhf" (unless rdm1 or initial_walkers are given). The scalar state
-    leaves are pinned to strong dtypes, so the jitted block compiles once.
-    """
+def make_prop_ops(ham_data, sys, plan: MpsWalkerPlan) -> PropOps:
+    """PropOps for MPS-CPMC with trial_data = MpsTrial and meas_ctx = MpsMeasCtx (make_mps_meas_ops_hubbard on the
+    same plan). step is two half steps of the plan's engine over the whole walker batch (params.n_chunks chunks)."""
     if sys.walker_kind.lower() != "unrestricted":
         raise ValueError("MPS-CPMC needs walker_kind='unrestricted'")
-    if propagator not in ("fast", "slow"):
-        raise ValueError(f"propagator must be 'fast' or 'slow', got {propagator!r}")
-    cpmc_ops = make_hubbard_cpmc_ops(ham_data, sys.walker_kind)
-    nelec = (int(sys.nelec[0]), int(sys.nelec[1]))
-
-    def init_prop_state_mps(**kwargs):
-        params = kwargs["params"]
-        start = getattr(params, "walker_start", "natural")
-        if start not in ("natural", "rhf"):
-            raise ValueError(f"walker_start must be 'natural' or 'rhf', got {start!r}")
-        if start == "rhf" and kwargs.get("rdm1") is None and kwargs.get("initial_walkers") is None:
-            Ra, Rb = rhf_orbitals(kwargs["ham_data"], nelec)
-            kwargs["rdm1"] = jnp.asarray(np.stack([Ra @ Ra.T, Rb @ Rb.T]))
-        state = init_prop_state(**kwargs)
-        return state._replace(
-            node_encounters=state.node_encounters.astype(jnp.int64),
-            e_estimate=state.e_estimate.astype(jnp.result_type(float)),
-            pop_control_ene_shift=state.pop_control_ene_shift.astype(jnp.result_type(float)),
-        )
 
     def build_prop_ctx(ham, _rdm1, params):
         return _build_prop_ctx(ham, params.dt)
 
     def step(state, *, params, ham_data, trial_data, trial_ops, meas_ops, meas_ctx, prop_ctx):
         check_meas_ctx(meas_ctx, plan, trial_data)
-        layout = contraction_layout(plan, meas_ctx.trial_charges)
-        sweep = partial(
-            fast_sweep,
-            convert=partial(_convert_for_sweep, plan=plan),
-            channel_maps=layout.channel_maps,
-            trial_blocks=meas_ctx.trial_blocks,
-            contraction=layout.contraction,
-        )
-        return mps_cpmc_step(
-            state,
-            params=params,
-            prop_ctx=prop_ctx,
-            cpmc_ops=cpmc_ops,
-            sweep_fn=sweep,
-            overlap_fn=partial(overlap_from_blocks, layout=layout, plan=plan),
-            overlap_arg=meas_ctx.trial_blocks,
-        )
+        n_chunks = engine.divisor_at_least(wk.n_walkers(state.walkers), params.n_chunks)
+        half = engine.make_half_step(meas_ctx.kernels, params, n_chunks)
+        data = meas_ctx.data(prop_ctx)
+        return half(half(state, 0, data), 1, data)
 
-    def slow_step(state, *, params, ham_data, trial_data, trial_ops, meas_ops, meas_ctx, prop_ctx):
-        check_meas_ctx(meas_ctx, plan, trial_data)
-        return cpmc_slow_step(
-            state,
-            params=params,
-            trial_data=trial_data,
-            meas_ops=meas_ops,
-            cpmc_ops=cpmc_ops,
-            prop_ctx=prop_ctx,
-        )
+    return PropOps(init_prop_state=init_prop_state, build_prop_ctx=build_prop_ctx, step=step)
 
-    return PropOps(
-        init_prop_state=init_prop_state_mps,
-        build_prop_ctx=build_prop_ctx,
-        step=step if propagator == "fast" else slow_step,
-    )
+
+# ---------------------------------------------------------------------------------------------
+# The MPS measurement block
+# ---------------------------------------------------------------------------------------------
+
+
+def make_block(record: Callable | None = None):
+    """trot.prop.blocks.block for MPS trials, with 2 n + 1 walker conversions per block of n steps.
+
+    The n steps are a scan over 2 n half steps with one conversion call site (engine.make_half_step). The walkers are
+    then orthonormalised (the engine's batch_qr) and their overlaps rescaled by det R instead of reconverted; the
+    energy is one more conversion; after the comb the overlaps are gathered. Outlier clipping, the e_estimate EMA,
+    the comb and the RNG use are those of blocks.block, so both blocks agree to rounding (the conversion QRs its
+    input, so the rescaled and gathered overlaps equal reconverted ones).
+
+    record: optional host callable(up, dn, pre_comb_weights, comb_index, energy, weight, e_estimate, node_encounters)
+      called after every block with the new walkers and the comb's input (trot.gmps.driver.WalkerSnapshots).
+    """
+    record_spec = jax.ShapeDtypeStruct((), jnp.int32)
+
+    def mps_block(state: PropState, *, sys, params, ham_data, trial_data, trial_ops, meas_ops, meas_ctx, prop_ops,
+                  prop_ctx, sr_fn=wk.stochastic_reconfiguration, observable_names=()):
+        if observable_names:
+            raise ValueError("the MPS block measures the energy only (observable_names must be empty)")
+        if not isinstance(meas_ctx, MpsMeasCtx):
+            raise ValueError("the MPS block needs meas_ctx = meas_ops.build_meas_ctx(ham_data, trial_data)")
+        kernels, data = meas_ctx.kernels, meas_ctx.data(prop_ctx)
+        n = wk.n_walkers(state.walkers)
+        n_chunks = engine.divisor_at_least(n, params.n_chunks)
+        half_step = engine.make_half_step(kernels, params, n_chunks)
+        state, _ = lax.scan(lambda s, i: (half_step(s, i, data), None), state, jnp.arange(2 * params.n_prop_steps))
+        qu, du = kernels.batch_qr(state.walkers[0])
+        qd, dd = kernels.batch_qr(state.walkers[1])
+        overlaps = state.overlaps / (du * dd)
+
+        e_samples = engine.chunked(lambda a, b: kernels.energies(a, b, data), n_chunks, qu, qd)
+        thresh = jnp.sqrt(2.0 / jnp.asarray(params.dt))
+        e_ref = state.e_estimate
+        is_nan = ~jnp.isfinite(e_samples)
+        e_samples = jnp.where(is_nan | (jnp.abs(e_samples - e_ref) > thresh), e_ref, e_samples)
+        weights = jnp.where(is_nan, 0.0, state.weights)
+        w_sum = jnp.sum(weights)
+        w_sum_safe = jnp.where(w_sum == 0, 1.0, w_sum)
+        e_block = jnp.sum(weights * e_samples) / w_sum_safe
+        e_block = jnp.where(w_sum == 0, e_ref, e_block)
+        alpha = jnp.asarray(params.shift_ema, dtype=jnp.result_type(e_block))
+        e_estimate = (1.0 - alpha) * state.e_estimate + alpha * e_block
+
+        key, subkey = jax.random.split(state.rng_key)
+        zeta = jax.random.uniform(subkey)
+        if sr_fn is wk.stochastic_reconfiguration:
+            idx = wk._sr_indices(weights, zeta, n)
+            average = jnp.cumsum(jnp.abs(weights))[-1] / n
+            walkers, new_overlaps = (qu[idx], qd[idx]), overlaps[idx]
+            new_weights = jnp.full((n,), average, weights.dtype)
+        else:  # a sharded comb (trot.driver with a mesh): no indices, so reconvert for the overlaps
+            idx = jnp.full((n,), -1, jnp.int32)
+            walkers, new_weights = sr_fn((qu, qd), weights, zeta, sys.walker_kind)
+            new_overlaps = engine.chunked(lambda a, b: kernels.overlaps(a, b, data), n_chunks, *walkers)
+        state = PropState(walkers, new_weights, new_overlaps, key, state.pop_control_ene_shift, e_estimate,
+                          state.node_encounters)
+        if record is not None:
+            jax.experimental.io_callback(record, record_spec, walkers[0], walkers[1], weights, idx.astype(jnp.int32),
+                                         e_block, w_sum, e_estimate, state.node_encounters, ordered=True)
+        return state, BlockObs(scalars={"energy": e_block, "weight": w_sum}, observables={})
+
+    return mps_block
+
+
+block = make_block()

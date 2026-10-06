@@ -2,7 +2,7 @@
 
 Every trial (pyblock3 DMRG at the given bond dimensions; with --uhf also the pyscf UHF determinant) runs
 twice with the same seed: as it is ("plain") and rotated by R_y(pi/2), i.e. projected onto the walkers'
-S_z = 0 sector after the rotation ("rotated", make_mps_trial(rotate_spin(T, R))). The rotation removes
+S_z = 0 sector after the rotation ("rotated", rotate_mps_trial(T, R)). The rotation removes
 every odd-S component of an S_z = 0 trial and scales S = 2 by 1/2, S = 4 by 3/8 (Legendre P_S(0)).
 The reference energy is DMRG at --chi-ref (exact for these sizes).
 
@@ -178,14 +178,15 @@ def trials(ham, sys_, chis, with_uhf, rotated_start="plain"):
     of the rotated (unprojected) trial. That one is fully degenerate for a rotated Neel product state
     (1/2 on every site), and its arbitrary natural orbitals can give a start with zero overlap.
     """
-    from trot.trial.mps import make_mps_trial, mps_trial_from_sd, rotate_spin
+    from trot.trial.mps import mps_trial_from_sd
+    from trot.trial.mps_rotation import rotate_mps_trial
 
     nelec = tuple(int(n) for n in sys_.nelec)
     if rotated_start not in ("plain", "rotated"):
         raise ValueError(f"rotated_start must be 'plain' or 'rotated', got {rotated_start!r}")
 
     def start(t):
-        return t.rdm1 if rotated_start == "plain" else None  # None: make_mps_trial's default
+        return t.rdm1 if rotated_start == "plain" else None  # None: the rotated trial's rdm1, before projection
 
     out = []
     if with_uhf:
@@ -201,7 +202,7 @@ def trials(ham, sys_, chis, with_uhf, rotated_start="plain"):
         name = f"DMRG chi={chi}" + (f" seed={seed}" if seed else "")
         out.append((name, dmrg(ham, sys_, int(chi), seed=int(seed or 0)).trial))
     return [
-        (name, t, make_mps_trial(rotate_spin(t.tensors, R90), nelec=nelec, rdm1=start(t)))
+        (name, t, rotate_mps_trial(t, R90, nelec=nelec, rdm1=start(t)))
         for name, t in out
     ]
 
@@ -289,13 +290,12 @@ def run(ham, sys_, trial, args, tag, blocks_path):
         seed=args.seed,
         orbital_plan="maximal" if args.walker_chi is None else "adaptive",
         walker_channel_chi=args.walker_chi,
-        propagator=getattr(args, "propagator", "fast"),
     )
     # the ops of trot.gmps.driver.make_mps_cpmc_ops, built here so the study does not import the driver
     plan = make_walker_plan(ham, trial, sys_, params)
     trial_ops = make_mps_trial_ops(plan)
     meas_ops = make_mps_meas_ops_hubbard(plan, energy_kernel=params.energy_kernel)
-    prop_ops = make_prop_ops(ham, sys_, plan, propagator=params.propagator)
+    prop_ops = make_prop_ops(ham, sys_, plan)
     energy_clip, weight_cap = getattr(args, "energy_clip", None), getattr(args, "weight_cap", None)
     block_fn = make_block_fn(energy_clip, weight_cap)
     start = time.perf_counter()
@@ -326,7 +326,6 @@ def run(ham, sys_, trial, args, tag, blocks_path):
         weight_floor=args.floor,
         walker_chi=args.walker_chi,
         seed=args.seed,
-        propagator=getattr(args, "propagator", "fast"),
         energy_clip="default" if energy_clip is None else energy_clip,
         weight_cap="default" if weight_cap is None else weight_cap,
     )
@@ -463,7 +462,8 @@ def plot(path, show=False):
 
 def self_test():
     """p_S on states with known spin, the 90-degree weight against the projection, and a 2-block run."""
-    from trot.trial.mps import make_mps_trial, mps_trial_from_sd, rotate_spin
+    from trot.trial.mps import mps_trial_from_sd
+    from trot.trial.mps_rotation import rotate_mps_trial
 
     h1, ham, sys_ = hubbard_chain(6, 4.0)
     p = spin_distribution(dmrg(ham, sys_, 64).trial.tensors)  # exact ground state: a singlet
@@ -474,7 +474,7 @@ def self_test():
     d = diagnostics(uhf.tensors, h1, 12.0, 0.0)
     assert abs(d["s_s1"] - mf.spin_square()[0]) < 1e-8, (d["s_s1"], mf.spin_square()[0])
     assert abs(d["e_var"] - mf.e_tot) < 1e-10, (d["e_var"], mf.e_tot)
-    rotated = make_mps_trial(rotate_spin(uhf.tensors, R90), nelec=(4, 4))
+    rotated = rotate_mps_trial(uhf, R90)
     assert abs(d["w90"] - rotated.sector_weight) < 1e-10, (d["w90"], rotated.sector_weight)
     p_rot = spin_distribution(rotated.tensors)
     assert np.all(np.abs(p_rot[1::2]) < 1e-8), "the 90-degree rotation must remove every odd S"
@@ -526,7 +526,6 @@ def main():
         help="walker start of the rotated run: the plain trial's (the same walkers in both runs) "
         "or the rotated trial's 1-RDM (trot's GHF convention)",
     )
-    parser.add_argument("--propagator", choices=("fast", "slow"), default="fast")
     parser.add_argument(
         "--energy-clip",
         type=float,

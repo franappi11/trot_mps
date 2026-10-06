@@ -1,27 +1,23 @@
-"""MPS-CPMC through trot's driver.
+"""MPS-CPMC through trot's driver: one code path for CPU and GPU, chain or any lattice.
 
-make_mps_cpmc_ops(ham_data, trial, sys, params) returns the walker plan and the trial, measurement
-and propagation ops for trot.driver.run_qmc; run_qmc_mps(...) does everything in one call and,
-when no trial is given, builds one by pyblock3 DMRG (trot.gmps.dmrg). make_rotated_mps_cpmc_ops
-does the same for a RotatedMpsTrial (trot.trial.mps_rotation), a trial without definite S_z.
-
-params.engine picks the implementation behind the same interface: "reference" (trot.trial.mps,
-trot.meas.mps, trot.prop.mps_cpmc), "batched" (the GPU engine of trot/gmps/gpu.py: batched sector
-factorisations, factorized contractions, device data as jit arguments) or "auto" (batched on a GPU
-backend, reference on CPU). Both give the same trajectories up to rounding.
-
-The second half of this module is the legacy closure-based API of trot/gmps/mps_cpmc_new.py
-(make_walker_ops, make_block_logger, run_qmc_fixed_chunks, save_result), moved here unchanged.
+The trot ops of an MPS trial come from the trot modules, as for any trial: make_walker_plan and make_mps_trial_ops
+(trot.trial.mps), make_mps_meas_ops_hubbard (trot.meas.mps) and make_prop_ops plus the MPS measurement block
+(trot.prop.mps_cpmc), all on the batched engine of the walker plan (trot.gmps.engine). This module puts a run
+together: make_mps_cpmc_ops builds the ops, prepare_mps_cpmc adds the contexts, the walkers' start and the
+diagnostics, run_prepared runs trot.driver.run_qmc on them, and run_qmc_mps does all of it in one call, building a
+DMRG trial (trot.gmps.dmrg) when none is given. make_block_logger and WalkerSnapshots record every block as it
+finishes; save_result writes a run's record. The command-line runner is trot/gmps/run_mps_cpmc.py; the trials,
+their cache and the spin rotation are in trot.gmps.trials.
 """
 
 from __future__ import annotations
 
 import json
-import math
+import shutil
 import time
 import warnings
 from pathlib import Path
-from typing import Callable, NamedTuple
+from typing import Any, NamedTuple
 
 import jax
 import jax.experimental
@@ -29,39 +25,23 @@ import jax.numpy as jnp
 import numpy as np
 
 from trot.core.ops import MeasOps, TrialOps
-from trot.driver import make_run_blocks, run_qmc
-from trot.gmps import gpu
-from trot.gmps.utils import channel_angles, channel_mps, combine_channels, combined_charges
-from trot.gmps.utils import contract_real
+from trot.driver import run_qmc
+from trot.gmps import engine
+from trot.gmps.utils import channel_angles
 from trot.meas.mps import make_mps_meas_ops_hubbard
-from trot.meas.mps_rotated import make_rotated_meas_ops_hubbard
-from trot.prop import blocks
-from trot.prop.mps_cpmc import make_fast_sweep, make_prop_ops
-from trot.prop.mps_cpmc_rotated import make_rotated_prop_ops
-from trot.prop.types import PropOps
-from trot.stat_utils import blocking_analysis_ratio, reject_outliers
+from trot.prop import blocks, mps_cpmc
+from trot.prop.mps_cpmc import make_block as make_mps_block  # noqa: F401  (the MPS measurement block)
+from trot.prop.mps_cpmc import make_prop_ops
+from trot.prop.types import PropOps, PropState
 from trot.trial.mps import (
     MpsTrial,
     MpsWalkerPlan,
     as_mps_trial,
-    blocked_contract_from_blocks,
-    contraction_layout,
-    contraction_report,
-    extract_channel_blocks,
-    extract_fixed_blocks,
-    make_channel_block_maps,
-    make_contraction_plan,
     make_mps_trial_ops,
     make_walker_plan,
     natural_orbitals,
     rhf_orbitals,
 )
-from trot.trial.mps_rotation import (
-    RotatedMpsTrial,
-    make_rotated_trial_ops,
-    make_rotated_walker_plan,
-)
-from trot.walkers import _qr as qr_with_det
 
 
 class MpsCpmcOps(NamedTuple):
@@ -69,47 +49,25 @@ class MpsCpmcOps(NamedTuple):
     trial_ops: TrialOps
     meas_ops: MeasOps
     prop_ops: PropOps
-    engine: gpu.GpuOps | None = None  # the batched engine's ops (engine="batched"), None for the reference
 
 
-def make_mps_cpmc_ops(ham_data, trial_data: MpsTrial, sys, params) -> MpsCpmcOps:
-    """Walker plan and trot ops for trial_data (an MpsTrial) with QmcParamsMps settings (params.engine)."""
+def make_mps_cpmc_ops(ham_data, trial_data: MpsTrial, sys, params, htrial=None) -> MpsCpmcOps:
+    """Walker plan and trot ops for trial_data (an MpsTrial) with QmcParamsMps settings.
+
+    htrial: optional precomputed H|trial> (tensors or block form, labels, trial_energy) for energy_kernel="blocked"
+    (trot.meas.mps.build_mps_meas_ctx).
+    """
     if not isinstance(trial_data, MpsTrial):
         raise TypeError(
             "trial_data must be an MpsTrial; convert pyblock3/dense trials with "
             "trot.trial.mps.as_mps_trial and pass that same object to run_qmc"
         )
     plan = make_walker_plan(ham_data, trial_data, sys, params)
-    if gpu.resolve_engine(params) == "batched":
-        engine, trial_ops, meas_ops, prop_ops = gpu.make_batched_ops(ham_data, trial_data, plan, params)
-        return MpsCpmcOps(plan, trial_ops, meas_ops, prop_ops, engine)
     return MpsCpmcOps(
         plan=plan,
         trial_ops=make_mps_trial_ops(plan),
-        meas_ops=make_mps_meas_ops_hubbard(plan, energy_kernel=params.energy_kernel),
-        prop_ops=make_prop_ops(ham_data, sys, plan, propagator=params.propagator),
-    )
-
-
-def make_rotated_mps_cpmc_ops(ham_data, trial_data: RotatedMpsTrial, sys, params) -> MpsCpmcOps:
-    """Walker plan and trot ops for a RotatedMpsTrial (no S_z projection) with QmcParamsMps.
-
-    params.engine as in make_mps_cpmc_ops. The batched engine blocks every contraction on the
-    trial's particle-number labels (trot.gmps.gpu.trial_labels) and keeps the walker's spin
-    channels apart; the reference engine contracts densely with the d=4 walker and ignores
-    params.energy_kernel. Everything else follows make_mps_cpmc_ops.
-    """
-    if not isinstance(trial_data, RotatedMpsTrial):
-        raise TypeError("trial_data must be a RotatedMpsTrial (see make_rotated_mps_trial)")
-    plan = make_rotated_walker_plan(ham_data, trial_data, sys, params)
-    if gpu.resolve_engine(params) == "batched":
-        engine, trial_ops, meas_ops, prop_ops = gpu.make_batched_ops(ham_data, trial_data, plan, params)
-        return MpsCpmcOps(plan, trial_ops, meas_ops, prop_ops, engine)
-    return MpsCpmcOps(
-        plan=plan,
-        trial_ops=make_rotated_trial_ops(plan),
-        meas_ops=make_rotated_meas_ops_hubbard(plan),
-        prop_ops=make_rotated_prop_ops(ham_data, sys, plan, propagator=params.propagator),
+        meas_ops=make_mps_meas_ops_hubbard(plan, energy_kernel=params.energy_kernel, htrial=htrial),
+        prop_ops=make_prop_ops(ham_data, sys, plan),
     )
 
 
@@ -127,210 +85,82 @@ def _plan_fidelity(S, plan) -> float:
     _, rows = channel_angles(np.asarray(S), plan, xp=np)
     return float(np.linalg.det(np.stack([rows[i] for i in np.flatnonzero(plan.occupation)]))) ** 2
 
-
-def _print_diagnostics(ham_data, trial, ops, params, meas_ctx, dmrg) -> None:
+def mps_diagnostics(ham_data, trial, ops: MpsCpmcOps, params, meas_ctx, state=None) -> dict:
+    """The run's static diagnostics (trial, H|trial>, walker plan, start determinant, engine layout), as a dict for
+    the result record; print_diagnostics prints it."""
     plan = ops.plan
     plan_a, plan_b = plan.orbital_plans
     gates = lambda p: int(p.block_sizes.sum() - len(p.block_sizes))
-    print(f"MPS trial: norb={trial.norb}, nelec={trial.nelec}, bonds {list(trial.bond_dims)}")
-    if isinstance(trial, RotatedMpsTrial):
-        print("  used as it is: no definite (N_up, N_dn); contractions blocked on particle number")
-    elif trial.sector_weight < 1.0 - 1.0e-12:
-        print(
-            f"  projected onto the walkers' sector, which holds {trial.sector_weight:.6f} of the norm"
-        )
-    if dmrg is not None:
-        print(f"  DMRG Davidson energy {dmrg.davidson_energy:.12f} (two-site, not variational)")
-        print(f"  DMRG variational energy {dmrg.variational_energy:.12f}")
-    print(
-        f"  <T|H|T>/<T|T> = {meas_ctx.trial_energy:.12f} ({getattr(meas_ctx, 'kernel', 'dense')} kernel, "
-        f"H|T> bonds max {max(meas_ctx.h_bond_dims)})"
-    )
-    print(
-        f"walker plan: {params.orbital_plan} gates {gates(plan_a)}, {gates(plan_b)}; "
-        f"reference {params.plan_reference}; walker bonds max {max(map(len, plan.walker_charges))}"
-    )
-    for spin, bond in zip("ab", plan.bond_plans):
-        if bond is not None:
-            print(
-                f"  channel {spin}: reference discarded weight {bond.reference_discarded_weight:.3e}"
-            )
     if params.walker_start == "rhf":
         Sa, Sb = rhf_orbitals(ham_data, trial.nelec)
     else:
         rdm1 = np.asarray(trial.rdm1)
         Sa, Sb = (natural_orbitals(rdm1[s], trial.nelec[s])[0] for s in range(2))
-    print(
-        f"  walkers start from the {params.walker_start} determinant; orbital-plan infidelity "
-        f"{1 - _plan_fidelity(Sa, plan_a):.1e}, {1 - _plan_fidelity(Sb, plan_b):.1e}"
+    kernels = meas_ctx.kernels
+    info: dict[str, Any] = dict(
+        trial_bonds=list(trial.bond_dims),
+        trial_bonds_max=int(max(trial.bond_dims)),
+        trial_labels="(N_up, N_dn)" if trial.label_width == 2 else "N",
+        trial_sector_weight=trial.sector_weight,
+        trial_energy=float(meas_ctx.trial_energy),
+        energy_kernel=meas_ctx.kernel,
+        htrial_bonds_max=int(max(meas_ctx.h_bond_dims)),
+        gates=gates(plan_a),
+        gates_beta=gates(plan_b),
+        walker_bonds_max=int(max(map(len, plan.walker_charges))),
+        reference_discarded_weight=[None if b is None else float(b.reference_discarded_weight)
+                                    for b in plan.bond_plans],
+        plan_infidelity=[1 - _plan_fidelity(Sa, plan_a), 1 - _plan_fidelity(Sb, plan_b)],
     )
-    if ops.engine is not None:
-        linalg, walker_qr = gpu.resolve_linalg(params)
-        print(
-            f"  batched engine: linalg={linalg}, walker_qr={walker_qr}, "
-            f"spin-batched={ops.engine.converter.spin_batched}; circuit "
-            f"{gpu.circuit_stats(ops.engine.converter.circuits[0])}; overlap plan {ops.engine.overlap_plan.stats}"
-        )
-        return
-    if isinstance(trial, RotatedMpsTrial):
-        return  # dense reference contractions: no charge-blocked layout to report
-    report = contraction_report(contraction_layout(plan, trial.charges).contraction)
-    print(
-        f"  overlap environment entries {report}, dense/padded "
-        f"{report['dense'] / max(report['padded_blocks'], 1):.2f}x"
+    if state is not None:
+        info["initial_e_estimate"] = float(state.e_estimate)
+        info["initial_overlap"] = float(np.asarray(state.overlaps)[0])
+    info.update(
+        walker_qr=engine.resolve_walker_qr(plan.walker_qr), spin_batched=kernels.converter.spin_batched,
+        sector_buckets=list(plan.sector_buckets),
+        circuits=[engine.circuit_stats(c) for c in kernels.converter.circuits],
+        overlap_plan=kernels.overlap_plan.stats,
+        energy_plan=None if kernels.energy_plan is None else kernels.energy_plan.stats,
     )
+    return info
 
 
-def run_qmc_mps(
-    *,
-    sys,
-    params,
-    ham_data,
-    trial_data=None,
-    block_fn=blocks.block,
-    state=None,
-    mesh=None,
-    target_error=None,
-    observable_names=(),
-):
-    """CPMC for a HamHubbard with an MPS trial, through trot.driver.run_qmc.
-
-    trial_data: None (pyblock3 DMRG with params.trial_chi, dmrg_sweeps, dmrg_seed), an MpsTrial,
-      a pyblock3 MPS, a DenseMps/Gmps-like object or (tensors, charges). Spin-rotated trials are
-      projected onto the walkers' (N_up, N_dn) sector, except a RotatedMpsTrial, which is used as
-      it is (make_rotated_mps_cpmc_ops).
-    params: QmcParamsMps. block_fn: blocks.block, or e.g. make_block_logger(...) for a JSONL log.
-    Returns trot's QmcResult.
-    """
-    if sys.walker_kind.lower() != "unrestricted":
-        raise ValueError("MPS-CPMC needs walker_kind='unrestricted'")
-    for name in ("orbital_plan", "walker_channel_chi", "energy_kernel", "plan_reference"):
-        if not hasattr(params, name):
-            raise TypeError("params must be a QmcParamsMps (trot.prop.types)")
-    dmrg = None
-    if trial_data is None:
-        from trot.gmps.dmrg import make_dmrg_trial
-
-        dmrg = make_dmrg_trial(
-            ham_data, sys, chi=params.trial_chi, n_sweeps=params.dmrg_sweeps, seed=params.dmrg_seed
-        )
-        trial = dmrg.trial
-    elif isinstance(trial_data, RotatedMpsTrial):
-        trial = trial_data
-    else:
-        trial = as_mps_trial(trial_data, nelec=sys.nelec)
-    make_ops = make_rotated_mps_cpmc_ops if isinstance(trial, RotatedMpsTrial) else make_mps_cpmc_ops
-    ops = make_ops(ham_data, trial, sys, params)
-    meas_ctx = ops.meas_ops.build_meas_ctx(ham_data, trial)
-    prop_ctx = ops.prop_ops.build_prop_ctx(ham_data, ops.trial_ops.get_rdm1(trial), params)
-    _print_diagnostics(ham_data, trial, ops, params, meas_ctx, dmrg)
-
-    sizes = run_qmc_chunk_sizes(params)
-    if len(sizes) > 1:
-        message = (
-            f"run_qmc will compile the MPS block once per block-batch size {sorted(sizes)}; "
-            "choose n_eql_blocks = 5k and n_blocks = 10k (same k) to compile once"
-        )
-        warnings.warn(message, stacklevel=2)
-        print(f"[mps] {message}", flush=True)
-
-    try:
-        result = run_qmc(
-            sys=sys,
-            params=params,
-            ham_data=ham_data,
-            trial_data=trial,
-            trial_ops=ops.trial_ops,
-            meas_ops=ops.meas_ops,
-            prop_ops=ops.prop_ops,
-            block_fn=block_fn,
-            state=state,
-            meas_ctx=meas_ctx,
-            prop_ctx=prop_ctx,
-            target_error=target_error,
-            mesh=mesh,
-            observable_names=observable_names,
-        )
-    except ValueError as exc:
-        if "is zero or numerically ill-conditioned" in str(exc):
-            raise RuntimeError(
-                "the walker population collapsed: every sampled block has total weight 0 "
-                "(all walkers were killed and reconfiguration cannot revive them)"
-            ) from exc
-        raise
-    weights = np.asarray(result.block_weights)
-    if np.any(weights == 0.0):
-        first = int(np.flatnonzero(weights == 0.0)[0])
-        message = (
-            f"the walker population collapsed (total weight 0 from block entry {first}); "
-            "trot's run_qmc does not stop, so the statistics are not meaningful"
-        )
-        warnings.warn(message, stacklevel=2)
-        print(f"[mps] {message}", flush=True)
-    return result
+def print_diagnostics(info: dict, params, dmrg=None) -> None:
+    print(f"MPS trial: bonds {info['trial_bonds']}")
+    if info["trial_labels"] == "N":
+        print("  used as it is: no definite (N_up, N_dn); contractions blocked on particle number")
+    elif info["trial_sector_weight"] < 1.0 - 1.0e-12:
+        print(f"  projected onto the walkers' sector, which holds {info['trial_sector_weight']:.6f} of the norm")
+    if dmrg is not None:
+        print(f"  DMRG Davidson energy {dmrg.davidson_energy:.12f} (two-site, not variational)")
+        if dmrg.variational_energy is not None:  # None in chain cache files written before it was stored
+            print(f"  DMRG variational energy {dmrg.variational_energy:.12f}")
+    print(f"  <T|H|T>/<T|T> = {info['trial_energy']:.12f} ({info['energy_kernel']} kernel, "
+          f"H|T> bonds max {info['htrial_bonds_max']})")
+    if "setup_seconds" in info:
+        print("  setup: " + ", ".join(f"{k} {v:.1f} s" for k, v in info["setup_seconds"].items()))
+    print(f"walker plan: {params.orbital_plan} gates {info['gates']}, {info['gates_beta']}; reference "
+          f"{params.plan_reference}; walker bonds max {info['walker_bonds_max']}")
+    for spin, weight in zip("ab", info["reference_discarded_weight"]):
+        if weight is not None:
+            print(f"  channel {spin}: reference discarded weight {weight:.3e}")
+    print(f"  walkers start from the {params.walker_start} determinant; orbital-plan infidelity "
+          f"{info['plan_infidelity'][0]:.1e}, {info['plan_infidelity'][1]:.1e}")
+    if "initial_e_estimate" in info:
+        print(f"  start: overlap {info['initial_overlap']:.6e}, local energy {info['initial_e_estimate']:.10f}")
+    print(f"  engine: walker_qr={info['walker_qr']}, spin-batched={info['spin_batched']}, sector buckets "
+          f"{info['sector_buckets'] or 'none'}")
+    for j, circuit in enumerate(info["circuits"]):
+        print(f"  conversion circuit {j}: {circuit}")
+    print(f"  overlap plan {info['overlap_plan']}")
+    if info["energy_plan"] is not None:
+        print(f"  energy plan {info['energy_plan']}")
+    print("", flush=True)
 
 
 # ---------------------------------------------------------------------------------------------
-# Legacy closure-based API (moved from trot/gmps/mps_cpmc_new.py)
+# Block records: the JSONL block log and the walker snapshots
 # ---------------------------------------------------------------------------------------------
-
-
-class WalkerOps(NamedTuple):
-    convert: Callable
-    overlap: Callable
-    energy: Callable | None
-    sweep: Callable
-    walker_charges: tuple[np.ndarray, ...]
-    overlap_plan: dict
-
-
-def make_walker_ops(Ca, Cb, plan_a, plan_b, bond_a, bond_b, trial_np, trial_charges, Htrial=None):
-    """Walker conversion, overlap, local energy and fast sweep against a fixed trial.
-
-    The reference determinant (Ca, Cb) fixes the static walker bond labels.
-    """
-
-    def convert_channels(ca, cb):
-        """Orthonormalize an SD walker and convert each spin channel to an MPS."""
-        qa, det_ra = qr_with_det(ca)
-        qb, det_rb = qr_with_det(cb)
-        alpha, qa_charge, gauge_a = channel_mps(qa, plan_a, bond_a)
-        beta, qb_charge, gauge_b = channel_mps(qb, plan_b, bond_b)
-        prefactor = det_ra * det_rb * gauge_a * gauge_b
-        return alpha, qa_charge, beta, qb_charge, prefactor
-
-    _, qa_charge, _, qb_charge, _ = convert_channels(jnp.asarray(Ca), jnp.asarray(Cb))
-    walker_charges = combined_charges(qa_charge, qb_charge)
-    overlap_plan = make_contraction_plan(walker_charges, trial_charges)
-    channel_maps = make_channel_block_maps(overlap_plan, qa_charge, qb_charge)
-    trial_blocks = extract_fixed_blocks(trial_np, overlap_plan)
-    trial = tuple(jnp.asarray(A) for A in trial_np)
-
-    def overlap_fn(walker, _trial_data=None):
-        ca, cb = walker
-        alpha_mps, _, beta_mps, _, prefactor = convert_channels(ca, cb)
-        blocks_ = extract_channel_blocks(alpha_mps, beta_mps, channel_maps)
-        return prefactor * blocked_contract_from_blocks(blocks_, trial_blocks, overlap_plan)
-
-    def energy_fn(walker, _ham=None, _ctx=None, _trial_data=None):
-        ca, cb = walker
-        alpha, qa, beta, qb, _ = convert_channels(ca, cb)
-        tensors, _ = combine_channels(alpha, qa, beta, qb)
-        return contract_real(tensors, Htrial) / contract_real(tensors, trial)
-
-    def convert_for_sweep(ca, cb):
-        alpha, _, beta, _, prefactor = convert_channels(ca, cb)
-        return alpha, beta, prefactor
-
-    sweep_fn = make_fast_sweep(convert_for_sweep, channel_maps, trial_blocks, overlap_plan)
-    return WalkerOps(
-        convert_channels,
-        overlap_fn,
-        None if Htrial is None else energy_fn,
-        sweep_fn,
-        walker_charges,
-        overlap_plan,
-    )
 
 
 def make_block_logger(path, n_equilibration, tag="", base_block_fn=blocks.block):
@@ -373,79 +203,222 @@ def make_block_logger(path, n_equilibration, tag="", base_block_fn=blocks.block)
     return block_fn
 
 
-def run_qmc_fixed_chunks(
-    *, sys, params, ham_data, trial_data, meas_ops, trial_ops, prop_ops, block_fn, chunk_times=None
-):
-    """trot's run_qmc with one chunk size for both phases, gcd(n_eql, n_blocks),
-    so the jitted block scan compiles once instead of once per chunk size.
-    Same initialisation, block function, outlier rejection and blocking analysis.
-    Stops early if the population collapses (total weight zero: every walker was
-    killed, and reconfiguration cannot bring it back).
-    Returns (mean, stderr, block energies, block weights, collapsed_after_block), all
-    blocks unfiltered; mean and stderr are NaN and collapsed_after_block is set if it
-    collapsed, otherwise collapsed_after_block is None.
-    If chunk_times is a list, (blocks done, seconds since start) is appended after
-    every chunk; the first includes the compile."""
-    prop_ctx = prop_ops.build_prop_ctx(ham_data, trial_ops.get_rdm1(trial_data), params)
-    meas_ctx = meas_ops.build_meas_ctx(ham_data, trial_data)
-    state = prop_ops.init_prop_state(
-        sys=sys,
-        ham_data=ham_data,
-        trial_ops=trial_ops,
-        trial_data=trial_data,
-        meas_ops=meas_ops,
-        params=params,
-    )
-    run_blocks = make_run_blocks(
-        block_fn=block_fn,
-        sys=sys,
-        params=params,
-        trial_ops=trial_ops,
-        meas_ops=meas_ops,
-        prop_ops=prop_ops,
-    )
-    n_eql, total = params.n_eql_blocks, params.n_eql_blocks + params.n_blocks
-    chunk = math.gcd(n_eql, params.n_blocks)
-    energies, weights, start, collapsed = [], [], time.perf_counter(), None
-    for done in range(chunk, total + 1, chunk):
-        state, scalars, _ = run_blocks(
-            state,
-            ham_data=ham_data,
-            trial_data=trial_data,
-            meas_ctx=meas_ctx,
-            prop_ctx=prop_ctx,
-            n_blocks=chunk,
-        )
-        e, w = np.asarray(scalars["energy"]), np.asarray(scalars["weight"])
-        if chunk_times is not None:
-            chunk_times.append((done, time.perf_counter() - start))
-        energies.extend(e.tolist())
-        weights.extend(w.tolist())
-        print(
-            f"[{'eql' if done <= n_eql else 'blk'} {done:4d}/{total}]  E_chunk {np.sum(e * w) / np.sum(w):14.10f}"
-            f"  W {w.mean():12.6e}  nodes {int(state.node_encounters):10d}"
-            f"  t {time.perf_counter() - start:8.1f} s",
-            flush=True,
-        )
-        if not w[-1] > 0.0:
-            collapsed = done
-            print(
-                f"\nPopulation collapsed: total weight is zero after block {done}. Stopping.",
-                flush=True,
-            )
-            break
+class WalkerSnapshots:
+    """Every block's walkers, in the format fixed_block_walkers.ipynb and entanglement_vs_gmps.ipynb load.
 
-    if collapsed is not None:
-        return float("nan"), float("nan"), np.asarray(energies), np.asarray(weights), collapsed
-    sampled = np.column_stack((energies[n_eql:], weights[n_eql:]))
-    clean, _ = reject_outliers(sampled, obs=0)
-    print(f"\nRejected {len(sampled) - len(clean)} outlier blocks.\n\nFinal blocking analysis:")
-    stats = blocking_analysis_ratio(np.asarray(clean[:, 0]), np.asarray(clean[:, 1]), print_q=True)
-    return stats["mu"], stats["se_star"], np.asarray(energies), np.asarray(weights), None
+    Snapshot 0 is the starting population and snapshot b the population after block b, after its comb (where every
+    walker has the same weight): up, dn of shape (n_snap, n_walkers, L, N_sigma), float64, at imaginary time
+    tau_snapshots = b * n_steps * dt. Per block b (the one ending at tau_blocks[b] and producing snapshot b + 1):
+    energies, weights (the block's energy and total weight), e_estimate and node_encounters (cumulative), and the
+    comb's input: pre_comb_weights[b, j] is walker j's weight at the energy measurement, and comb_index[b, i] = j says
+    walker i of snapshot b + 1 is a copy of that walker j.
+
+    Arrays are written block by block into <name>.parts/ (progress.json says how many are valid), so a crash keeps
+    every finished block; finish() packs them with the config into <name>.npz and removes the parts. add_block is the
+    record callback of make_mps_block.
+    """
+
+    def __init__(self, path, n_snap, n_walkers, L, n_up, n_down, config=None):
+        from numpy.lib.format import open_memmap
+
+        self.config = dict(config or {})  # stored in progress.json too, so unfinished runs can be plotted
+        self.path = Path(path)
+        self.parts = self.path.with_name(self.path.stem + ".parts")
+        self.parts.mkdir(parents=True, exist_ok=True)
+
+        def memmap(name, shape, dtype=np.float64):
+            return open_memmap(self.parts / f"{name}.npy", mode="w+", dtype=dtype, shape=shape)
+
+        self.up = memmap("up", (n_snap, n_walkers, L, n_up))
+        self.dn = memmap("dn", (n_snap, n_walkers, L, n_down))
+        self.pre_comb_weights = memmap("pre_comb_weights", (n_snap - 1, n_walkers))
+        self.comb_index = memmap("comb_index", (n_snap - 1, n_walkers), np.int32)
+        self.snapshots, self.blocks = 0, []
+        print(f"walker snapshots: {n_snap} x {n_walkers} walkers -> {self.path} "
+              f"({(self.up.nbytes + self.dn.nbytes) / 1e9:.1f} GB)", flush=True)
+
+    def add_snapshot(self, state):
+        self.up[self.snapshots] = np.asarray(state.walkers[0])
+        self.dn[self.snapshots] = np.asarray(state.walkers[1])
+        self.snapshots += 1
+
+    def add_block(self, up, dn, pre_comb_weights, comb_index, energy, weight, e_estimate, node_encounters):
+        b = len(self.blocks)
+        self.pre_comb_weights[b] = np.asarray(pre_comb_weights)
+        self.comb_index[b] = np.asarray(comb_index)
+        self.blocks.append(dict(energy=float(energy), weight=float(weight), e_estimate=float(e_estimate),
+                                node_encounters=int(node_encounters)))
+        self.up[self.snapshots] = np.asarray(up)
+        self.dn[self.snapshots] = np.asarray(dn)
+        self.snapshots += 1
+        for array in (self.up, self.dn, self.pre_comb_weights, self.comb_index):
+            array.flush()
+        (self.parts / "progress.json").write_text(json.dumps(dict(snapshots=self.snapshots, blocks=self.blocks,
+                                                                  config=self.config)))
+        return np.int32(0)
+
+    def finish(self, config, arrays=None):
+        config = {**self.config, **config}
+        n, nb = self.snapshots, len(self.blocks)
+        step = config["N_PROP"] * config["DT"]
+
+        def column(key, dtype=float):
+            return np.array([blk[key] for blk in self.blocks], dtype=dtype)
+
+        np.savez(self.path, up=self.up[:n], dn=self.dn[:n], energies=column("energy"), weights=column("weight"),
+                 e_estimate=column("e_estimate"), node_encounters=column("node_encounters", np.int64),
+                 pre_comb_weights=self.pre_comb_weights[:nb], comb_index=self.comb_index[:nb],
+                 tau_snapshots=np.arange(n) * step, tau_blocks=np.arange(1, nb + 1) * step,
+                 config=json.dumps(config), **(arrays or {}))
+        del self.up, self.dn, self.pre_comb_weights, self.comb_index
+        shutil.rmtree(self.parts)
+        print(f"saved {self.path}: {n} snapshots, {nb} blocks", flush=True)
 
 
 def save_result(path, record):
+    """Append one run's record to a JSONL file (results.jsonl)."""
     if not path:
         return
     with Path(path).open("a") as stream:
-        stream.write(json.dumps(record) + "\n")
+        stream.write(json.dumps(record, default=str) + "\n")
+
+
+# ---------------------------------------------------------------------------------------------
+# Running: prepare, run
+# ---------------------------------------------------------------------------------------------
+
+
+class MpsCpmcRun(NamedTuple):
+    """Everything a run needs, built by prepare_mps_cpmc."""
+
+    sys: Any
+    params: Any
+    ham_data: Any
+    trial: Any
+    ops: MpsCpmcOps
+    meas_ctx: Any
+    prop_ctx: Any
+    state: PropState
+    info: dict
+
+
+def prepare_mps_cpmc(*, sys, params, ham_data, trial, htrial=None, state=None, mesh=None, dmrg=None,
+                     verbose=True) -> MpsCpmcRun:
+    """Ops, contexts, the walkers' start and the diagnostics for an MpsTrial.
+
+    htrial: optional precomputed H|trial> (tensors or block form, labels, trial_energy), energy_kernel="blocked".
+    dmrg: the trot.gmps.dmrg.DmrgTrial the trial came from, for the printout.
+    """
+    if sys.walker_kind.lower() != "unrestricted":
+        raise ValueError("MPS-CPMC needs walker_kind='unrestricted'")
+    for name in ("orbital_plan", "walker_channel_chi", "energy_kernel", "plan_reference"):
+        if not hasattr(params, name):
+            raise TypeError("params must be a QmcParamsMps (trot.prop.types)")
+    clock, seconds = time.perf_counter, {}
+    start = clock()
+    ops = make_mps_cpmc_ops(ham_data, trial, sys, params, htrial)  # walker plan (orbital and bond plans, circuit)
+    seconds["walker_plan"] = clock() - start
+    start = clock()
+    meas_ctx = ops.meas_ops.build_meas_ctx(ham_data, trial)  # H|trial>, layouts, padded blocks
+    prop_ctx = ops.prop_ops.build_prop_ctx(ham_data, ops.trial_ops.get_rdm1(trial), params)
+    seconds["meas_ctx"] = clock() - start
+    if state is None:
+        start = clock()
+        state = ops.prop_ops.init_prop_state(sys=sys, ham_data=ham_data, trial_ops=ops.trial_ops, trial_data=trial,
+                                             meas_ops=ops.meas_ops, params=params, meas_ctx=meas_ctx, mesh=mesh)
+        jax.block_until_ready(state)
+        seconds["walker_start"] = clock() - start  # compile included
+    info = mps_diagnostics(ham_data, trial, ops, params, meas_ctx, state)
+    info["setup_seconds"] = {k: round(v, 1) for k, v in seconds.items()}
+    if verbose:
+        print_diagnostics(info, params, dmrg)
+    return MpsCpmcRun(sys, params, ham_data, trial, ops, meas_ctx, prop_ctx, state, info)
+
+
+def run_prepared(run: MpsCpmcRun, *, block_fn=None, mesh=None, target_error=None, observable_names=()):
+    """trot.driver.run_qmc on a prepared run. block_fn defaults to the MPS block (trot.prop.mps_cpmc.block).
+    Returns trot's QmcResult."""
+    if block_fn is None:
+        block_fn = mps_cpmc.block
+    sizes = run_qmc_chunk_sizes(run.params)
+    if len(sizes) > 1:
+        message = (
+            f"run_qmc will compile the MPS block once per block-batch size {sorted(sizes)}; "
+            "choose n_eql_blocks = 5k and n_blocks = 10k (same k) to compile once"
+        )
+        warnings.warn(message, stacklevel=2)
+        print(f"[mps] {message}", flush=True)
+    try:
+        result = run_qmc(
+            sys=run.sys,
+            params=run.params,
+            ham_data=run.ham_data,
+            trial_data=run.trial,
+            trial_ops=run.ops.trial_ops,
+            meas_ops=run.ops.meas_ops,
+            prop_ops=run.ops.prop_ops,
+            block_fn=block_fn,
+            state=run.state,
+            meas_ctx=run.meas_ctx,
+            prop_ctx=run.prop_ctx,
+            target_error=target_error,
+            mesh=mesh,
+            observable_names=observable_names,
+        )
+    except ValueError as exc:
+        if "is zero or numerically ill-conditioned" in str(exc):
+            raise RuntimeError(
+                "the walker population collapsed: every sampled block has total weight 0 "
+                "(all walkers were killed and reconfiguration cannot revive them)"
+            ) from exc
+        raise
+    weights = np.asarray(result.block_weights)
+    if np.any(weights == 0.0):
+        first = int(np.flatnonzero(weights == 0.0)[0])
+        message = (
+            f"the walker population collapsed (total weight 0 from block entry {first}); "
+            "trot's run_qmc does not stop, so the statistics are not meaningful"
+        )
+        warnings.warn(message, stacklevel=2)
+        print(f"[mps] {message}", flush=True)
+    return result
+
+def run_qmc_mps(
+    *,
+    sys,
+    params,
+    ham_data,
+    trial_data=None,
+    block_fn=None,
+    state=None,
+    mesh=None,
+    target_error=None,
+    observable_names=(),
+    htrial=None,
+):
+    """CPMC for a HamHubbard with an MPS trial, through trot.driver.run_qmc.
+
+    trial_data: None (pyblock3 DMRG with params.trial_chi, dmrg_sweeps, dmrg_seed), an MpsTrial,
+      a pyblock3 MPS, a DenseMps/Gmps-like object or (tensors, charges) (trot.trial.mps.as_mps_trial).
+    params: QmcParamsMps. block_fn: None (the MPS block, trot.prop.mps_cpmc.block), trot.prop.blocks.block,
+      or e.g. make_block_logger(...) for a JSONL log.
+    htrial: optional precomputed H|trial> (see prepare_mps_cpmc).
+    Returns trot's QmcResult.
+    """
+    dmrg = None
+    if trial_data is None:
+        from trot.gmps.dmrg import make_dmrg_trial
+
+        dmrg = make_dmrg_trial(
+            ham_data, sys, chi=params.trial_chi, n_sweeps=params.dmrg_sweeps, seed=params.dmrg_seed
+        )
+        trial = dmrg.trial
+    else:
+        trial = as_mps_trial(trial_data, nelec=sys.nelec)
+    run = prepare_mps_cpmc(sys=sys, params=params, ham_data=ham_data, trial=trial, htrial=htrial, state=state,
+                           mesh=mesh, dmrg=dmrg)
+    return run_prepared(run, block_fn=block_fn, mesh=mesh, target_error=target_error,
+                        observable_names=observable_names)
+
+
+# ---------------------------------------------------------------------------------------------

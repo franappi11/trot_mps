@@ -12,10 +12,12 @@ config.configure_once()
 from trot.core.system import System
 from trot.driver import run_qmc
 from trot.gmps.dmrg import make_dmrg_trial
-from trot.gmps.driver import make_mps_cpmc_ops, run_qmc_mps
+from trot.gmps.driver import run_qmc_mps
 from trot.ham.hubbard import HamHubbard, hopping_matrix
-from trot.prop import blocks
+from trot.meas.mps import make_mps_meas_ops_hubbard
+from trot.prop import mps_cpmc
 from trot.prop.types import QmcParamsMps
+from trot.trial.mps import make_mps_trial_ops, make_walker_plan
 
 L, U = 8, 4.0
 sys = System(L, (L // 2, L // 2), "unrestricted")
@@ -35,20 +37,23 @@ params = QmcParamsMps(
 # One call: pyblock3 DMRG trial, then trot's run_qmc.
 run = run_qmc_mps(sys=sys, params=params, ham_data=ham)
 
-# The same run assembled by hand. trial_data can also be mps_trial_from_sd(Ca, Cb), or a
-# spin-rotated MPS passed through make_mps_trial(tensors, nelec=...).
+# The same run assembled from trot's modules, as for any trial. trial_data can also be mps_trial_from_sd(Ca, Cb),
+# a spin-rotated MPS through make_mps_trial(tensors, nelec=...) (used as it is, particle-number labels) or
+# trot.trial.mps_rotation.rotate_mps_trial(trial, R) (rotated straight into the walkers' sector).
 trial = make_dmrg_trial(ham, sys, chi=params.trial_chi, n_sweeps=params.dmrg_sweeps).trial
-ops = make_mps_cpmc_ops(ham, trial, sys, params)
-prop_ctx = ops.prop_ops.build_prop_ctx(ham, ops.trial_ops.get_rdm1(trial), params)
+plan = make_walker_plan(ham, trial, sys, params)  # the walker conversion, frozen on the trial's natural orbitals
+trial_ops = make_mps_trial_ops(plan)
+meas_ops = make_mps_meas_ops_hubbard(plan, energy_kernel=params.energy_kernel)
+prop_ops = mps_cpmc.make_prop_ops(ham, sys, plan)
 run = run_qmc(
     sys=sys,
     params=params,
     ham_data=ham,
     trial_data=trial,
-    trial_ops=ops.trial_ops,
-    meas_ops=ops.meas_ops,
-    prop_ops=ops.prop_ops,
-    prop_ctx=prop_ctx,
-    block_fn=blocks.block,
+    trial_ops=trial_ops,
+    meas_ops=meas_ops,
+    prop_ops=prop_ops,
+    prop_ctx=prop_ops.build_prop_ctx(ham, trial_ops.get_rdm1(trial), params),
+    block_fn=mps_cpmc.block,  # the MPS block; trot.prop.blocks.block gives the same blocks, with 3 more conversions
 )
 print(f"E = {float(run.mean_energy):.6f} +/- {float(run.stderr_energy):.6f}")

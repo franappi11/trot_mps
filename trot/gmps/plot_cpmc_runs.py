@@ -1,4 +1,4 @@
-"""Plot CPMC energy per block against imaginary time for runs saved with --save-walkers (mps_cpmc_gpu).
+"""Plot CPMC energy per block against imaginary time for runs saved with --save-walkers (run_mps_cpmc.py).
 
 Reads each run's <tag>_walkers.npz (only the small arrays: the walkers are not loaded), for a run still going
 its <tag>_walkers.parts/progress.json, or, without the walker files (e.g. on a laptop), the output directory's
@@ -32,11 +32,14 @@ def load_runs(path):
         return load_block_logs(path)
     if path.suffix == ".npz":
         z = np.load(path)  # lazy: only the arrays read below are loaded
+        config = json.loads(str(z["config"]))
+        config.update(trial_setup(config))
         run = dict(energies=z["energies"], weights=z["weights"], e_estimate=z["e_estimate"],
-                   tau=z["tau_blocks"], config=json.loads(str(z["config"])), finished=True)
+                   tau=z["tau_blocks"], config=config, finished=True)
     elif path.name == "progress.json":  # a run in progress: <tag>_walkers.parts/progress.json
         progress = json.loads(path.read_text())
         blocks, config = progress["blocks"], progress["config"]
+        config.update(trial_setup(config))
         run = dict(energies=np.array([b["energy"] for b in blocks]), weights=np.array([b["weight"] for b in blocks]),
                    e_estimate=np.array([b["e_estimate"] for b in blocks]),
                    tau=np.arange(1, len(blocks) + 1) * config["N_PROP"] * config["DT"], config=config, finished=False)
@@ -81,11 +84,52 @@ def load_block_logs(path):
                       E_TRIAL=r["trial_energy"], E_CPMC=r["cpmc_energy"], E_CPMC_ERR=r["cpmc_error"], tag=tag)
         if "Lx" in r:  # square lattice (mps_cpmc_2d_gpu), as in its walker files' config
             config.update(LX=r["Lx"], LY=r["Ly"])
+        config.update(trial_setup(r))
         runs.append(dict(energies=np.array([b["energy"] for b in rows]), weights=np.array([b["weight"] for b in rows]),
                          e_estimate=np.array([b["e_estimate"] for b in rows]),
                          tau=(np.array([b["block"] for b in rows]) + 1) * r["n_steps"] * r["dt"],
                          config=config, finished=True, path=blocks_path))
     return runs
+
+
+def rotation_angle(record):
+    """The trial's spin rotation in degrees: mps_cpmc_gpu's trial_rotation, or the angle of the R matrix that the
+    trot-native rotated runs stored (spin_rotation_y(beta) = [[cos beta/2, -sin beta/2], [sin beta/2, cos beta/2]])."""
+    if record.get("trial_rotation") is not None:
+        return float(record["trial_rotation"])
+    R = record.get("rotation")
+    if R is None:
+        return 0.0
+    return float(np.degrees(2.0 * np.arctan2(R[1][0], R[0][0])))
+
+
+def trial_setup(record):
+    """The config keys run_variant reads, from a results.jsonl record or a walker file's config. Runs from before
+    the options existed get their meaning then: unrotated, a rotated trial projected onto the walkers' sector, and
+    natural orbitals of the trial's rdm1 after the rotation."""
+    beta = rotation_angle(record)
+    return dict(TRIAL_ROTATION=beta,
+                ROTATED_TRIAL=record.get("rotated_trial", "projected") if beta else None,
+                NATURAL_RDM1=record.get("natural_rdm1", "after") if beta else None,
+                PLAN_REFERENCE=record.get("plan_reference", "natural"),
+                WALKER_START=record.get("walker_start", "natural"))
+
+
+def run_variant(cfg):
+    """How a run's trial and walkers were set up, for the legend: unrotated or rotated trial (projected onto the
+    walkers' S_z sector, or used as it is without S_z labels), and where the walker plan and start come from."""
+    beta = cfg.get("TRIAL_ROTATION") or 0.0
+    if not beta:
+        trial = "unrotated trial"
+    else:
+        kind = "no $S_z$ labels" if cfg.get("ROTATED_TRIAL") == "as_is" else "$S_z$-projected"
+        trial = rf"rotated ${beta:g}^\circ$ trial ({kind})"
+    plan, start = cfg.get("PLAN_REFERENCE", "natural"), cfg.get("WALKER_START", "natural")
+    if plan == start == "natural":
+        walkers = f"plan & start: {'unrotated' if cfg.get('NATURAL_RDM1') == 'before' else 'rotated'} rdm1" if beta else ""
+    else:
+        walkers = f"plan & start: {plan.upper()}" if plan == start else f"plan: {plan}, start: {start}"
+    return ", ".join(x for x in (trial, walkers) if x)
 
 
 def find_runs(paths):
@@ -133,6 +177,7 @@ def main():
     parser.add_argument("--per-site", action="store_true", help="plot E / L")
     parser.add_argument("--estimate", action="store_true", help="also draw the running energy estimate")
     parser.add_argument("--no-trial", action="store_true", help="do not draw the DMRG trial energies")
+    parser.add_argument("--e-ref", type=float, default=None, help="reference (e.g. converged DMRG) total energy: a black solid line")
     parser.add_argument("--trial-chi", type=int, nargs="+", default=None, help="keep only runs with these trial chi")
     parser.add_argument("--out", default="cpmc_energy_vs_tau.png", help="figure path (a .csv with the curves goes next to it)")
     parser.add_argument("--show", action="store_true", help="also open the figure window")
@@ -143,7 +188,8 @@ def main():
         runs = [r for r in runs if r["config"].get("DMRG_CHI_T") in args.trial_chi]
     if not runs:
         raise SystemExit("no runs found")
-    runs.sort(key=lambda r: (r["config"].get("DMRG_CHI_T", 0), r["config"].get("CHI_PROP") or 0, r["config"]["DT"],
+    runs.sort(key=lambda r: (r["config"].get("DMRG_CHI_T", 0), r["config"].get("CHI_PROP") or 0,
+                             r["config"].get("TRIAL_ROTATION") or 0.0, run_variant(r["config"]), r["config"]["DT"],
                              str(r["path"])))
     several_dt = len({r["config"]["DT"] for r in runs}) > 1  # then the labels say each run's time step
     several_chi_w = len({r["config"].get("CHI_PROP") for r in runs}) > 1  # ... and each run's walker bond
@@ -160,7 +206,8 @@ def main():
 
     fig, ax = plt.subplots(figsize=(8.0, 4.2))
     rows = ["run,trial_chi,block,tau,energy,weight,e_estimate"]
-    print(f"{'run':40s} {'trial chi':>9s} {'blocks':>6s} {'E (sampling)':>16s} {'error':>10s} {'E_DMRG':>14s}  method")
+    print(f"{'run':40s} {'trial chi':>9s} {'blocks':>6s} {'E (sampling)':>16s} {'error':>10s} {'E_DMRG':>14s}  "
+          f"method; setup")
     for i, r in enumerate(runs):
         cfg, color = r["config"], PALETTE[i % len(PALETTE)]
         scale = 1.0 / cfg["L"] if args.per_site else 1.0
@@ -169,9 +216,9 @@ def main():
         name = cfg.get("tag") or r["path"].name
         state = "" if r["finished"] else " (running)"
         print(f"{name[:40]:40s} {chi_t!s:>9s} {len(r['energies']):6d} {mean:16.8f} {err:10.2e} "
-              f"{cfg.get('E_DMRG', float('nan')):14.8f}  {method}{state}")
+              f"{cfg.get('E_DMRG', float('nan')):14.8f}  {method}{state}; {run_variant(cfg).replace('$', '')}")
         run_label = (rf"trial $\chi_T$={chi_t}" + (rf", $\chi_w$={cfg.get('CHI_PROP')}" if several_chi_w else "")
-                     + (f", dt={cfg['DT']:g}" if several_dt else "") + state)
+                     + (f", dt={cfg['DT']:g}" if several_dt else "") + ", " + run_variant(cfg) + state)
         label = (rf"{run_label}: {mean * scale:.6f} $\pm$ {err * scale:.1e}" if np.isfinite(mean) else run_label)
         ax.plot(r["tau"], r["energies"] * scale, "-", marker="o", ms=2.5, color=color, label=label)
         if args.estimate:
@@ -182,6 +229,9 @@ def main():
             rows.append(f"{name},{chi_t},{b},{t},{e},{w},{est}")
 
     cfg0 = runs[0]["config"]
+    if args.e_ref is not None:
+        ax.axhline(args.e_ref * (1.0 / cfg0["L"] if args.per_site else 1.0), color=INK, lw=1.4,
+                   label=f"reference energy (DMRG): {args.e_ref:.4f}")
     for tau_eql in sorted({r["config"]["N_EQL"] * r["config"]["N_PROP"] * r["config"]["DT"] for r in runs}):
         ax.axvline(tau_eql, color=INK2, lw=1.0, ls="--", zorder=0)
     ax.set_xlabel(r"imaginary time $\tau$")

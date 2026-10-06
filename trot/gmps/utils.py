@@ -5,8 +5,8 @@ an orbital plan fixes a circuit of nearest-neighbour Givens gates, the gates act
 on an occupation state with the orthogonality centre moved onto each gate, and
 every split is done charge block by charge block, optionally truncated to fixed
 ranks. The two channels are then interleaved into the d=4 basis of a pyblock3
-DMRG trial, which densify turns into plain arrays. mps_cpmc_new and the scripts
-built on it import these functions from here.
+DMRG trial, which densify turns into plain arrays. The batched engine (trot.gmps.engine)
+compiles the same algorithm for the device and checks itself against channel_mps.
 
 Conventions: real orbitals; local basis |0>, |up>, |dn>, |up dn> indexed
 n_up + 2*n_dn; fermion operators ordered site by site with up before down; bond
@@ -129,6 +129,16 @@ def make_orbital_plan(C: np.ndarray, mode="rank_exact", eps=1.0e-10) -> OrbitalP
     return OrbitalPlan(occ, np.asarray(block_sizes), tuple(references), exact)
 
 
+def null_mode(block, xp=jnp):
+    """A unit vector v with v^T block = 0 for blocks (..., B, N) of rank < B: the left singular vector of the
+    smallest singular value, in null(block^T) whatever the shape. (The last vector of a complete QR is in null(block^T)
+    only for B > N: Householder QR without pivoting can leave the rank deficiency of a B <= N block above its last
+    row, e.g. when its leading columns are dependent, which the "maximal" plan's late blocks of a walker equal to the
+    reference can be.)"""
+    u, _, _ = xp.linalg.svd(block, full_matrices=True)
+    return u[..., :, -1]
+
+
 def channel_angles(C, plan: OrbitalPlan, xp=jnp):
     """Recompute numerical rotation angles for the current orthonormal walker following 
     Fishman White paper."""
@@ -140,10 +150,8 @@ def channel_angles(C, plan: OrbitalPlan, xp=jnp):
             continue
         block = xp.stack(rows[k:k + B])
         if plan.exact_for_all_walkers and not plan.occupation[k]:
-            # B > number of occupied orbitals, so the last complete-QR vector
-            # lies exactly in null(block.T): it is the required empty mode.
-            vectors, _ = xp.linalg.qr(block, mode="complete")
-            v = vectors[:, -1]
+            # rank counting leaves the block rank-deficient: any vector of null(block.T) is the required empty mode
+            v = null_mode(block, xp)
         else:
             _, vectors = xp.linalg.eigh(block @ block.T)
             v = vectors[:, -1 if plan.occupation[k] else 0]
@@ -442,6 +450,64 @@ def contract_real(left_mps, right_mps):
     return env.reshape(())
 
 
+# ---------------------------------------------------------------------------------------------
+# Bond labels of a d=4 MPS: (N_up, N_dn) pairs, or particle numbers N
+# ---------------------------------------------------------------------------------------------
+
+PHYSICAL_CHARGE = np.array([[0, 0], [1, 0], [0, 1], [1, 1]])  # (n_up, n_dn) of p = n_up + 2 n_dn
+
+
+def label_array(labels) -> np.ndarray:
+    """One bond's labels as a (D, width) int array: width 2 for (N_up, N_dn) labels, 1 for particle-number
+    labels N (a (D,) array is read as N labels)."""
+    q = np.asarray(labels, int)
+    return q.reshape(len(q), -1)
+
+
+def _labels_from_nonzeros(tensors, physical):
+    """Bond labels read off the nonzero entries: bond 0 is 0, and A[i, p, j] != 0 from a reached index i gives index j
+    the label of i plus physical[p]. An index that no such entry reaches gets -1 (its block is zero: it pairs with no
+    walker label, so dropping it is exact). Returns L+1 (D, width) int arrays, or None if some index is reached with
+    two different labels (no definite labels in this gauge)."""
+    width = physical.shape[1]
+    labels = [np.zeros((1, width), int)]
+    for A in tensors:
+        reached = labels[-1][:, 0] >= 0
+        nonzero = (np.asarray(A) != 0) & reached[:, None, None]
+        pairs = []
+        for p, delta in enumerate(physical):
+            rows, cols = np.nonzero(nonzero[:, p, :])
+            pairs.append(np.column_stack([cols, labels[-1][rows] + delta]))
+        pairs = np.unique(np.concatenate(pairs), axis=0)
+        if len(np.unique(pairs[:, 0])) != len(pairs):
+            return None
+        out = np.full((nonzero.shape[2], width), -1, int)
+        out[pairs[:, 0]] = pairs[:, 1:]
+        labels.append(out)
+    return tuple(labels)
+
+
+def sz_labels(tensors):
+    """(N_up, N_dn) bond labels of a real d=4 MPS read off its nonzero entries (-1 for an index that nothing
+    reaches), or None when the MPS has no definite (N_up, N_dn) in this gauge (an index reached with two labels,
+    e.g. a spin-rotated MPS)."""
+    return _labels_from_nonzeros(tensors, PHYSICAL_CHARGE)
+
+
+def number_labels(tensors):
+    """Particle-number bond labels of a real d=4 MPS, read off its nonzero entries.
+
+    Bond 0 has N = 0, and every nonzero entry A[i, p, j] gives index j the label
+    N_i + n_up(p) + n_dn(p). A spin rotation acts site by site and keeps N, so a
+    rotated trial keeps the input's N labels while its (N_up, N_dn) labels are lost.
+    Returns L+1 (D, 1) int arrays, or None if some index is reached with two
+    different N (the MPS mixes particle numbers in this gauge). An index that no
+    nonzero entry reaches gets -1: its left block is zero, so it pairs with no
+    walker label and dropping it is exact.
+    """
+    return _labels_from_nonzeros(tensors, PHYSICAL_CHARGE.sum(axis=1, keepdims=True))
+
+
 def spin_occupations(charge):
     return ((int(charge.n) + int(charge.twos)) // 2,
             (int(charge.n) - int(charge.twos)) // 2)
@@ -557,7 +623,7 @@ def densify(mps) -> DenseMps:
     Each bond's charge sectors are laid out contiguously in sorted order and the
     labels say which sector every index belongs to, so the result contracts
     directly with sd_to_gmps output (contract_real) or feeds the charge-blocked
-    contraction (mps_cpmc_new.make_contraction_plan).
+    contraction (make_mps_trial, the engine's factorized layouts).
     """
     if mps.const:
         raise ValueError("MPS.const is an added constant term that dense tensors cannot carry")

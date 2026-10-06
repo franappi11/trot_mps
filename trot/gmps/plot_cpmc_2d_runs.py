@@ -2,8 +2,8 @@
 references as horizontal lines.
 
 plot_cpmc_runs.py (whose loaders and statistics this reuses) plus the ground truth: DMRG energies from
-`mps_cpmc_2d.py dmrg` logs or from its kind="dmrg" records in a results.jsonl. A directory argument is also searched
-for dmrg_*.log files and such records; every bond dimension whose lattice, boundaries, filling and U match the runs
+`run_mps_cpmc.py --dmrg-reference` (earlier `mps_cpmc_2d.py dmrg`) logs or from their kind="dmrg" records in a
+results.jsonl. A directory argument is also searched for dmrg_*.log files and such records; every bond dimension whose lattice, boundaries, filling and U match the runs
 is drawn, darker for larger bond, and the largest is the E_ref of the printed table. Logs of another model, or of a
 DMRG run that has not finished, are skipped with the reason printed, so rerunning as runs finish adds their lines. The line is e_mps, <H> of the final MPS, which is variational (not e_davidson, which sits below it).
 
@@ -74,8 +74,8 @@ def add_start_energy(runs):
 
 
 def reference_from_log(path):
-    """(reference, "") from a `mps_cpmc_2d.py dmrg` log: the model from its lattice line, the energy from the
-    record it prints last. (None, reason) when either line is missing."""
+    """(reference, "") from a `run_mps_cpmc.py --dmrg-reference` (or `mps_cpmc_2d.py dmrg`) log: the model from its
+    lattice line, the energy from the record it prints last. (None, reason) when either line is missing."""
     text = path.read_text()
     final = [line for line in text.splitlines() if line.startswith("{'e_davidson'")]
     if not final:
@@ -90,7 +90,7 @@ def reference_from_log(path):
 
 
 def references_from_results(path):
-    """The kind="dmrg" records of a results.jsonl (written by `mps_cpmc_2d.py dmrg result_json=...`)."""
+    """The kind="dmrg" records of a results.jsonl (run_mps_cpmc.py --dmrg-reference, or mps_cpmc_2d.py dmrg)."""
     return [dict(LX=r["Lx"], LY=r["Ly"], BOUNDARY_X=r["boundary_x"], BOUNDARY_Y=r["boundary_y"], N_UP=r["n_up"],
                  N_DN=r["n_down"], U=float(r["interaction"]), energy=float(r["e_mps"]), chi=max(r["bond_dims"]),
                  source=f"{path.name}, dmrg record {r.get('tag') or i}")
@@ -175,7 +175,7 @@ def main():
     parser.add_argument("paths", nargs="+",
                         help="walker .npz files, progress.json files, blocks.jsonl files or directories of runs")
     parser.add_argument("--dmrg", nargs="+", default=[],
-                        help="DMRG reference: mps_cpmc_2d.py dmrg logs or results.jsonl files with its records "
+                        help="DMRG reference: run_mps_cpmc.py --dmrg-reference logs or results.jsonl files with its records "
                              "(default: search the directories given)")
     parser.add_argument("--reference", type=float, help="reference energy to draw instead, e.g. from elsewhere")
     parser.add_argument("--reference-label", default="reference", help="its legend label")

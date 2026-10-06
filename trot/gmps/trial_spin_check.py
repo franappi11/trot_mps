@@ -1,4 +1,4 @@
-"""Spin contamination and staggered magnetization of a cached DMRG trial (mps_cpmc_gpu's trial_cache).
+"""Spin contamination and staggered magnetization of a cached DMRG trial (trot.gmps.trials' trial_cache).
 
 The trial fixes N_alpha and N_beta (pyblock3's SZ symmetry), so S_z = 0, but S^2 is not fixed. Its spin
 content comes from global rotations about y, R(beta) = exp(-i beta S^y). S^y_i is an even on-site operator,
@@ -34,7 +34,6 @@ The numbers go to <out>/<tag>_spin_check.json and .npz before the plot <tag>_spi
 import argparse
 import json
 import os
-import sys
 import time
 import traceback
 from pathlib import Path
@@ -42,11 +41,13 @@ from pathlib import Path
 import numpy as np
 from numpy.polynomial.legendre import leggauss, legvander
 
-HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
-import mps_cpmc_gpu as m  # noqa: E402  (the trial cache, hubbard_mpo, apply_mpo)
+from trot.gmps import trials
+from trot.ham.hubbard import hopping_matrix
+from trot.meas.mps import apply_mpo, hubbard_mpo
 
-# as uhf_trial_cpmc_gpu.py: (L, U) at half filling, t = 1 -> DMRG reference
+HERE = Path(__file__).resolve().parent
+
+# (L, U) at half filling, t = 1 -> DMRG reference
 REFERENCES = {(100, 8.0): -32.545774923969844}
 PALETTE = ["#2a78d6", "#eb6834", "#1baf7a"]
 INK2, GRID, SURFACE = "#52514e", "#e6e5e1", "#fcfcfb"
@@ -75,7 +76,7 @@ if S_EXACT < S_MAX:
           f"use --nodes {S_MAX + 1} for all", flush=True)
 start = time.time()
 
-# ---- local operators in mps_cpmc_gpu's basis |0>, |up>, |dn>, |up dn> (index n_up + 2 n_dn), where
+# ---- local operators in trot.trial.mps's basis |0>, |up>, |dn>, |up dn> (index n_up + 2 n_dn), where
 # c^dag_up c_dn = |up><dn| on a site. All are even, so a sum over sites needs no Jordan-Wigner string.
 RAISE = np.zeros((4, 4)); RAISE[1, 2] = 1.0     # S^+_i
 SZ_OP = np.diag([0.0, 0.5, -0.5, 0.0])
@@ -137,16 +138,18 @@ def site_expectations(tensors, O):
 
 
 # ---- the trial, as the CPMC runs load it
-cfg = m.Config(L=L, n_up=N_UP, n_down=N_DN, hopping=args.t, interaction=U, trial_chi=CHI,
-               dmrg_sweeps=args.dmrg_sweeps, dmrg_seed=args.dmrg_seed, trial_cache=args.trial_cache)
-trial_file = m._trial_cache_file(cfg)
+h1 = hopping_matrix(L, args.t)
+trial_file = trials.trial_cache_file(args.trial_cache, trials.describe_h1(h1), (N_UP, N_DN), U, chi=CHI,
+                                     sweeps=args.dmrg_sweeps, seed=args.dmrg_seed, mpo="terms", schedule="warmup")
 if not trial_file.exists():
     raise SystemExit(f"no cached trial {trial_file}; this script does not run DMRG")
-psi, _, e_dmrg = m.load_or_run_trial(cfg)
+cached = trials.load_or_make_dmrg_trial(h1, U, (N_UP, N_DN), chi=CHI, sweeps=args.dmrg_sweeps, seed=args.dmrg_seed,
+                                        cache_dir=args.trial_cache)
+psi, e_dmrg = [np.array(A) for A in cached.tensors], cached.davidson_energy
 norm = overlap(psi, psi)
 psi[0] = psi[0] / np.sqrt(norm)
-W = m.hubbard_mpo(L, args.t, U)
-h_psi = m.apply_mpo(W, psi)
+W = hubbard_mpo(L, args.t, U)
+h_psi = apply_mpo(W, psi)
 e_trial = overlap(h_psi, psi)
 print(f"{TAG}: <psi|psi> = {norm:.12f}, DMRG Davidson {e_dmrg:.10f}, <psi|H|psi> = {e_trial:.10f}", flush=True)
 
@@ -154,8 +157,8 @@ print(f"{TAG}: <psi|psi> = {norm:.12f}, DMRG Davidson {e_dmrg:.10f}, <psi|H|psi>
 beta_check = 1.0
 r_psi = rotate(psi, beta_check)
 checks = dict(beta=beta_check,
-              energy_rotated=overlap(r_psi, m.apply_mpo(W, r_psi)) - e_trial,
-              commutator=overlap(psi, m.apply_mpo(W, r_psi)) - overlap(h_psi, r_psi))
+              energy_rotated=overlap(r_psi, apply_mpo(W, r_psi)) - e_trial,
+              commutator=overlap(psi, apply_mpo(W, r_psi)) - overlap(h_psi, r_psi))
 print(f"[H, R] checks at beta = {beta_check}: <R psi|H|R psi> - E = {checks['energy_rotated']:.2e}, "
       f"<psi|H R psi> - <H psi|R psi> = {checks['commutator']:.2e}", flush=True)
 if max(abs(checks["energy_rotated"]), abs(checks["commutator"])) > 1e-8:

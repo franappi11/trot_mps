@@ -67,19 +67,16 @@ _MPS_CHOICES = {
     "plan_reference": ("natural", "rhf"),
     "walker_start": ("natural", "rhf"),
     "energy_kernel": ("blocked", "dense"),
-    "propagator": ("fast", "slow"),
-    "engine": ("auto", "batched", "reference"),
-    "linalg": ("auto", "batched", "native"),
     "walker_qr": ("auto", "cholesky", "native"),
 }
 
 
 @dataclass(frozen=True)
 class QmcParamsMps(QmcParams):
-    """QmcParams for CPMC with an MPS trial (trot.trial.mps, trot.gmps.driver.run_qmc_mps).
+    """QmcParams for CPMC with an MPS trial (trot.trial.mps, trot.meas.mps, trot.prop.mps_cpmc).
 
-    Field names follow trot/gmps/mps_cpmc_new.py's Config. trot's base defaults are kept
-    (dt=0.005, n_prop_steps=50, weight_floor=1e-3); mps_cpmc_new used 0.01, 20 and 1e-8.
+    trot's base defaults are kept (dt=0.005, n_prop_steps=50, weight_floor=1e-3); the production command line
+    (trot/gmps/run_mps_cpmc.py) uses 0.01, 20 and 1e-8.
 
     trial_chi, dmrg_sweeps, dmrg_seed: pyblock3 DMRG, used when run_qmc_mps builds the trial.
     orbital_plan: gate plan of the walker conversion. "rank_exact" and "maximal" are exact for
@@ -91,15 +88,12 @@ class QmcParamsMps(QmcParams):
       occupied natural orbitals of the trial) or "rhf" (free-fermion determinant of h1).
     walker_start: determinant every walker starts from, "natural" (trot's convention) or "rhf".
     energy_kernel: "blocked" (charge-labelled H|trial>, blocked contraction) or "dense"
-      (d=4 walker MPS against a densely compressed H|trial>).
-    propagator: "fast" (one walker conversion per HS sweep with cached environments) or
-      "slow" (trot.prop.cpmc_slow: a full conversion and overlap for every field proposal).
-    engine: "reference" (trot.trial.mps / trot.meas.mps / trot.prop.mps_cpmc), "batched" (the GPU engine of
-      trot/gmps/gpu.py: batched sector factorisations, factorized contractions, device data as jit arguments;
-      "fast" propagator only) or "auto" (batched on a GPU backend, reference on CPU). Same results up to rounding.
-    linalg, walker_qr: batched engine only. linalg "batched" factors all sectors of one kind in one call,
-      "native" runs the per-sector loop; walker_qr "cholesky" (CholeskyQR2, Householder fallback) or "native".
-      "auto": batched and cholesky on accelerators, native on CPU.
+      (d=4 walker MPS against a densely compressed H|trial>; for validation).
+    walker_qr: walker orthonormalisation, "cholesky" (CholeskyQR2 with a Householder fallback, for
+      accelerators), "native" (trot's Householder _qr) or "auto" (cholesky on accelerators, native on CPU).
+    sector_buckets: increasing size bounds that split each factorisation's charge sectors into classes padded to
+      their own largest member (trot.gmps.engine.compile_circuit): the same factorisations on smaller padded
+      matrices. (8, 16) measured 1.19-1.38x faster per step at L=100; () keeps one class per kind.
     """
 
     trial_chi: int = 64
@@ -112,15 +106,17 @@ class QmcParamsMps(QmcParams):
     plan_reference: Literal["natural", "rhf"] = "natural"
     walker_start: Literal["natural", "rhf"] = "natural"
     energy_kernel: Literal["blocked", "dense"] = "blocked"
-    propagator: Literal["fast", "slow"] = "fast"
-    engine: Literal["auto", "batched", "reference"] = "auto"
-    linalg: Literal["auto", "batched", "native"] = "auto"
     walker_qr: Literal["auto", "cholesky", "native"] = "auto"
+    sector_buckets: tuple[int, ...] = (8, 16)
 
     def __post_init__(self) -> None:
         for name, allowed in _MPS_CHOICES.items():
             if getattr(self, name) not in allowed:
                 raise ValueError(f"{name} must be one of {allowed}, got {getattr(self, name)!r}")
+        buckets = tuple(int(b) for b in self.sector_buckets)
+        if any(b < 1 for b in buckets) or list(buckets) != sorted(set(buckets)):
+            raise ValueError(f"sector_buckets must be increasing positive sizes, got {self.sector_buckets!r}")
+        object.__setattr__(self, "sector_buckets", buckets)
         if self.trial_chi < 1:
             raise ValueError("trial_chi must be positive")
         if self.dmrg_sweeps < 2:
