@@ -135,6 +135,7 @@ def print_diagnostics(info: dict, params, dmrg=None) -> None:
         print(f"  DMRG Davidson energy {dmrg.davidson_energy:.12f} (two-site, not variational)")
         if dmrg.variational_energy is not None:  # None in chain cache files written before it was stored
             print(f"  DMRG variational energy {dmrg.variational_energy:.12f}")
+        print(f"  DMRG initial state: {dmrg.init}")
     print(f"  <T|H|T>/<T|T> = {info['trial_energy']:.12f} ({info['energy_kernel']} kernel, "
           f"H|T> bonds max {info['htrial_bonds_max']})")
     if "setup_seconds" in info:
@@ -398,7 +399,7 @@ def run_qmc_mps(
 ):
     """CPMC for a HamHubbard with an MPS trial, through trot.driver.run_qmc.
 
-    trial_data: None (pyblock3 DMRG with params.trial_chi, dmrg_sweeps, dmrg_seed), an MpsTrial,
+    trial_data: None (pyblock3 DMRG with params.trial_chi, dmrg_sweeps, dmrg_seed, dmrg_init), an MpsTrial,
       a pyblock3 MPS, a DenseMps/Gmps-like object or (tensors, charges) (trot.trial.mps.as_mps_trial).
     params: QmcParamsMps. block_fn: None (the MPS block, trot.prop.mps_cpmc.block), trot.prop.blocks.block,
       or e.g. make_block_logger(...) for a JSONL log.
@@ -409,9 +410,8 @@ def run_qmc_mps(
     if trial_data is None:
         from trot.gmps.dmrg import make_dmrg_trial
 
-        dmrg = make_dmrg_trial(
-            ham_data, sys, chi=params.trial_chi, n_sweeps=params.dmrg_sweeps, seed=params.dmrg_seed
-        )
+        dmrg = make_dmrg_trial(ham_data, sys, chi=params.trial_chi, n_sweeps=params.dmrg_sweeps,
+                               seed=params.dmrg_seed, init=params.dmrg_init)
         trial = dmrg.trial
     else:
         trial = as_mps_trial(trial_data, nelec=sys.nelec)

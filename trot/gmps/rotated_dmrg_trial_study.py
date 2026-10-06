@@ -106,15 +106,15 @@ def hubbard_chain(L, u):
     return h1, HamHubbard(h1=jnp.asarray(h1), u=u), System(L, (L // 2, L // 2), "unrestricted")
 
 
-def dmrg(ham, sys_, chi, n_sweeps=14, seed=0):
+def dmrg(ham, sys_, chi, n_sweeps=14, seed=0, init="auto"):
     from trot.gmps.dmrg import make_dmrg_trial
 
     with contextlib.redirect_stdout(io.StringIO()):
-        return make_dmrg_trial(ham, sys_, chi=chi, n_sweeps=n_sweeps, seed=seed)
+        return make_dmrg_trial(ham, sys_, chi=chi, n_sweeps=n_sweeps, seed=seed, init=init)
 
 
 def warm_dmrg(ham, sys_, chi, warm_chi, n_sweeps=12, seed=0, warm_sweeps=30):
-    """DMRG at chi started from the DMRG state at warm_chi compressed to chi (an MpsTrial).
+    """DMRG at chi started from the random-start DMRG state at warm_chi compressed to chi (an MpsTrial).
 
     Random-start DMRG at small chi gets stuck in states with domain walls of the staggered
     magnetisation (localised spinons), and the energy grows linearly with their number. A
@@ -133,7 +133,7 @@ def warm_dmrg(ham, sys_, chi, warm_chi, n_sweeps=12, seed=0, warm_sweeps=30):
     nelec = tuple(int(n) for n in sys_.nelec)
     hamiltonian = make_pyblock3_hamiltonian(h1, nelec)
     mpo = hubbard_pyblock3_mpo(hamiltonian, h1, u)
-    source = dmrg(ham, sys_, warm_chi, n_sweeps=warm_sweeps, seed=seed)
+    source = dmrg(ham, sys_, warm_chi, n_sweeps=warm_sweeps, seed=seed, init="random")
     walls, _, _ = domain_walls(source.trial.rdm1)
     if walls:
         print(f"warning: the chi={warm_chi} warm source has {walls} domain walls", flush=True)
@@ -460,6 +460,543 @@ def plot(path, show=False):
         plt.show()
 
 
+# ---------------------------------------------------------------------------------------------
+# Exact references (L <= 10), the no-SR weight-leak test, the chi ladder and the bridge analogue
+# ---------------------------------------------------------------------------------------------
+
+
+def _fock_helpers():
+    import sys
+
+    root = str(Path(__file__).resolve().parents[2])
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from tests.helpers import hubbard_fock
+
+    return hubbard_fock
+
+
+class ExactSector:
+    """Dense (N_up, N_dn)-sector Hamiltonian, ground energy and trot's Trotter split for small L."""
+
+    def __init__(self, h1, u, nelec, dt):
+        hf = _fock_helpers()
+        self.hf, self.nelec, self.dt = hf, tuple(nelec), dt
+        self.H = np.asarray(hf.hubbard_sector_hamiltonian(h1, u, *nelec))
+        self.E0 = float(np.linalg.eigvalsh(self.H)[0])
+        K = np.asarray(hf.hubbard_sector_hamiltonian(h1, 0.0, *nelec))
+        kv, kq = np.linalg.eigh(K)
+        self.half = (kq * np.exp(-0.5 * dt * kv)) @ kq.T  # e^{-dt K/2}
+        self.pot = np.exp(-dt * np.diag(self.H - K))  # e^{-dt U sum n_up n_dn}
+
+    def amplitudes(self, tensors):
+        return self.hf.mps_sector_amplitudes(tensors, *self.nelec).reshape(-1)
+
+    def walker_amplitudes(self, walker):
+        return self.hf.sd_amplitudes(np.asarray(walker[0]), np.asarray(walker[1])).reshape(-1)
+
+    def trotter_steps(self, v, n):
+        """n Trotter steps on v; returns (normalised v, log of the norm change)."""
+        log_norm = 0.0
+        for _ in range(n):
+            v = self.half @ (self.pot * (self.half @ v))
+            norm = np.linalg.norm(v)
+            v, log_norm = v / norm, log_norm + np.log(norm)
+        return v, log_norm
+
+
+def leak_test(state, *, t_amp, exact, advance, chunk, n_chunks):
+    """No-SR walk against the exact Trotterized projection of the actual start determinant.
+
+    advance(state) -> (state, o_over_g, h_over_g): chunk steps, walkers orthonormalised, the guide
+    overlaps recomputed, and per walker <T|phi>/g(phi) and <T|H|phi>/g(phi) (g = the propagation
+    guide; for a plain trial g = <T|phi>, so the parts are 1 and E_L). Exact importance sampling gives
+    E[mean w <T|phi>/g] = <T|e^{-tau(H - shift)}|phi0> / g(phi0), and the energy
+    sum w <T|H|phi>/g / sum w <T|phi>/g estimates E_mixed(tau). Returns one row per chunk.
+    """
+    shift = float(state.pop_control_ene_shift)
+    phi0 = exact.walker_amplitudes((state.walkers[0][0], state.walkers[1][0]))
+    g0 = float(state.overlaps[0])
+    v, log_norm, rows = phi0 / np.linalg.norm(phi0), np.log(np.linalg.norm(phi0)), []
+    for c in range(1, n_chunks + 1):
+        state, o_g, h_g = advance(state)
+        v, dlog = exact.trotter_steps(v, chunk)
+        log_norm += dlog
+        tau = c * chunk * exact.dt
+        z_exact = (t_amp @ v) * np.exp(log_norm + tau * shift) / g0
+        w, o_g, h_g = (np.asarray(x) for x in (state.weights, o_g, h_g))
+        tw = w * o_g
+        rows.append(
+            dict(
+                tau=tau,
+                norm_ratio=float(np.mean(tw) / z_exact),
+                energy=float(np.sum(w * h_g) / np.sum(tw) - exact.E0),
+                energy_exact=float((t_amp @ exact.H @ v) / (t_amp @ v) - exact.E0),
+                ess=float(np.sum(w) ** 2 / np.sum(w**2)),
+                max_over_mean=float(np.max(w) / np.mean(w)),
+                sign=float(np.sum(tw) / np.sum(np.abs(tw))),
+                nodes=int(state.node_encounters),
+            )
+        )
+        r = rows[-1]
+        print(
+            f"  leak tau {tau:4.1f}: norm ratio {r['norm_ratio']:.4f}  E-E0 {r['energy']:+.4f} "
+            f"(exact {r['energy_exact']:+.4f})  ESS {r['ess']:.0f}  max/mean {r['max_over_mean']:.1f}  "
+            f"sign {r['sign']:+.3f}  nodes {r['nodes']}",
+            flush=True,
+        )
+    return rows
+
+
+def leak_params(args, chunk):
+    from trot.prop.types import QmcParamsMps
+
+    return QmcParamsMps(
+        n_walkers=args.leak_walkers,
+        n_eql_blocks=0,
+        n_blocks=1,
+        dt=args.dt,
+        n_prop_steps=chunk,
+        weight_floor=args.floor,
+        weight_cap=float("inf"),
+        pop_control_damping=0.0,
+        seed=args.seed,
+        orbital_plan="maximal",
+        walker_channel_chi=None,
+        auto_n_chunks=False,
+        n_chunks=1,
+    )
+
+
+def mps_leak_test(ham, sys_, trial, exact, args, chunk=50):
+    """leak_test for an MpsTrial with trot's MPS CPMC step (the trial is the guide)."""
+    import jax
+    from jax import lax
+
+    from trot import walkers as wk
+    from trot.core.ops import k_energy
+    from trot.meas.mps import make_mps_meas_ops_hubbard
+    from trot.prop.mps_cpmc import make_prop_ops
+    from trot.trial.mps import make_mps_trial_ops, make_walker_plan
+
+    params = leak_params(args, chunk)
+    plan = make_walker_plan(ham, trial, sys_, params)
+    trial_ops, meas_ops = make_mps_trial_ops(plan), make_mps_meas_ops_hubbard(plan)
+    prop_ops = make_prop_ops(ham, sys_, plan)
+    meas_ctx = meas_ops.build_meas_ctx(ham, trial)
+    prop_ctx = prop_ops.build_prop_ctx(ham, None, params)
+    state = prop_ops.init_prop_state(
+        sys=sys_,
+        ham_data=ham,
+        trial_ops=trial_ops,
+        trial_data=trial,
+        meas_ops=meas_ops,
+        params=params,
+        meas_ctx=meas_ctx,
+    )
+    t_amp = exact.amplitudes(trial.tensors)
+    start = exact.walker_amplitudes((state.walkers[0][0], state.walkers[1][0]))
+    if abs(float(state.overlaps[0]) / (t_amp @ start) - 1.0) > 1e-8:
+        raise RuntimeError("the start determinant's MPS overlap is not exact")
+    overlap = jax.vmap(trial_ops.overlap, in_axes=(0, None))
+    energy = jax.vmap(meas_ops.kernels[k_energy], in_axes=(0, None, None, None))
+
+    @jax.jit
+    def advance(s):
+        def body(c, _):
+            c = prop_ops.step(
+                c,
+                params=params,
+                ham_data=ham,
+                trial_data=trial,
+                trial_ops=trial_ops,
+                meas_ops=meas_ops,
+                meas_ctx=meas_ctx,
+                prop_ctx=prop_ctx,
+            )
+            return c, None
+
+        s, _ = lax.scan(body, s, None, length=chunk)
+        walkers = wk.orthonormalize(s.walkers, "unrestricted")
+        s = s._replace(walkers=walkers, overlaps=overlap(walkers, trial))
+        e = energy(walkers, ham, meas_ctx, trial)
+        return s, jax.numpy.ones_like(e), e
+
+    n_chunks = int(round(args.leak_tau / (chunk * args.dt)))
+    return leak_test(
+        state, t_amp=t_amp, exact=exact, advance=advance, chunk=chunk, n_chunks=n_chunks
+    )
+
+
+def leak_summary(rows, spike=100.0):
+    by_tau = {round(r["tau"], 6): r for r in rows}
+    spikes = [r["tau"] for r in rows if r["max_over_mean"] > spike]
+    return dict(
+        norm_ratio_tau2=by_tau.get(2.0, {}).get("norm_ratio"),
+        norm_ratio_tau4=by_tau.get(4.0, {}).get("norm_ratio"),
+        min_ess_fraction=min(r["ess"] for r in rows) / max(rows[0]["ess"], 1.0),
+        max_weight_ratio=max(r["max_over_mean"] for r in rows),
+        first_spike_tau=spikes[0] if spikes else None,
+        min_sign=min(r["sign"] for r in rows),
+    )
+
+
+def ladder(args):
+    """For each DMRG trial chi: diagnostics, standard CPMC (plain and rotated) and the leak test."""
+    from trot.trial.mps import make_mps_trial, rotate_spin
+
+    out = Path(args.out)
+    blocks_path = out.with_name(out.stem + "_blocks.jsonl")
+    h1, ham, sys_ = hubbard_chain(args.L, args.U)
+    nelec = tuple(int(n) for n in sys_.nelec)
+    exact = ExactSector(h1, args.U, nelec, args.dt)
+    print(f"ladder L={args.L} U={args.U:g}: exact E0 {exact.E0:.10f}", flush=True)
+    for spec in args.chi:
+        chi = int(spec)
+        plain = dmrg(ham, sys_, chi).trial
+        rotated = make_mps_trial(rotate_spin(plain.tensors, R90), nelec=nelec, rdm1=plain.rdm1)
+        walls, _, _ = domain_walls(plain.rdm1)
+        p0 = diagnostics(plain.tensors, h1, args.U, exact.E0)["p0"]
+        variants = [("plain", plain)] + ([] if p0 > 0.999 else [("rotated", rotated)])
+        for variant, trial in variants:
+            tag = f"ladder_L{args.L}_U{args.U:g}_chi{chi}_{variant}_s{args.seed}"
+            record = dict(tag=tag, L=args.L, U=args.U, chi=chi, variant=variant, e_ref=exact.E0)
+            record.update(diagnostics(trial.tensors, h1, args.U, exact.E0))
+            record.update(walls=walls, trial_bond=max(trial.bond_dims))
+            print(
+                f"chi={chi} {variant}: E_var-E0 {record['e_var_error']:+.4f} p0 {record['p0']:.3f}",
+                flush=True,
+            )
+            record.update(run(ham, sys_, trial, args, tag, blocks_path))
+            record["bias"] = record["cpmc"] - exact.E0
+            rows = mps_leak_test(ham, sys_, trial, exact, args)
+            record.update(leak=rows, **leak_summary(rows))
+            with out.open("a") as stream:
+                stream.write(json.dumps(record) + "\n")
+            print(
+                f"RESULT chi={chi:3d} {variant:8s} E_var-E0 {record['e_var_error']:+.4f}  "
+                f"CPMC-E0 {record['bias']:+.5f} +/- {record['cpmc_error']:.5f}  nodes {record['nodes']}  "
+                f"norm ratio tau2 {record['norm_ratio_tau2']:.3f} tau4 {record['norm_ratio_tau4']:.3f}  "
+                f"max w/mean {record['max_weight_ratio']:.0f}",
+                flush=True,
+            )
+
+
+def plot_ladder(path, show=False):
+    """CPMC bias and the tau=2 weight leak against the trial's variational error, plain and rotated."""
+    import matplotlib
+
+    if not show:
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from trot.gmps.plot_cpmc_runs import INK, PALETTE
+
+    path = Path(path)
+    records = [json.loads(x) for x in path.read_text().splitlines() if x.strip()]
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11.0, 4.2))
+    for i, variant in enumerate(("plain", "rotated")):
+        rs = sorted((r for r in records if r["variant"] == variant), key=lambda r: r["e_var_error"])
+        if not rs:
+            continue
+        x = [r["e_var_error"] for r in rs]
+        ax1.errorbar(
+            x,
+            [r["bias"] for r in rs],
+            yerr=[r["cpmc_error"] for r in rs],
+            fmt="o-",
+            color=PALETTE[i],
+            capsize=3,
+            label=variant,
+        )
+        ax2.plot(x, [1 - r["norm_ratio_tau4"] for r in rs], "o-", color=PALETTE[i], label=variant)
+        labels = {}
+        for r in rs:  # identical trials (e.g. chi=5 and 6 at L=8) share one label
+            labels.setdefault((round(r["e_var_error"], 8), round(r["bias"], 8)), []).append(
+                r["chi"]
+            )
+        for (xv, yv), chis in labels.items():
+            ax1.annotate(
+                "χ=" + ",".join(map(str, chis)),
+                (xv, yv),
+                textcoords="offset points",
+                xytext=(4, 4),
+                fontsize=8,
+            )
+    ax1.axhline(0.0, color=INK, lw=1.2)
+    ax1.set_xscale("log")
+    ax1.set_xlabel("trial variational error E_var − E0")
+    ax1.set_ylabel("CPMC − E0")
+    ax1.set_title("CPMC bias", fontsize=14)
+    ax2.axhline(0.0, color=INK, lw=1.2)
+    ax2.set_xscale("log")
+    ax2.set_xlabel("trial variational error E_var − E0")
+    ax2.set_ylabel("weight missing at τ = 4 (1 − mean w / exact)")
+    ax2.set_title("Weight leak (no population control)", fontsize=14)
+    for ax in (ax1, ax2):
+        ax.legend(loc="upper left")
+    fig.suptitle(
+        f"L={records[0]['L']}, U={records[0]['U']:g}: how good must the one trial be?", fontsize=15
+    )
+    out = path.with_name(path.stem + "_ladder.png")
+    fig.savefig(out, dpi=200, bbox_inches="tight")
+    print(f"saved {out}")
+    if show:
+        plt.show()
+
+
+def dense_trial_ops(trial, exact, eps):
+    """The trial as a dense sector vector with the zero-free guide g = sqrt(<T|phi>^2 + eps^2 <T|H|phi>^2).
+
+    Returns (DenseTrial pytree, trial_ops, meas_ops, parts) where parts(walker) = (<T|phi>, <T|H|phi>).
+    eps = 0 gives g = |<T|phi>|, the plain importance function as long as no walker crosses a node.
+    """
+    from typing import NamedTuple
+
+    import jax
+    import jax.numpy as jnp
+    from jax import tree_util
+
+    from trot.core.ops import MeasOps, TrialOps, k_energy
+
+    hf = exact.hf
+    L = trial.norb
+    nup, ndn = exact.nelec
+    t = exact.amplitudes(trial.tensors)
+    rows_a = np.asarray(hf.sector_basis(L, nup)[0])
+    rows_b = np.asarray(hf.sector_basis(L, ndn)[0])
+    shape = (len(rows_a), len(rows_b))
+
+    @tree_util.register_pytree_node_class
+    class DenseTrial(NamedTuple):
+        t: jax.Array
+        ht: jax.Array
+        rdm1: jax.Array
+
+        def tree_flatten(self):
+            return (self.t, self.ht, self.rdm1), None
+
+        @classmethod
+        def tree_unflatten(cls, aux, children):
+            return cls(*children)
+
+    data = DenseTrial(
+        jnp.asarray(t.reshape(shape)),
+        jnp.asarray((exact.H @ t).reshape(shape)),
+        jnp.asarray(trial.rdm1),
+    )
+
+    def parts(walker, trial_data):
+        da = jnp.linalg.det(walker[0][rows_a])
+        db = jnp.linalg.det(walker[1][rows_b])
+        return da @ trial_data.t @ db, da @ trial_data.ht @ db
+
+    def guide(walker, trial_data):
+        o, h = parts(walker, trial_data)
+        return jnp.sqrt(o**2 + eps**2 * h**2)
+
+    def energy(walker, ham_data, meas_ctx, trial_data):
+        o, h = parts(walker, trial_data)
+        return h / o
+
+    trial_ops = TrialOps(overlap=jax.jit(guide), get_rdm1=lambda d: d.rdm1)
+    meas_ops = MeasOps(
+        overlap=jax.jit(guide),
+        build_meas_ctx=lambda h, d: None,
+        kernels={k_energy: jax.jit(energy)},
+    )
+    return data, trial_ops, meas_ops, parts
+
+
+def make_bridge_block(parts, sign0):
+    """blocks.block for the zero-free guide: energy = sum w <T|H|phi>/g / sum w <T|phi>/g, the block's
+    'weight' is the signed denominator (times the start overlap's sign, so it is positive while no walker has
+    crossed a node) and 'sign' its ratio to the unsigned one. Random stream and SR as in blocks.block.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax import lax
+
+    from trot import walkers as wk
+    from trot.prop.blocks import BlockObs
+
+    def block(
+        state,
+        *,
+        sys,
+        params,
+        ham_data,
+        trial_data,
+        trial_ops,
+        meas_ops,
+        meas_ctx,
+        prop_ops,
+        prop_ctx,
+        sr_fn=wk.stochastic_reconfiguration,
+        observable_names=(),
+    ):
+        def body(c, _):
+            c = prop_ops.step(
+                c,
+                params=params,
+                ham_data=ham_data,
+                trial_data=trial_data,
+                trial_ops=trial_ops,
+                meas_ops=meas_ops,
+                prop_ctx=prop_ctx,
+                meas_ctx=meas_ctx,
+            )
+            return c, None
+
+        state, _ = lax.scan(body, state, None, length=params.n_prop_steps)
+        walkers = wk.orthonormalize(state.walkers, sys.walker_kind)
+        g = jax.vmap(meas_ops.overlap, in_axes=(0, None))(walkers, trial_data)
+        o, h = jax.vmap(parts, in_axes=(0, None))(walkers, trial_data)
+        state = state._replace(walkers=walkers, overlaps=g)
+        w = state.weights
+        num, den, unsigned = jnp.sum(w * h / g), jnp.sum(w * o / g), jnp.sum(w * jnp.abs(o) / g)
+        e_block = num / den
+        alpha = jnp.asarray(params.shift_ema, dtype=jnp.result_type(e_block))
+        state = state._replace(e_estimate=(1.0 - alpha) * state.e_estimate + alpha * e_block)
+        key_next, key_sr = jax.random.split(state.rng_key)
+        zeta = jax.random.uniform(key_sr)
+        w_sr, weights_sr = sr_fn(state.walkers, state.weights, zeta, sys.walker_kind)
+        state = state._replace(
+            walkers=w_sr,
+            weights=weights_sr,
+            overlaps=jax.vmap(meas_ops.overlap, in_axes=(0, None))(w_sr, trial_data),
+            rng_key=key_next,
+        )
+        scalars = {"energy": e_block, "weight": sign0 * den, "sign": sign0 * den / unsigned}
+        return state, BlockObs(scalars=scalars, observables={})
+
+    return block
+
+
+def bridge(args):
+    """The bridge analogue on one trial (default chi=4): leak test and standard run for each eps."""
+    import jax
+    from jax import lax
+
+    from trot import walkers as wk
+    from trot.driver import run_qmc
+    from trot.prop import cpmc_slow
+    from trot.prop.types import QmcParams
+
+    out = Path(args.out)
+    blocks_path = out.with_name(out.stem + "_blocks.jsonl")
+    h1, ham, sys_ = hubbard_chain(args.L, args.U)
+    nelec = tuple(int(n) for n in sys_.nelec)
+    if args.L > 10:
+        raise SystemExit("--bridge uses dense sector vectors: L <= 10")
+    exact = ExactSector(h1, args.U, nelec, args.dt)
+    trial = dmrg(ham, sys_, args.bridge_chi).trial
+    print(
+        f"bridge L={args.L} U={args.U:g} chi={args.bridge_chi}: exact E0 {exact.E0:.10f}",
+        flush=True,
+    )
+    for eps in args.bridge:
+        data, trial_ops, meas_ops, parts = dense_trial_ops(trial, exact, eps)
+        prop_ops = cpmc_slow.make_prop_ops(ham, "unrestricted")
+        record = dict(L=args.L, U=args.U, chi=args.bridge_chi, eps=eps, e_ref=exact.E0)
+
+        # leak test: no SR, cap off, damping 0
+        chunk = 50
+        lp = leak_params(args, chunk)
+        pctx = prop_ops.build_prop_ctx(ham, None, lp)
+        state = prop_ops.init_prop_state(
+            sys=sys_,
+            ham_data=ham,
+            trial_ops=trial_ops,
+            trial_data=data,
+            meas_ops=meas_ops,
+            params=lp,
+            meas_ctx=None,
+        )
+
+        @jax.jit
+        def advance(s):
+            def body(c, _):
+                c = prop_ops.step(
+                    c,
+                    params=lp,
+                    ham_data=ham,
+                    trial_data=data,
+                    trial_ops=trial_ops,
+                    meas_ops=meas_ops,
+                    prop_ctx=pctx,
+                    meas_ctx=None,
+                )
+                return c, None
+
+            s, _ = lax.scan(body, s, None, length=chunk)
+            walkers = wk.orthonormalize(s.walkers, "unrestricted")
+            g = jax.vmap(meas_ops.overlap, in_axes=(0, None))(walkers, data)
+            o, h = jax.vmap(parts, in_axes=(0, None))(walkers, data)
+            return s._replace(walkers=walkers, overlaps=g), o / g, h / g
+
+        print(f"eps={eps:g}: leak test", flush=True)
+        n_chunks = int(round(args.leak_tau / (chunk * args.dt)))
+        rows = leak_test(
+            state,
+            t_amp=exact.amplitudes(trial.tensors),
+            exact=exact,
+            advance=advance,
+            chunk=chunk,
+            n_chunks=n_chunks,
+        )
+        record.update(leak=rows, **leak_summary(rows))
+
+        # standard run with SR and the bridge block
+        params = QmcParams(
+            n_walkers=args.walkers,
+            n_eql_blocks=args.eql,
+            n_blocks=args.blocks,
+            dt=args.dt,
+            n_prop_steps=args.steps,
+            weight_floor=args.floor,
+            seed=args.seed,
+        )
+        o0, _ = parts(
+            (
+                jax.numpy.asarray(np.asarray(state.walkers[0][0])),
+                jax.numpy.asarray(np.asarray(state.walkers[1][0])),
+            ),
+            data,
+        )
+        tag = f"bridge_L{args.L}_U{args.U:g}_chi{args.bridge_chi}_eps{eps:g}_s{args.seed}"
+        block_fn = make_bridge_block(parts, float(np.sign(o0)))
+        start = time.perf_counter()
+        result = run_qmc(
+            sys=sys_,
+            params=params,
+            ham_data=ham,
+            trial_data=data,
+            trial_ops=trial_ops,
+            meas_ops=meas_ops,
+            prop_ops=prop_ops,
+            prop_ctx=prop_ops.build_prop_ctx(ham, None, params),  # pyright: ignore
+            block_fn=block_logger(blocks_path, args.eql, tag, block_fn),
+        )
+        record.update(
+            tag=tag,
+            cpmc=float(result.mean_energy),
+            cpmc_error=float(result.stderr_energy),
+            seconds=time.perf_counter() - start,
+            n_walkers=args.walkers,
+        )
+        record["bias"] = record["cpmc"] - exact.E0
+        with out.open("a") as stream:
+            stream.write(json.dumps(record) + "\n")
+        print(
+            f"RESULT bridge eps={eps:g}: CPMC-E0 {record['bias']:+.5f} +/- {record['cpmc_error']:.5f}  "
+            f"leak norm ratio tau2 {record['norm_ratio_tau2']:.3f} tau4 {record['norm_ratio_tau4']:.3f}  "
+            f"max w/mean {record['max_weight_ratio']:.0f}  min sign {record['min_sign']:+.3f}  "
+            f"{record['seconds']:.0f} s",
+            flush=True,
+        )
+
+
 def self_test():
     """p_S on states with known spin, the 90-degree weight against the projection, and a 2-block run."""
     from trot.trial.mps import mps_trial_from_sd
@@ -489,6 +1026,96 @@ def self_test():
         summary = run(ham, sys_, rotated, args, "selftest", Path(directory) / "blocks.jsonl")
     assert np.isfinite(summary["cpmc"])
     print(f"self-test passed (2-block run: E = {summary['cpmc']:.6f})")
+    self_test_ladder_and_bridge()
+
+
+def self_test_ladder_and_bridge():
+    """Leak test exact at short tau; dense overlaps = MPS overlaps; eps = 0 bridge block = blocks.block."""
+    import jax
+    import jax.numpy as jnp
+
+    from trot.prop import blocks, cpmc_slow
+    from trot.prop.types import QmcParamsMps
+    from trot.trial.mps import make_mps_trial_ops, make_walker_plan
+
+    h1, ham, sys_ = hubbard_chain(8, 8.0)
+    exact = ExactSector(h1, 8.0, (4, 4), 0.01)
+    trial = dmrg(ham, sys_, 4).trial
+    args = argparse.Namespace(leak_walkers=2000, leak_tau=0.5, dt=0.01, floor=1e-8, seed=1)
+    rows = mps_leak_test(ham, sys_, trial, exact, args)
+    assert abs(rows[0]["norm_ratio"] - 1.0) < 5e-3, rows[0]
+    assert abs(rows[0]["energy"] - rows[0]["energy_exact"]) < 0.02, rows[0]
+
+    data, trial_ops, meas_ops, parts = dense_trial_ops(trial, exact, 0.0)
+    params = QmcParamsMps(
+        n_walkers=5,
+        dt=0.01,
+        n_prop_steps=5,
+        orbital_plan="maximal",
+        walker_channel_chi=None,
+        seed=3,
+    )
+    plan = make_walker_plan(ham, trial, sys_, params)
+    mps_ops = make_mps_trial_ops(plan)
+    hf = exact.hf
+    rdm1 = np.asarray(trial.rdm1)
+    from trot.trial.mps import natural_orbitals
+
+    Ra, Rb = natural_orbitals(rdm1[0], 4)[0], natural_orbitals(rdm1[1], 4)[0]
+    walkers = hf.random_field_walkers(h1, 8.0, 0.1, Ra, Rb, n=5, steps=10, seed=2)
+    for wa, wb in walkers:
+        w = (jnp.asarray(wa), jnp.asarray(wb))
+        o, _ = parts(w, data)
+        assert abs(float(o) / float(mps_ops.overlap(w, trial)) - 1.0) < 1e-10
+
+    prop_ops = cpmc_slow.make_prop_ops(ham, "unrestricted")
+    pctx = prop_ops.build_prop_ctx(ham, None, params)
+    state = prop_ops.init_prop_state(
+        sys=sys_,
+        ham_data=ham,
+        trial_ops=trial_ops,
+        trial_data=data,
+        meas_ops=meas_ops,
+        params=params,
+        meas_ctx=None,
+    )
+    o0, _ = parts((state.walkers[0][0], state.walkers[1][0]), data)
+    common = dict(
+        sys=sys_,
+        params=params,
+        ham_data=ham,
+        trial_data=data,
+        trial_ops=trial_ops,
+        meas_ops=meas_ops,
+        meas_ctx=None,
+        prop_ops=prop_ops,
+        prop_ctx=pctx,
+    )
+    s_bridge, obs_bridge = jax.jit(
+        lambda s: make_bridge_block(parts, float(np.sign(o0)))(s, **common)
+    )(state)
+    plain_meas = type(meas_ops)(
+        overlap=jax.jit(lambda w, d: parts(w, d)[0]),
+        build_meas_ctx=lambda h, d: None,
+        kernels=meas_ops.kernels,
+    )
+    plain_trial = type(trial_ops)(overlap=plain_meas.overlap, get_rdm1=trial_ops.get_rdm1)
+    common.update(trial_ops=plain_trial, meas_ops=plain_meas)
+    state_plain = state._replace(
+        overlaps=jax.vmap(plain_meas.overlap, in_axes=(0, None))(state.walkers, data)
+    )
+    s_plain, obs_plain = jax.jit(lambda s: blocks.block(s, **common))(state_plain)
+    assert abs(float(obs_bridge.scalars["energy"]) - float(obs_plain.scalars["energy"])) < 1e-12, (
+        float(obs_bridge.scalars["energy"]),
+        float(obs_plain.scalars["energy"]),
+    )
+    for a, b in zip(s_bridge.walkers, s_plain.walkers):
+        assert np.array_equal(np.asarray(a), np.asarray(b))
+    assert abs(float(obs_bridge.scalars["sign"]) - 1.0) < 1e-12
+    print(
+        f"self-test (ladder/bridge) passed: leak norm ratio at tau 0.5 = {rows[0]['norm_ratio']:.4f}; dense "
+        f"overlaps = MPS overlaps; eps=0 bridge block = blocks.block (E = {float(obs_plain.scalars['energy']):.10f})"
+    )
 
 
 def main():
@@ -537,8 +1164,27 @@ def main():
     )
     parser.add_argument("--out", default="rotated_trial_study.jsonl")
     parser.add_argument(
+        "--ladder",
+        action="store_true",
+        help="chi ladder (L <= 10): diagnostics, standard CPMC and the no-SR weight-leak test per --chi",
+    )
+    parser.add_argument(
+        "--bridge",
+        type=float,
+        nargs="*",
+        default=None,
+        metavar="EPS",
+        help="bridge analogue (L <= 10): zero-free guide sqrt(<T|phi>^2 + eps^2 <T|H|phi>^2)",
+    )
+    parser.add_argument(
+        "--bridge-chi", type=int, default=4, help="trial bond dimension for --bridge"
+    )
+    parser.add_argument("--leak-walkers", type=int, default=2000)
+    parser.add_argument("--leak-tau", type=float, default=4.0)
+    parser.add_argument(
         "--plot", metavar="JSONL", help="plot the runs of a results file instead of running"
     )
+    parser.add_argument("--plot-ladder", metavar="JSONL", help="plot a --ladder results file")
     parser.add_argument("--show", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
@@ -550,6 +1196,12 @@ def main():
         self_test()
     elif args.plot:
         plot(args.plot, args.show)
+    elif args.plot_ladder:
+        plot_ladder(args.plot_ladder, args.show)
+    elif args.ladder:
+        ladder(args)
+    elif args.bridge is not None:
+        bridge(args)
     else:
         study(args)
 

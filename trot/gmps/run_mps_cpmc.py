@@ -12,9 +12,14 @@ chi<chi>[_rot..].npz (the trial in the notebooks' format). The run tag and the f
 run_mps_sweep_gpu.py (chain) and run_sq_sweep_gpu.py (square lattice).
 
     python run_mps_cpmc.py --L 100 --U 8 --trial-chi 16 --chi-w 32 --walkers 400 --eql 200 --blocks 400 \\
-        --dt 0.005 --dmrg-sweeps 30 --trial-cache trial_cache_warm --out /mnt/ceph/.../L100_U8_warm
+        --dt 0.005 --dmrg-sweeps 30 --dmrg-init warm --trial-cache trial_cache_warm --out /mnt/ceph/.../L100_U8_warm
     python run_mps_cpmc.py --Lx 4 --Ly 4 --U 8 --trial-chi 256 --chi-w 32 --orbital-plan adaptive ...
     python run_mps_cpmc.py --Lx 8 --Ly 8 --U 8 --trial-chi 512 --dmrg-mpo terms --cache-htrial --prepare-only
+
+The DMRG trial starts from the Neel product state wherever h1 and the electron counts define one (--dmrg-init auto,
+the default; chains and bipartite lattices at half filling), else from a random MPS; its cache name ends in _neel.
+--dmrg-init random reproduces the earlier random-start trials and their cache names, and --dmrg-init warm loads a
+build_warm_trials.py trial (_warm) and never runs DMRG.
 
 --prepare-only builds (or loads) the DMRG trial and, with --cache-htrial, the block-form H|trial>, then stops: the
 CPU part of a large-lattice run, done once for every GPU run of that trial. --dmrg-reference runs a DMRG reference
@@ -62,6 +67,9 @@ def add_trial_arguments(group):
     """The trial's options except --trial-chi (one value here, several in the benchmark)."""
     group.add_argument("--dmrg-sweeps", type=int, default=None, help="default: 20 on a chain, 14 otherwise")
     group.add_argument("--dmrg-seed", type=int, default=0)
+    group.add_argument("--dmrg-init", default="auto", choices=["auto", "neel", "random", "warm"],
+                       help="DMRG initial state: auto = the Neel product state where defined, else random; warm = "
+                            "load a build_warm_trials.py trial (_warm) from --trial-cache, never run DMRG")
     group.add_argument("--dmrg-mpo", default=None, choices=["terms", "qc"], help="default: terms on a chain, qc else")
     group.add_argument("--dmrg-bdims", type=int, nargs="*", default=[], help="bond-dimension ramp (plain schedule)")
     group.add_argument("--dmrg-tol", type=float, default=None, help="default: none on a chain, 1e-6 otherwise")
@@ -167,8 +175,8 @@ def build_trial(args, h1, lattice, nelec, chi, *, rotate=True, say=print) -> Run
     clock, seconds = time.perf_counter, {}
     start = clock()
     dmrg = trials.load_or_make_dmrg_trial(h1, args.U, nelec, chi=chi, sweeps=dmrg_sweeps(args, lattice),
-                                          seed=args.dmrg_seed, cache_dir=args.trial_cache, mpo=args.dmrg_mpo,
-                                          bdims=tuple(args.dmrg_bdims),
+                                          seed=args.dmrg_seed, init=args.dmrg_init, cache_dir=args.trial_cache,
+                                          mpo=args.dmrg_mpo, bdims=tuple(args.dmrg_bdims),
                                           tol="default" if args.dmrg_tol is None else args.dmrg_tol, say=say)
     seconds["trial"] = clock() - start
     htrial, gamma, htrial_file = None, None, None
@@ -237,8 +245,12 @@ def main(argv=None):
     lattice = trials.describe_h1(h1)
     tag, rot = run_tag(args, lattice)
     if args.dmrg_reference:
+        if args.dmrg_init == "warm":
+            raise SystemExit("--dmrg-reference runs DMRG: --dmrg-init auto, neel or random")
         ramp = "-".join(map(str, args.dmrg_bdims)) if args.dmrg_bdims else str(args.trial_chi)
-        tag = f"dmrg_{lattice.name}_U{args.U:g}_chi{ramp}_sw{dmrg_sweeps(args, lattice)}_seed{args.dmrg_seed}"
+        init = trials.resolve_trial_init(args.dmrg_init, h1, electrons(args, lattice))
+        tag = (f"dmrg_{lattice.name}_U{args.U:g}_chi{ramp}_sw{dmrg_sweeps(args, lattice)}_seed{args.dmrg_seed}"
+               f"{trials.INIT_TAGS[init]}")
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     log = (out / f"{tag}.log").open("w")
@@ -258,27 +270,31 @@ def _dmrg_reference(args, h1, lattice, tag, out):
     """A DMRG reference energy for the lattice, as mps_cpmc_2d.py's dmrg mode wrote it: e_mps is <H> of the final
     MPS (variational), e_davidson the two-site energy before the last truncation."""
     from trot.gmps import driver, trials
-    from trot.gmps.dmrg import dmrg_h1, dmrg_schedule, lattice_dmrg_schedule
+    from trot.gmps.dmrg import dmrg_h1, dmrg_schedule, lattice_dmrg_schedule, neel_schedule
 
     nelec, sweeps = electrons(args, lattice), dmrg_sweeps(args, lattice)
     defaults = trials.dmrg_defaults(lattice)
     mpo = args.dmrg_mpo or defaults["mpo"]
     schedule = "plain" if args.dmrg_bdims else defaults["schedule"]
     tol = defaults["tol"] if args.dmrg_tol is None else args.dmrg_tol
+    init = trials.resolve_trial_init(args.dmrg_init, h1, nelec)
     if lattice.kind == "square":  # the line plot_cpmc_2d_runs.py reads the model from
         print(f"{lattice.Lx}x{lattice.Ly} lattice, boundaries x={lattice.boundary_x} y={lattice.boundary_y}, "
               f"({nelec[0]},{nelec[1]}), U={args.U}")
     else:
         print(f"{lattice.name} ({lattice.kind}, {lattice.n_sites} sites), ({nelec[0]},{nelec[1]}), U={args.U}")
-    bdims = (lattice_dmrg_schedule(args.trial_chi, sweeps, tuple(args.dmrg_bdims)) if schedule == "plain"
-             else dmrg_schedule(args.trial_chi, sweeps))[0]
-    print(f"DMRG reference {tag}: {mpo} MPO, {schedule} schedule, bond dimensions {bdims}, tol {tol}", flush=True)
+    if schedule == "plain":
+        bdims = lattice_dmrg_schedule(args.trial_chi, sweeps, tuple(args.dmrg_bdims))[0]
+    else:
+        bdims = (neel_schedule if init == "neel" else dmrg_schedule)(args.trial_chi, sweeps)[0]
+    print(f"DMRG reference {tag}: {mpo} MPO, {schedule} schedule, bond dimensions {bdims}, tol {tol}, start "
+          f"{init}", flush=True)
     start = time.perf_counter()
     tensors, _, davidson, sweep_energies, variational = dmrg_h1(
-        h1, args.U, nelec, chi=args.trial_chi, n_sweeps=sweeps, seed=args.dmrg_seed, mpo=mpo, schedule=schedule,
-        bdims=tuple(args.dmrg_bdims), tol=tol, iprint=0)
+        h1, args.U, nelec, chi=args.trial_chi, n_sweeps=sweeps, seed=args.dmrg_seed, init=init, mpo=mpo,
+        schedule=schedule, bdims=tuple(args.dmrg_bdims), tol=tol, iprint=0)
     record = dict(kind="dmrg", tag=tag, **lattice.record(), n_up=nelec[0], n_down=nelec[1], interaction=args.U,
-                  trial_chi=args.trial_chi, dmrg_sweeps=sweeps, dmrg_seed=args.dmrg_seed, dmrg_mpo=mpo,
+                  trial_chi=args.trial_chi, dmrg_sweeps=sweeps, dmrg_seed=args.dmrg_seed, dmrg_init=init, dmrg_mpo=mpo,
                   dmrg_schedule=schedule, dmrg_tol=tol, bdims=list(bdims), e_davidson=davidson, e_mps=variational,
                   sweep_energies=sweep_energies,
                   bond_dims=[int(A.shape[0]) for A in tensors] + [int(tensors[-1].shape[-1])],
@@ -311,7 +327,7 @@ def _run(args, h1, lattice, tag, rot, out):
 
     built = build_trial(args, h1, lattice, nelec, args.trial_chi, rotate=not args.prepare_only)
     dmrg, trial, trial_info, htrial, htrial_file, setup = built
-    print(f"DMRG trial: Davidson energy {dmrg.davidson_energy:.12f}"
+    print(f"DMRG trial ({dmrg.init} start): Davidson energy {dmrg.davidson_energy:.12f}"
           + ("" if dmrg.variational_energy is None else f", variational {dmrg.variational_energy:.12f}"), flush=True)
     if args.prepare_only:
         print(f"prepared {tag}: trial {'and H|trial> ' if args.cache_htrial else ''}ready "
@@ -357,7 +373,8 @@ def _run(args, h1, lattice, tag, rot, out):
     if args.save_walkers:
         snap_config = dict(L=n, N_UP=nelec[0], N_DN=nelec[1], T=lattice.hopping, U=args.U, N_WALKERS=args.walkers,
                            N_EQL=args.eql, N_BLOCKS=args.blocks, N_PROP=args.steps, DT=args.dt, SEED=args.seed,
-                           DMRG_CHI_T=args.trial_chi, DMRG_SWEEPS=sweeps, CHI_PROP=params.walker_channel_chi,
+                           DMRG_CHI_T=args.trial_chi, DMRG_SWEEPS=sweeps, DMRG_INIT=dmrg.init,
+                           CHI_PROP=params.walker_channel_chi,
                            E_DMRG=dmrg.davidson_energy, E_TRIAL=run.info["trial_energy"],
                            plan_reference=args.plan_reference, walker_start=args.walker_start,
                            orbital_plan=args.orbital_plan, EPS=params.occupation_tolerance, trial_file=trial_export,
@@ -388,8 +405,8 @@ def _run(args, h1, lattice, tag, rot, out):
                               start_up=start_det[0], start_dn=start_det[1], h1=h1))
     record = dict(
         kind="mps_cpmc", tag=tag, **lattice.record(), n_up=nelec[0], n_down=nelec[1], interaction=args.U,
-        trial_chi=args.trial_chi, dmrg_sweeps=sweeps, dmrg_seed=args.dmrg_seed, dmrg_mpo=args.dmrg_mpo,
-        dmrg_bdims=list(args.dmrg_bdims), walker_channel_chi=params.walker_channel_chi,
+        trial_chi=args.trial_chi, dmrg_sweeps=sweeps, dmrg_seed=args.dmrg_seed, dmrg_init=dmrg.init,
+        dmrg_mpo=args.dmrg_mpo, dmrg_bdims=list(args.dmrg_bdims), walker_channel_chi=params.walker_channel_chi,
         orbital_plan=args.orbital_plan, occupation_tolerance=params.occupation_tolerance,
         plan_reference=args.plan_reference, walker_start=args.walker_start, n_walkers=args.walkers,
         n_equilibration=args.eql, n_blocks=args.blocks, n_steps=args.steps, dt=args.dt,

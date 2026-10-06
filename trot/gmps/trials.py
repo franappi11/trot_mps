@@ -5,8 +5,10 @@ other step is the same code for a chain, a square lattice or any other h1:
 
 * describe_h1(h1): open/periodic chain, Lx x Ly square lattice (open, periodic or antiperiodic sides, site
   x * Ly + y) or a general h1 (named by a hash).
-* load_or_make_dmrg_trial(...): pyblock3 DMRG trial (trot.gmps.dmrg.dmrg_h1) with a file cache. The file names of
-  mps_cpmc_gpu (chain) and mps_cpmc_2d_gpu (square lattice) are kept, so their caches load as they are.
+* load_or_make_dmrg_trial(...): pyblock3 DMRG trial (trot.gmps.dmrg.dmrg_h1) with a file cache. The DMRG starts
+  from the Neel product state wherever h1 and nelec define one (init="auto"), else from a random MPS. The file names
+  of mps_cpmc_gpu (chain) and mps_cpmc_2d_gpu (square lattice) are kept for random starts, so their caches load as
+  they are; Neel starts add _neel, and init="warm" only loads a build_warm_trials.py trial (_warm).
 * make_trial(...): the MpsTrial a run uses: optionally spin-rotated by exp(-i beta S^y), projected
   onto the walkers' sector or used as it is, with the rdm1 whose natural orbitals set the walker plan and start.
 * export_trial(...): the trial in the notebooks' npz format.
@@ -26,6 +28,7 @@ from typing import NamedTuple
 
 import numpy as np
 
+from trot.gmps.dmrg import DMRG_INITS, dmrg_h1, resolve_init
 from trot.ham.hubbard import hopping_matrix, square_hopping_matrix
 from trot.meas.mps import CHANNEL_CHARGE, apply_mpo, compress_mps, hubbard_mpo_from_h1
 from trot.trial.mps import (
@@ -114,18 +117,36 @@ def dmrg_defaults(lattice: Lattice) -> dict:
 # ---------------------------------------------------------------------------------------------
 
 
+# DMRG initial states of a trial: trot.gmps.dmrg's (auto, neel, random) and "warm", a wall-free trial of
+# build_warm_trials.py that is only ever loaded. The cache name records the start (random keeps the old names).
+TRIAL_INITS = DMRG_INITS + ("warm",)
+INIT_TAGS = {"random": "", "neel": "_neel", "warm": "_warm"}
+
+
+def resolve_trial_init(init, h1, nelec) -> str:
+    """The start a trial is made from: "neel" or "random" (trot.gmps.dmrg.resolve_init; "auto" is "neel" where h1
+    and nelec define a Neel state) or "warm"."""
+    if init not in TRIAL_INITS:
+        raise ValueError(f"init must be one of {TRIAL_INITS}, got {init!r}")
+    return "warm" if init == "warm" else resolve_init(init, h1, nelec)[0]
+
+
 class DmrgTrialData(NamedTuple):
     tensors: list
     charges: tuple
     davidson_energy: float  # two-site energy before the last truncation, not variational
     variational_energy: float | None  # <mps|H|mps>/<mps|mps> (None in old chain cache files)
     path: Path | None  # the cache file, if any
+    init: str = "random"  # the DMRG start: "neel", "random" or "warm"
 
 
 def trial_cache_file(cache_dir, lattice: Lattice, nelec, u, *, chi, sweeps, seed=0, mpo, schedule, bdims=(),
-                     tol=None) -> Path:
+                     tol=None, init) -> Path:
     """Cache file name of a DMRG trial: mps_cpmc_gpu's for an open chain with the chain defaults, mps_cpmc_2d_gpu's
-    otherwise (lattice name, schedule, tolerance and MPO in the name)."""
+    otherwise (lattice name, schedule, tolerance and MPO in the name); init (resolved: "neel", "random" or "warm")
+    adds INIT_TAGS[init]."""
+    if init not in INIT_TAGS:
+        raise ValueError(f"init must be resolved to one of {tuple(INIT_TAGS)} (resolve_trial_init), got {init!r}")
     nup, ndn = (int(x) for x in nelec)
     t, n = lattice.hopping, lattice.n_sites
     open_chain = lattice.name == f"L{n}"
@@ -138,15 +159,17 @@ def trial_cache_file(cache_dir, lattice: Lattice, nelec, u, *, chi, sweeps, seed
         # the qc MPO is the unnamed default except on an open chain, where the unnamed name is the chain default's
         name += f"_seed{seed}" + ("" if mpo == "qc" and not open_chain else f"_mpo{mpo}")
         name += "" if schedule == "plain" else f"_{schedule}"
-    return Path(cache_dir) / f"{name}.npz"
+    return Path(cache_dir) / f"{name}{INIT_TAGS[init]}.npz"
 
 
-def load_or_make_dmrg_trial(h1, u, nelec, *, chi, sweeps, seed=0, cache_dir="", mpo=None, schedule=None, bdims=(),
-                            tol="default", say=print) -> DmrgTrialData:
+def load_or_make_dmrg_trial(h1, u, nelec, *, chi, sweeps, seed=0, init="auto", cache_dir="", mpo=None, schedule=None,
+                            bdims=(), tol="default", say=print) -> DmrgTrialData:
     """The DMRG trial of HamHubbard(h1, u) at nelec: read from cache_dir when present, else made by
-    trot.gmps.dmrg.dmrg_h1 (pyblock3, imported only then) and written there. mpo, schedule and tol default to
+    trot.gmps.dmrg.dmrg_h1 (pyblock3, imported only then) and written there. init: "auto" (the Neel product state
+    where defined, else random), "neel", "random" or "warm" (load only). mpo, schedule and tol default to
     dmrg_defaults(describe_h1(h1)). A cached file that stores h1 must match this h1."""
     h1 = np.asarray(h1, dtype=float)
+    init = resolve_trial_init(init, h1, nelec)
     lattice = describe_h1(h1)
     defaults = dmrg_defaults(lattice)
     mpo = mpo or defaults["mpo"]
@@ -156,7 +179,7 @@ def load_or_make_dmrg_trial(h1, u, nelec, *, chi, sweeps, seed=0, cache_dir="", 
     path = None
     if cache_dir:
         path = trial_cache_file(cache_dir, lattice, nelec, u, chi=chi, sweeps=sweeps, seed=seed, mpo=mpo,
-                                schedule=schedule, bdims=tuple(bdims), tol=tol)
+                                schedule=schedule, bdims=tuple(bdims), tol=tol, init=init)
     if path is not None and path.exists():
         with np.load(path) as data:
             if "h1" in data.files and not _same(np.asarray(data["h1"]), h1):
@@ -166,21 +189,24 @@ def load_or_make_dmrg_trial(h1, u, nelec, *, chi, sweeps, seed=0, cache_dir="", 
             davidson = float(data["energy"])
             variational = float(data["mps_energy"]) if "mps_energy" in data.files else None
         say(f"trial loaded from {path}", flush=True)
-        return DmrgTrialData(tensors, charges, davidson, variational, path)
+        return DmrgTrialData(tensors, charges, davidson, variational, path, init)
+    if init == "warm":
+        where = "no cache_dir is given" if path is None else f"{path} does not exist"
+        raise FileNotFoundError(f"init='warm' loads a build_warm_trials.py trial, but {where}")
 
-    from trot.gmps.dmrg import dmrg_h1
-
+    say(f"DMRG trial from the {'Neel product state' if init == 'neel' else 'random MPS'}", flush=True)
     tensors, charges, davidson, sweep_energies, variational = dmrg_h1(
-        h1, u, nelec, chi=chi, n_sweeps=sweeps, seed=seed, mpo=mpo, schedule=schedule, bdims=tuple(bdims), tol=tol)
+        h1, u, nelec, chi=chi, n_sweeps=sweeps, seed=seed, init=init, mpo=mpo, schedule=schedule, bdims=tuple(bdims),
+        tol=tol)
     if path is not None:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f"{path.stem}.{os.getpid()}.tmp.npz")
         np.savez(tmp, energy=davidson, mps_energy=variational, sweep_energies=np.asarray(sweep_energies), h1=h1,
-                 dmrg_mpo=mpo, **{f"A{i}": A for i, A in enumerate(tensors)},
+                 dmrg_mpo=mpo, dmrg_init=init, **{f"A{i}": A for i, A in enumerate(tensors)},
                  **{f"q{i}": q for i, q in enumerate(charges)})
         os.replace(tmp, path)
         say(f"trial saved to {path}", flush=True)
-    return DmrgTrialData(tensors, charges, davidson, variational, path)
+    return DmrgTrialData(tensors, charges, davidson, variational, path, init)
 
 
 # ---------------------------------------------------------------------------------------------

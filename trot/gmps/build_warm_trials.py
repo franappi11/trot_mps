@@ -3,10 +3,10 @@
 Random-start DMRG at small bond on long chains converges to states with domain walls of the staggered
 magnetisation (see rotated_dmrg_trial_study.warm_dmrg). This script runs DMRG at --warm (random start),
 compresses that state to each --chi, re-optimises it there, and saves every trial as
-<out>/L{L}_n{N_up}-{N_dn}_t{t}_U{U}_chi{chi}_sw{sweeps}_seed{seed}.npz, the chain cache name of
-trot.gmps.trials.trial_cache_file, with the keys it reads (A{i}, q{i}, energy) plus a description. Point
-run_mps_cpmc.py at the directory with --trial-cache <out>; --dmrg-sweeps and --dmrg-seed must match --sweeps
-and --seed.
+<out>/L{L}_n{N_up}-{N_dn}_t{t}_U{U}_chi{chi}_sw{sweeps}_seed{seed}_warm.npz, the chain cache name of
+trot.gmps.trials.trial_cache_file with init="warm", with the keys it reads (A{i}, q{i}, energy) plus a
+description. Point run_mps_cpmc.py at the directory with --dmrg-init warm --trial-cache <out>; --dmrg-sweeps and
+--dmrg-seed must match --sweeps and --seed. (The Neel start, run_mps_cpmc.py's default, is wall-free as well.)
 
     ~/.trot/bin/python trot/gmps/build_warm_trials.py --L 100 --U 8 --chi 8 16 --warm 32 \\
         --out trot/gmps/trial_cache_warm
@@ -48,6 +48,8 @@ def main():
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from rotated_dmrg_trial_study import diagnostics, domain_walls, hubbard_chain, warm_dmrg
 
+    from trot.gmps import trials
+
     if args.t != 1.0:
         raise SystemExit("only t = 1 (hubbard_chain) is supported")
     h1, ham, sys_ = hubbard_chain(args.L, args.U)
@@ -59,7 +61,8 @@ def main():
         trial = warm_dmrg(ham, sys_, chi, args.warm, seed=args.seed, warm_sweeps=args.warm_sweeps)
         d = diagnostics(trial.tensors, h1, args.U, args.reference or 0.0)
         walls, max_m, _ = domain_walls(trial.rdm1)
-        name = f"L{args.L}_n{nup}-{ndn}_t{args.t:g}_U{args.U:g}_chi{chi}_sw{args.sweeps}_seed{args.seed}.npz"
+        name = trials.trial_cache_file(out, trials.describe_h1(h1), (nup, ndn), args.U, chi=chi, sweeps=args.sweeps,
+                                       seed=args.seed, mpo="terms", schedule="warmup", init="warm").name
         info = dict(
             built_by="warm_dmrg",
             chi=chi,

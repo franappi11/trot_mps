@@ -59,6 +59,7 @@ parser.add_argument("--t", type=float, default=1.0)
 parser.add_argument("--trial-chi", type=int, required=True)
 parser.add_argument("--dmrg-sweeps", type=int, default=30, help="as the L = 100 CPMC runs")
 parser.add_argument("--dmrg-seed", type=int, default=0)
+parser.add_argument("--dmrg-init", default="auto", choices=trials.TRIAL_INITS, help="as run_mps_cpmc.py")
 parser.add_argument("--nodes", type=int, default=64, help="Gauss-Legendre nodes in cos(beta)")
 parser.add_argument("--trial-cache", default=str(HERE / "trial_cache"))
 parser.add_argument("--out", default=str(HERE / "trial_spin_check"))
@@ -139,12 +140,14 @@ def site_expectations(tensors, O):
 
 # ---- the trial, as the CPMC runs load it
 h1 = hopping_matrix(L, args.t)
+init = trials.resolve_trial_init(args.dmrg_init, h1, (N_UP, N_DN))
 trial_file = trials.trial_cache_file(args.trial_cache, trials.describe_h1(h1), (N_UP, N_DN), U, chi=CHI,
-                                     sweeps=args.dmrg_sweeps, seed=args.dmrg_seed, mpo="terms", schedule="warmup")
+                                     sweeps=args.dmrg_sweeps, seed=args.dmrg_seed, mpo="terms", schedule="warmup",
+                                     init=init)
 if not trial_file.exists():
     raise SystemExit(f"no cached trial {trial_file}; this script does not run DMRG")
 cached = trials.load_or_make_dmrg_trial(h1, U, (N_UP, N_DN), chi=CHI, sweeps=args.dmrg_sweeps, seed=args.dmrg_seed,
-                                        cache_dir=args.trial_cache)
+                                        init=init, cache_dir=args.trial_cache)
 psi, e_dmrg = [np.array(A) for A in cached.tensors], cached.davidson_energy
 norm = overlap(psi, psi)
 psi[0] = psi[0] / np.sqrt(norm)

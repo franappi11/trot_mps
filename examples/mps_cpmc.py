@@ -12,7 +12,6 @@ config.configure_once()
 from trot.core.system import System
 from trot.driver import run_qmc
 from trot.gmps.dmrg import make_dmrg_trial
-from trot.gmps.driver import run_qmc_mps
 from trot.ham.hubbard import HamHubbard, hopping_matrix
 from trot.meas.mps import make_mps_meas_ops_hubbard
 from trot.prop import mps_cpmc
@@ -34,12 +33,7 @@ params = QmcParamsMps(
     walker_channel_chi=4,
 )
 
-# One call: pyblock3 DMRG trial, then trot's run_qmc.
-run = run_qmc_mps(sys=sys, params=params, ham_data=ham)
-
-# The same run assembled from trot's modules, as for any trial. trial_data can also be mps_trial_from_sd(Ca, Cb),
-# a spin-rotated MPS through make_mps_trial(tensors, nelec=...) (used as it is, particle-number labels) or
-# trot.trial.mps_rotation.rotate_mps_trial(trial, R) (rotated straight into the walkers' sector).
+# Call pyblock3 drmg to initilize the trial and the Hamiltonian MPO
 trial = make_dmrg_trial(ham, sys, chi=params.trial_chi, n_sweeps=params.dmrg_sweeps).trial
 plan = make_walker_plan(ham, trial, sys, params)  # the walker conversion, frozen on the trial's natural orbitals
 trial_ops = make_mps_trial_ops(plan)

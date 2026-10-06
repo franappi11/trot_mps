@@ -8,7 +8,8 @@ runs on both: an 8-site chain (open, antiperiodic) and a 2 x 4 lattice (open, pe
 closed shells, so the natural orbitals and the walkers' start are unique.
 
 References are exact enumeration (tests/helpers/hubbard_fock.py) and trot's generic block (trot.prop.blocks.block)
-driving the same ops. test_mps_unified_legacy.py compares this path with the scripts it replaces.
+driving the same ops. The DMRG trials start from the Neel product state (the default; every case is bipartite at half
+filling).
 """
 
 from trot import config
@@ -154,22 +155,65 @@ def test_lattice_record_has_the_plot_keys():
 
 
 def test_trial_cache_names_keep_the_production_names():
-    """The names the production caches have (trial_cache_warm/L100_..., the 2D caches); no two options share one."""
+    """The names the production caches have (trial_cache/L100_..., the 2D caches: random starts; Neel starts add
+    _neel, build_warm_trials.py's trials _warm); no two options share one."""
     chain = trials.describe_h1(hopping_matrix(100, 1.0))
     sq = trials.describe_h1(square_hopping_matrix(4, 4, 1.0))
     big = trials.describe_h1(square_hopping_matrix(8, 8, 1.0))
-    name = lambda lattice, nelec, u, **kw: trials.trial_cache_file("c", lattice, nelec, u, **kw).name
-    assert name(chain, (50, 50), 8.0, chi=16, sweeps=30, mpo="terms", schedule="warmup") \
-        == "L100_n50-50_t1_U8_chi16_sw30_seed0.npz"
+    name = lambda lattice, nelec, u, init="random", **kw: trials.trial_cache_file("c", lattice, nelec, u, init=init,
+                                                                                  **kw).name
+    chain_options = dict(chi=16, sweeps=30, mpo="terms", schedule="warmup")
+    assert name(chain, (50, 50), 8.0, **chain_options) == "L100_n50-50_t1_U8_chi16_sw30_seed0.npz"
+    assert name(chain, (50, 50), 8.0, "neel", **chain_options) == "L100_n50-50_t1_U8_chi16_sw30_seed0_neel.npz"
+    assert name(chain, (50, 50), 8.0, "warm", **chain_options) == "L100_n50-50_t1_U8_chi16_sw30_seed0_warm.npz"
     assert name(sq, (8, 8), 8.0, chi=256, sweeps=14, mpo="qc", schedule="plain", tol=1e-6) \
         == "sq4x4oo_n8-8_t1_U8_chi256_sw14_tol1e-06_seed0.npz"
+    assert name(sq, (8, 8), 8.0, "neel", chi=256, sweeps=14, mpo="qc", schedule="plain", tol=1e-6) \
+        == "sq4x4oo_n8-8_t1_U8_chi256_sw14_tol1e-06_seed0_neel.npz"
     assert name(big, (32, 32), 8.0, chi=512, sweeps=20, mpo="terms", schedule="plain", bdims=(128, 256, 512),
                 tol=1e-6) == "sq8x8oo_n32-32_t1_U8_chi128-256-512_sw20_tol1e-06_seed0_mpoterms.npz"
     chain8 = trials.describe_h1(hopping_matrix(8, 1.0))
-    options = [dict(mpo=m, schedule=s, tol=t) for m in ("terms", "qc") for s in ("warmup", "plain")
-               for t in (None, 1e-6)]
+    options = [dict(mpo=m, schedule=s, tol=t, init=i) for m in ("terms", "qc") for s in ("warmup", "plain")
+               for t in (None, 1e-6) for i in ("random", "neel", "warm")]
     names = {name(chain8, (4, 4), 4.0, chi=16, sweeps=8, **o) for o in options}
     assert len(names) == len(options)
+    with pytest.raises(ValueError, match="resolve"):  # "auto" is resolved first (resolve_trial_init)
+        name(chain8, (4, 4), 4.0, "auto", chi=16, sweeps=8, mpo="terms", schedule="warmup")
+
+
+def test_neel_states_on_bipartite_lattices_and_the_fallback():
+    """neel_states 2-colours h1 (chain: alternating; square lattice x * Ly + y: checkerboard), swaps the colours to
+    match nelec, and is None for a frustrated h1 or a filling the Neel state does not have; "auto" then falls back
+    to a random start and "neel" refuses. No pyblock3 needed."""
+    from trot.gmps.dmrg import neel_states, resolve_init
+
+    np.testing.assert_array_equal(neel_states(hopping_matrix(6, 1.0), (3, 3)), [1, 2, 1, 2, 1, 2])
+    x, y = np.divmod(np.arange(8), 4)
+    checkerboard = np.where((x + y) % 2 == 0, 1, 2)
+    for h1 in (square_hopping_matrix(2, 4, 1.0), square_hopping_matrix(2, 4, 1.0, "open", "periodic"),
+               square_hopping_matrix(2, 4, 1.0, "open", "antiperiodic")):
+        np.testing.assert_array_equal(neel_states(h1, (4, 4)), checkerboard)
+    np.testing.assert_array_equal(neel_states(hopping_matrix(5, 1.0), (2, 3)), [2, 1, 2, 1, 2])
+    odd_ring = square_hopping_matrix(5, 1, 1.0, "periodic", "open")
+    for h1, nelec in ((odd_ring, (2, 3)), (hopping_matrix(6, 1.0), (2, 2))):
+        assert neel_states(h1, nelec) is None
+        assert resolve_init("auto", h1, nelec) == ("random", None)
+        with pytest.raises(ValueError, match="no Neel"):
+            resolve_init("neel", h1, nelec)
+    assert resolve_init("random", hopping_matrix(6, 1.0), (3, 3)) == ("random", None)
+    assert trials.resolve_trial_init("auto", hopping_matrix(6, 1.0), (3, 3)) == "neel"
+    assert trials.resolve_trial_init("warm", hopping_matrix(6, 1.0), (3, 3)) == "warm"
+    with pytest.raises(ValueError):
+        trials.resolve_trial_init("neal", hopping_matrix(6, 1.0), (3, 3))
+
+
+def test_trials_and_dmrg_import_without_pyblock3():
+    """Cache names (and so loading a cached trial) need no pyblock3: trot.gmps.dmrg imports it only to run DMRG."""
+    import subprocess
+    import sys
+
+    code = "import sys, trot.gmps.trials, trot.gmps.dmrg; assert 'pyblock3' not in sys.modules, 'pyblock3 imported'"
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -183,7 +227,8 @@ def test_dmrg_trial_cache_round_trip_and_h1_check(tmp_path):
     messages = []
     say = lambda message, **kw: messages.append(message)
     made = trials.load_or_make_dmrg_trial(h1, U, (3, 3), chi=8, sweeps=4, cache_dir=tmp_path, say=say)
-    assert made.path == tmp_path / "L6_n3-3_t1_U4_chi8_sw4_seed0.npz" and made.path.exists()
+    assert made.path == tmp_path / "L6_n3-3_t1_U4_chi8_sw4_seed0_neel.npz" and made.path.exists()
+    assert made.init == "neel" and "DMRG trial from the Neel product state" in messages
     loaded = trials.load_or_make_dmrg_trial(h1, U, (3, 3), chi=8, sweeps=4, cache_dir=tmp_path, say=say)
     assert messages[-1].startswith("trial loaded from")
     for a, b in zip(made.tensors, loaded.tensors):
@@ -199,10 +244,48 @@ def test_dmrg_trial_cache_round_trip_and_h1_check(tmp_path):
     np.savez(made.path, **{**arrays, "h1": 2.0 * h1})
     with pytest.raises(ValueError, match="different h1"):
         trials.load_or_make_dmrg_trial(h1, U, (3, 3), chi=8, sweeps=4, cache_dir=tmp_path, say=say)
-    old = {k: v for k, v in arrays.items() if k not in ("h1", "mps_energy", "sweep_energies", "dmrg_mpo")}
+    old = {k: v for k, v in arrays.items()
+           if k not in ("h1", "mps_energy", "sweep_energies", "dmrg_mpo", "dmrg_init")}
     np.savez(made.path, **old)  # the chain cache files of mps_cpmc_gpu: no h1, no variational energy
     loaded = trials.load_or_make_dmrg_trial(h1, U, (3, 3), chi=8, sweeps=4, cache_dir=tmp_path, say=say)
     assert loaded.variational_energy is None and loaded.davidson_energy == made.davidson_energy
+
+
+def test_neel_product_mps_is_the_neel_determinant():
+    """product_mps(neel_states) is the Neel basis state (norm 1, one amplitude, the Neel densities), for the
+    Hamiltonian of the term-built MPO (u=None) and of the qc MPO (dense g2) alike."""
+    pytest.importorskip("pyblock3")
+    from trot.gmps.dmrg import make_pyblock3_hamiltonian, neel_states, product_mps
+    from trot.gmps.utils import densify_with_charges
+
+    h1 = CASES["sq2x4oo"]
+    states = neel_states(h1, NELEC)
+    for u in (None, U):
+        tensors, _ = densify_with_charges(product_mps(make_pyblock3_hamiltonian(h1, NELEC, u=u), states), 8)
+        amplitudes = np.asarray(hf.mps_sector_amplitudes(tensors, *NELEC)).ravel()
+        assert np.sum(amplitudes**2) == pytest.approx(1.0, abs=1e-12)
+        assert np.max(np.abs(amplitudes)) == pytest.approx(1.0, abs=1e-12)
+        densities = np.stack([np.diag((states == 1).astype(float)), np.diag((states == 2).astype(float))])
+        np.testing.assert_allclose(np.stack(one_rdm(tensors)), densities, atol=1e-12)
+
+
+@pytest.mark.parametrize("init", ["neel", "random"])
+def test_dmrg_h1_and_make_dmrg_trial_run_the_same_dmrg(init):
+    """On a chain with the warm-up schedule, dmrg_h1 (the cached trials) and make_dmrg_trial (run_qmc_mps) start
+    alike ("auto" = Neel here) and give the same energies; the result is variational."""
+    pytest.importorskip("pyblock3")
+    from trot.gmps.dmrg import dmrg_h1, make_dmrg_trial
+
+    h1 = CASES["L8"]
+    system = System(norb=8, nelec=NELEC, walker_kind="unrestricted")
+    made = make_dmrg_trial(HamHubbard(h1=jnp.asarray(h1), u=U), system, chi=CHI, n_sweeps=SWEEPS,
+                           init="auto" if init == "neel" else init)
+    assert made.init == init
+    _, _, davidson, _, variational = dmrg_h1(h1, U, NELEC, chi=CHI, n_sweeps=SWEEPS, init=init)
+    assert davidson == pytest.approx(made.davidson_energy, rel=1e-10)
+    assert variational == pytest.approx(made.variational_energy, rel=1e-10)
+    exact = hf.ground_state(h1, U, *NELEC)[0]
+    assert exact - 1e-9 < variational < exact + 0.1
 
 
 @pytest.mark.parametrize("name", ["L8", "sq2x4oo"])
@@ -435,7 +518,7 @@ def test_prepare_only_and_the_cached_htrial_run(tmp_path):
     pytest.importorskip("pyblock3")
     cache = tmp_path / "cache"
     assert _cli(tmp_path / "prepared", cache, "--Lx", "2", "--Ly", "4", "--cache-htrial", "--prepare-only") is None
-    trial_file = cache / f"sq2x4oo_n4-4_t1_U4_chi{CHI}_sw{SWEEPS}_tol1e-06_seed0.npz"
+    trial_file = cache / f"sq2x4oo_n4-4_t1_U4_chi{CHI}_sw{SWEEPS}_tol1e-06_seed0_neel.npz"
     assert trial_file.exists() and trials.htrial_cache_file(trial_file).exists()
     assert not (tmp_path / "prepared" / "results.jsonl").exists()
 
@@ -447,19 +530,37 @@ def test_prepare_only_and_the_cached_htrial_run(tmp_path):
                                    [b[key] for b in _block_log(tmp_path / "dense")], rtol=1e-9)
 
 
+def test_cli_dmrg_init_random_names_and_warm_trials(tmp_path):
+    """--dmrg-init random keeps the earlier (untagged) cache name; warm only loads build_warm_trials.py's _warm file
+    and never runs DMRG."""
+    pytest.importorskip("pyblock3")
+    cache = tmp_path / "cache"
+    with pytest.raises(FileNotFoundError, match="build_warm_trials"):
+        _cli(tmp_path / "missing", cache, "--L", "8", "--dmrg-init", "warm", "--prepare-only")
+    assert _cli(tmp_path / "random", cache, "--L", "8", "--dmrg-init", "random", "--prepare-only") is None
+    random_file = cache / f"L8_n4-4_t1_U4_chi{CHI}_sw{SWEEPS}_seed0.npz"
+    assert random_file.exists()
+    assert "DMRG trial (random start)" in (tmp_path / "random" / "L8_T16_w4_NOplan_NOstart_s3.log").read_text()
+    random_file.rename(cache / f"L8_n4-4_t1_U4_chi{CHI}_sw{SWEEPS}_seed0_warm.npz")
+    assert _cli(tmp_path / "warm", cache, "--L", "8", "--dmrg-init", "warm", "--prepare-only") is None
+    log = (tmp_path / "warm" / "L8_T16_w4_NOplan_NOstart_s3.log").read_text()
+    assert "trial loaded from" in log and "DMRG trial (warm start)" in log
+
+
 def test_dmrg_reference_mode_writes_what_the_2d_plots_read(tmp_path):
     """--dmrg-reference (the former mps_cpmc_2d.py dmrg mode) runs trot.gmps.dmrg.dmrg_h1 with the lattice's defaults
     (qc MPO, plain schedule, tol 1e-6) and writes a kind="dmrg" record in results.jsonl and a dmrg_*.log that
     plot_cpmc_2d_runs.py reads back with the lattice's model. e_mps is variational, so above the exact energy; it is
     not close to it here: the 2x4 order x * Ly + y cuts all four rungs in the middle (exact bond up to 70^2), so chi 64
-    still sits 0.06 above (job 7180801)."""
+    still sat 0.06 above from a random start (job 7180801). The default start is the Neel state (tag _neel)."""
     pytest.importorskip("pyblock3")
     from trot.gmps import plot_cpmc_2d_runs, run_mps_cpmc
     from trot.gmps.dmrg import dmrg_h1
 
     record = run_mps_cpmc.main(["--Lx", "2", "--Ly", "4", "--U", "4", "--trial-chi", str(CHI), "--dmrg-sweeps",
                                 str(SWEEPS), "--dmrg-reference", "--compile-cache", "", "--out", str(tmp_path)])
-    assert record["kind"] == "dmrg" and record["tag"] == f"dmrg_sq2x4oo_U4_chi{CHI}_sw{SWEEPS}_seed0"
+    assert record["kind"] == "dmrg" and record["tag"] == f"dmrg_sq2x4oo_U4_chi{CHI}_sw{SWEEPS}_seed0_neel"
+    assert record["dmrg_init"] == "neel"
     assert (record["dmrg_mpo"], record["dmrg_schedule"], record["dmrg_tol"]) == ("qc", "plain", 1e-6)
     direct = dmrg_h1(CASES["sq2x4oo"], U, NELEC, chi=CHI, n_sweeps=SWEEPS, mpo="qc", schedule="plain", tol=1e-6)
     assert record["e_davidson"] == pytest.approx(direct[2], rel=1e-10)

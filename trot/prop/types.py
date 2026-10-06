@@ -68,6 +68,7 @@ _MPS_CHOICES = {
     "walker_start": ("natural", "rhf"),
     "energy_kernel": ("blocked", "dense"),
     "walker_qr": ("auto", "cholesky", "native"),
+    "dmrg_init": ("auto", "neel", "random"),
 }
 
 
@@ -79,6 +80,8 @@ class QmcParamsMps(QmcParams):
     (trot/gmps/run_mps_cpmc.py) uses 0.01, 20 and 1e-8.
 
     trial_chi, dmrg_sweeps, dmrg_seed: pyblock3 DMRG, used when run_qmc_mps builds the trial.
+    dmrg_init: DMRG initial state (trot.gmps.dmrg.make_dmrg_trial): "auto" (Neel product state where
+      defined, else random), "neel" or "random" (random MPS with a warm-up at a larger bond).
     orbital_plan: gate plan of the walker conversion. "rank_exact" and "maximal" are exact for
       every walker before truncation; "adaptive" is cheaper but exact only for the reference.
     occupation_tolerance: purity threshold of the "adaptive" plan.
@@ -99,6 +102,7 @@ class QmcParamsMps(QmcParams):
     trial_chi: int = 64
     dmrg_sweeps: int = 14
     dmrg_seed: int = 0
+    dmrg_init: Literal["auto", "neel", "random"] = "auto"
     orbital_plan: Literal["rank_exact", "adaptive", "maximal"] = "adaptive"
     occupation_tolerance: float = 1.0e-10
     walker_channel_chi: int | None = 4

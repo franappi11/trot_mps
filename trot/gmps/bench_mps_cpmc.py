@@ -20,7 +20,7 @@ fraction). --circuit-only prints each conversion circuit's statistics, padding w
 setting: host work only, any backend.
 
     python bench_mps_cpmc.py --L 100 --U 8 --trial-chi 8 16 --chi-w 32 --walkers 400 --dmrg-sweeps 30 \\
-        --trial-cache trial_cache_warm --steps 5 --out bench_mps_cpmc.jsonl
+        --dmrg-init warm --trial-cache trial_cache_warm --steps 5 --out bench_mps_cpmc.jsonl
 """
 
 from __future__ import annotations
@@ -327,7 +327,7 @@ def main(argv=None):
             state = jax.device_put(first_walkers(run.state, nw))
             data = run.meas_ctx.data(run.prop_ctx)
             record = dict(lattice=lattice.name, kind=lattice.kind, n_sites=lattice.n_sites, U=args.U, trial_chi=chi,
-                          chi_w=chi_w, n_walkers=nw, steps=args.steps, n_chunks=n_chunks,
+                          dmrg_init=built.dmrg.init, chi_w=chi_w, n_walkers=nw, steps=args.steps, n_chunks=n_chunks,
                           trial_rotation=args.trial_rotation, rotated_trial=args.rotated_trial,
                           natural_rdm1=args.natural_rdm1, sector_buckets=list(args.sector_buckets),
                           cache_htrial=args.cache_htrial, device=device.device_kind, jax=jax.__version__,
