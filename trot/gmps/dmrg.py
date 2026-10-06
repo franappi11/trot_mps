@@ -8,8 +8,9 @@ dmrg_h1 is the general entry point (any h1, the "terms" or "qc" MPO, the chain's
 plain schedule and bond ramp) that trot.gmps.trials caches.
 
 Initial state (init, both entry points): "neel" starts from the Neel product state (up on the
-sublattice of site 0, down on the other; bipartite h1 with matching N_up, N_dn); "random" starts
-from a random MPS. "auto" (default) is "neel" where the Neel state is defined, else "random". Random
+sublattice of site 0, down on the other, any bipartite h1; away from half filling with holes or
+doublons spread over the lattice, neel_states); "random" starts from a random MPS. "auto" (default)
+is "neel" where that state is defined, else "random". Random
 starts at low chi on long chains get stuck in states with domain walls of the staggered
 magnetisation (L=32 chi=6: 6 walls for two of three seeds; the cluster's L=100 chi=16 trial: 4
 walls); the Neel start seeds the uniform pattern (0 walls). With the chain's warm-up schedule a Neel
@@ -104,13 +105,32 @@ def lattice_dmrg_schedule(chi, n_sweeps, bdims=()):
     return ramp + [ramp[-1]] * (n_sweeps - len(ramp)), [1.0e-5] * max(6, len(ramp)) + [0.0]
 
 
+def _spread_sites(n, groups):
+    """count sites from each (sites, count) in groups, spread evenly over range(n): pick j of k goes to the unused
+    site, of a group with picks left, nearest to (j + 1/2) n / k (ties: the lower site)."""
+    left = [int(count) for _, count in groups]
+    k, chosen = sum(left), []
+    for j in range(k):
+        target = (j + 0.5) * n / k
+        candidates = [(abs(s - target), int(s), g) for g, (sites, _) in enumerate(groups) if left[g]
+                      for s in sites if int(s) not in chosen]
+        _, site, g = min(candidates)
+        left[g] -= 1
+        chosen.append(site)
+    return np.array(chosen, dtype=int)
+
+
 def neel_states(h1, nelec):
-    """Site states of the Neel product state (1 = up, 2 = down) on the lattice of h1, or None.
+    """Site states of the (doped) Neel product state (0 = empty, 1 = up, 2 = down, 3 = up down) on the lattice of
+    h1, or None.
 
     The sites are 2-coloured along the nonzero off-diagonal h1 entries (the lowest site of every
     connected component gets the first colour). Up electrons sit on the colour of site 0 and down
-    electrons on the other, or the other way round when that matches nelec; None when h1 is not
-    bipartite or neither assignment gives (N_up, N_dn).
+    electrons on the other, or the other way round when only that fits nelec. With one electron per
+    site of each colour this is the Neel state. Away from it, the missing electrons leave holes
+    (N_up and N_dn at most the sizes of their colours) or the extra ones make doublons on the other
+    colour (both at least those sizes), at sites spread evenly over the site order (_spread_sites).
+    None when h1 is not bipartite or nelec has holes in one spin and extra electrons in the other.
     """
     h1 = np.asarray(h1)
     n = len(h1)
@@ -130,12 +150,19 @@ def neel_states(h1, nelec):
                 elif colour[j] == colour[i]:
                     return None
     nup, ndn = (int(x) for x in nelec)
-    a, b = int(np.sum(colour == 0)), int(np.sum(colour == 1))
-    if (nup, ndn) == (a, b):
-        return np.where(colour == 0, 1, 2)
-    if (nup, ndn) == (b, a):
-        return np.where(colour == 0, 2, 1)
-    return None
+    for up_colour in (0, 1):
+        up_sites, dn_sites = np.flatnonzero(colour == up_colour), np.flatnonzero(colour != up_colour)
+        holes = nup <= len(up_sites) and ndn <= len(dn_sites)
+        if holes or (nup >= len(up_sites) and ndn >= len(dn_sites)):
+            break
+    else:
+        return None
+    states = np.where(colour == up_colour, 1, 2)
+    if holes:
+        states[_spread_sites(n, [(up_sites, len(up_sites) - nup), (dn_sites, len(dn_sites) - ndn)])] = 0
+    else:  # doublons: the extra up electrons join down ones and vice versa
+        states[_spread_sites(n, [(dn_sites, nup - len(up_sites)), (up_sites, ndn - len(dn_sites))])] = 3
+    return states
 
 
 def product_mps(hamiltonian, states):

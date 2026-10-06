@@ -17,7 +17,8 @@ run_mps_sweep_gpu.py (chain) and run_sq_sweep_gpu.py (square lattice).
     python run_mps_cpmc.py --Lx 8 --Ly 8 --U 8 --trial-chi 512 --dmrg-mpo terms --cache-htrial --prepare-only
 
 The DMRG trial starts from the Neel product state wherever h1 and the electron counts define one (--dmrg-init auto,
-the default; chains and bipartite lattices at half filling), else from a random MPS; its cache name ends in _neel.
+the default; any bipartite lattice, with holes or doublons away from half filling), else from a random MPS; its
+cache name ends in _neel.
 --dmrg-init random reproduces the earlier random-start trials and their cache names, and --dmrg-init warm loads a
 build_warm_trials.py trial (_warm) and never runs DMRG.
 

@@ -183,8 +183,9 @@ def test_trial_cache_names_keep_the_production_names():
 
 def test_neel_states_on_bipartite_lattices_and_the_fallback():
     """neel_states 2-colours h1 (chain: alternating; square lattice x * Ly + y: checkerboard), swaps the colours to
-    match nelec, and is None for a frustrated h1 or a filling the Neel state does not have; "auto" then falls back
-    to a random start and "neel" refuses. No pyblock3 needed."""
+    match nelec, and away from half filling leaves holes (or makes doublons) spread over the site order. It is None
+    for a frustrated h1 or holes in one spin with extra electrons in the other; "auto" then falls back to a random
+    start and "neel" refuses. No pyblock3 needed."""
     from trot.gmps.dmrg import neel_states, resolve_init
 
     np.testing.assert_array_equal(neel_states(hopping_matrix(6, 1.0), (3, 3)), [1, 2, 1, 2, 1, 2])
@@ -194,8 +195,15 @@ def test_neel_states_on_bipartite_lattices_and_the_fallback():
                square_hopping_matrix(2, 4, 1.0, "open", "antiperiodic")):
         np.testing.assert_array_equal(neel_states(h1, (4, 4)), checkerboard)
     np.testing.assert_array_equal(neel_states(hopping_matrix(5, 1.0), (2, 3)), [2, 1, 2, 1, 2])
+    # doped: one hole (or doublon) per colour, at the sites nearest 1.5 and 4.5 of 6
+    np.testing.assert_array_equal(neel_states(hopping_matrix(6, 1.0), (2, 2)), [1, 0, 1, 2, 0, 2])
+    np.testing.assert_array_equal(neel_states(hopping_matrix(6, 1.0), (4, 4)), [1, 3, 1, 2, 3, 2])
+    doped = neel_states(square_hopping_matrix(4, 4, 1.0), (7, 7))  # filling 0.875
+    np.testing.assert_array_equal(np.flatnonzero(doped == 0), [4, 13])
+    assert (np.sum(doped == 1), np.sum(doped == 2)) == (7, 7)
+    assert resolve_init("auto", hopping_matrix(6, 1.0), (2, 2))[0] == "neel"
     odd_ring = square_hopping_matrix(5, 1, 1.0, "periodic", "open")
-    for h1, nelec in ((odd_ring, (2, 3)), (hopping_matrix(6, 1.0), (2, 2))):
+    for h1, nelec in ((odd_ring, (2, 3)), (hopping_matrix(6, 1.0), (4, 1))):
         assert neel_states(h1, nelec) is None
         assert resolve_init("auto", h1, nelec) == ("random", None)
         with pytest.raises(ValueError, match="no Neel"):
@@ -252,21 +260,23 @@ def test_dmrg_trial_cache_round_trip_and_h1_check(tmp_path):
 
 
 def test_neel_product_mps_is_the_neel_determinant():
-    """product_mps(neel_states) is the Neel basis state (norm 1, one amplitude, the Neel densities), for the
-    Hamiltonian of the term-built MPO (u=None) and of the qc MPO (dense g2) alike."""
+    """product_mps(neel_states) is the Neel basis state (norm 1, one amplitude, the Neel densities), at half filling
+    and doped (holes, doublons), for the Hamiltonian of the term-built MPO (u=None) and of the qc MPO (dense g2)."""
     pytest.importorskip("pyblock3")
     from trot.gmps.dmrg import make_pyblock3_hamiltonian, neel_states, product_mps
     from trot.gmps.utils import densify_with_charges
 
     h1 = CASES["sq2x4oo"]
-    states = neel_states(h1, NELEC)
-    for u in (None, U):
-        tensors, _ = densify_with_charges(product_mps(make_pyblock3_hamiltonian(h1, NELEC, u=u), states), 8)
-        amplitudes = np.asarray(hf.mps_sector_amplitudes(tensors, *NELEC)).ravel()
-        assert np.sum(amplitudes**2) == pytest.approx(1.0, abs=1e-12)
-        assert np.max(np.abs(amplitudes)) == pytest.approx(1.0, abs=1e-12)
-        densities = np.stack([np.diag((states == 1).astype(float)), np.diag((states == 2).astype(float))])
-        np.testing.assert_allclose(np.stack(one_rdm(tensors)), densities, atol=1e-12)
+    for nelec in (NELEC, (3, 3), (5, 5)):
+        states = neel_states(h1, nelec)
+        for u in (None, U):
+            tensors, _ = densify_with_charges(product_mps(make_pyblock3_hamiltonian(h1, nelec, u=u), states), 8)
+            amplitudes = np.asarray(hf.mps_sector_amplitudes(tensors, *nelec)).ravel()
+            assert np.sum(amplitudes**2) == pytest.approx(1.0, abs=1e-12)
+            assert np.max(np.abs(amplitudes)) == pytest.approx(1.0, abs=1e-12)
+            up, dn = np.isin(states, (1, 3)), np.isin(states, (2, 3))
+            densities = np.stack([np.diag(up.astype(float)), np.diag(dn.astype(float))])
+            np.testing.assert_allclose(np.stack(one_rdm(tensors)), densities, atol=1e-12)
 
 
 @pytest.mark.parametrize("init", ["neel", "random"])
@@ -286,6 +296,19 @@ def test_dmrg_h1_and_make_dmrg_trial_run_the_same_dmrg(init):
     assert variational == pytest.approx(made.variational_energy, rel=1e-10)
     exact = hf.ground_state(h1, U, *NELEC)[0]
     assert exact - 1e-9 < variational < exact + 0.1
+
+
+def test_doped_neel_start_reaches_the_exact_ground_state():
+    """3 + 3 electrons on the 8-site chain: "auto" starts from the Neel state with two holes, and at a bond above the
+    130 that 8 sites need at the middle cut, DMRG reaches the exact ground state from it."""
+    pytest.importorskip("pyblock3")
+    from trot.gmps.dmrg import make_dmrg_trial
+
+    h1, nelec = CASES["L8"], (3, 3)
+    system = System(norb=8, nelec=nelec, walker_kind="unrestricted")
+    made = make_dmrg_trial(HamHubbard(h1=jnp.asarray(h1), u=U), system, chi=160, n_sweeps=10)
+    assert made.init == "neel"
+    assert made.variational_energy == pytest.approx(hf.ground_state(h1, U, *nelec)[0], abs=1e-8)
 
 
 @pytest.mark.parametrize("name", ["L8", "sq2x4oo"])
