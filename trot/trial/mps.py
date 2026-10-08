@@ -47,8 +47,10 @@ def _require_x64() -> None:
         )
 
 def one_rdm(tensors):
+
     """Spin-resolved one-body density matrices <c^dag_i,sigma c_j,sigma> of a real
     d=4 MPS in the interleaved (alpha before beta on each site) ordering."""
+    
     create_a = np.zeros((4, 4))
     create_a[1, 0] = create_a[3, 2] = 1.0
     create_b = np.zeros((4, 4))
@@ -78,6 +80,7 @@ def one_rdm(tensors):
                 gamma[i, j] = gamma[j, i] = np.sum(site(E, j, annihilate_j) * right[j + 1])
                 E = site(E, j, parity_a @ parity_b)  # Jordan-Wigner string between i and j
         gammas.append(gamma / left[-1][0, 0])
+    
     return tuple(gammas)
 
 
