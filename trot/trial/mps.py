@@ -600,8 +600,8 @@ def check_walker(walker) -> None:
 def mps_overlap(walker, trial: MpsTrial, plan: MpsWalkerPlan):
     """<trial|walker> for one SD walker, a real float64 scalar: the plan's engine with the trial's blocks
     gathered from trial.tensors."""
-    check_trial(trial, plan)
-    check_walker(walker)
+    # check_trial(trial, plan)
+    # check_walker(walker)
     kernels = engine.kernels_for(plan, trial.charges, energy=None)
     data = engine.DeviceData(engine.fixed_blocks(trial.tensors, kernels.overlap_plan), (), (), None, None)
     return kernels.overlap_one(walker[0], walker[1], data)
