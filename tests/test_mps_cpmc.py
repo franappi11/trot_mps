@@ -826,9 +826,10 @@ def test_run_qmc_mps_builds_the_dmrg_trial(monkeypatch):
     result = run_qmc_mps(sys=sys_, params=params, ham_data=ham)
     assert len(calls) == 1
     kwargs, rng_restored = calls[0]
-    assert kwargs == dict(chi=16, n_sweeps=8, seed=0)
+    assert kwargs == dict(chi=16, n_sweeps=8, seed=0, init="auto")  # init: params.dmrg_init
     assert rng_restored, "make_dmrg_trial must restore numpy's global RNG"
-    np.testing.assert_allclose(np.asarray(result.block_energies), E_L4, rtol=0, atol=1e-8)
+    # the default Neel start leaves the 8-sweep trial ~3e-8 above E0 in the first blocks
+    np.testing.assert_allclose(np.asarray(result.block_energies), E_L4, rtol=0, atol=1e-7)
 
 
 def test_run_qmc_mps_with_a_ready_trial_equals_manual_run_qmc(monkeypatch):

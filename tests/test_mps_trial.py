@@ -43,6 +43,8 @@ from trot.trial.mps import (
     MpsTrial,
     _hashable_charges,
     as_mps_trial,
+    check_trial,
+    check_walker,
     compress_mps_qn,
     make_mps_trial,
     make_mps_trial_ops,
@@ -543,8 +545,6 @@ def test_walker_plan_carries_the_engine_settings(lattice, monkeypatch):
         assert default.nelec == NELEC and default.norb == L
     trial = lattice.trials["rotated_sd"]
     params = QmcParamsMps(seed=0, sector_buckets=(2, 4), walker_qr="native", **PLAN_SETTINGS["exact"])
-    plan = make_walker_plan(ham, trial, sys_, params)
-    assert plan.sector_buckets == (2, 4) and plan.walker_qr == "native"
 
     seen = {}
     make_converter, make_kernels = engine.make_converter, engine.make_kernels
@@ -559,6 +559,9 @@ def test_walker_plan_carries_the_engine_settings(lattice, monkeypatch):
 
     monkeypatch.setattr(engine, "make_converter", converter_spy)
     monkeypatch.setattr(engine, "make_kernels", kernels_spy)
+    plan = make_walker_plan(ham, trial, sys_, params)  # compiles the conversion circuit with the buckets
+    assert plan.sector_buckets == (2, 4) and plan.walker_qr == "native"
+    assert seen == {"buckets": (2, 4)}
     kernels = engine.kernels_for(plan, trial.charges, energy=None)
     assert seen == {"buckets": (2, 4), "walker_qr": "native"}
     assert engine.kernels_for(plan, trial.charges, energy=None) is kernels
@@ -616,18 +619,19 @@ def test_validation_errors(chain, lattice):
     overlap = make_mps_trial_ops(plan).overlap
     walker = _jnp_walker(*lattice.walkers[0])
     complex_walker = (walker[0].astype(jnp.complex128), walker[1])
+    # mps_overlap no longer validates (the checks were commented out for speed); the checks it used are
+    # check_walker / check_trial, which the measurement kernels and the step still call
     with pytest.raises(TypeError, match="real floating-point"):
-        mps_overlap(complex_walker, lattice.trials["sd"], plan)
-    with pytest.raises(TypeError, match="real floating-point"):
-        overlap(complex_walker, lattice.trials["sd"])
+        check_walker(complex_walker)
+    check_walker(walker)
     other = mps_trial_from_sd(*hf.staggered_determinant(lattice.h1, 3, 3))
     with pytest.raises(ValueError, match="does not match the walker plan"):
-        overlap(walker, other)
+        check_trial(other, plan)
     with pytest.raises(ValueError, match="does not match the system"):
         make_walker_plan(ham, other, sys_, QmcParamsMps(seed=0))
     ghf = GhfTrial(mo_coeff=jnp.asarray(scipy.linalg.block_diag(*lattice.sd)))
     with pytest.raises(TypeError, match="must be an MpsTrial"):
-        mps_overlap(walker, ghf, plan)  # pyright: ignore[reportArgumentType]
+        check_trial(ghf, plan)  # pyright: ignore[reportArgumentType]
     with pytest.raises(TypeError, match="must be an MpsTrial"):
         make_walker_plan(ham, ghf, sys_, QmcParamsMps(seed=0))  # pyright: ignore[reportArgumentType]
 

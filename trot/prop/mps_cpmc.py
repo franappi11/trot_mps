@@ -13,7 +13,8 @@ are identical whenever that event does not occur.
 make_prop_ops(ham_data, sys, plan) is the factory, as trot.prop.cpmc.make_prop_ops: prop_ctx is trot's
 HubbardCpmcCtx (exp(-dt K/2) and the HS factors) and the trial blocks come from meas_ctx (trot.meas.mps), which
 also names the plan's engine. block is the MPS measurement block for trot.driver.run_qmc: trot.prop.blocks.block
-with 2 n + 1 walker conversions per block of n steps (blocks.block, which also works, needs 2 n + 4).
+with 2 n + 1 walker conversions per block of n steps (blocks.block, which also works, needs 2 n + 4), plus one per
+requested observable (observable_names, e.g. "szsz": the mixed <S^z_i S^z_j>, trot.meas.mps).
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ from jax import lax
 
 from trot import walkers as wk
 from trot.gmps import engine
-from trot.meas.mps import MpsMeasCtx, check_meas_ctx
+from trot.meas.mps import BATCHED_OBSERVABLES, MpsMeasCtx, check_meas_ctx
 from trot.prop.blocks import BlockObs
 from trot.prop.hubbard_cpmc_ops import _build_prop_ctx
 from trot.prop.types import PropOps, PropState
@@ -122,6 +123,9 @@ def make_prop_ops(ham_data, sys, plan: MpsWalkerPlan) -> PropOps:
 def make_block(record: Callable | None = None):
     """trot.prop.blocks.block for MPS trials, with 2 n + 1 walker conversions per block of n steps.
 
+    observable_names (of mps_block) selects trot.meas.mps.BATCHED_OBSERVABLES, averaged over the walkers with the
+    energy's weights after the energy and before the comb, as blocks.block does; one more conversion each.
+
     The n steps are a scan over 2 n half steps with one conversion call site (engine.make_half_step). The walkers are
     then orthonormalised (the engine's batch_qr) and their overlaps rescaled by det R instead of reconverted; the
     energy is one more conversion; after the comb the overlaps are gathered. Outlier clipping, the e_estimate EMA,
@@ -135,8 +139,11 @@ def make_block(record: Callable | None = None):
 
     def mps_block(state: PropState, *, sys, params, ham_data, trial_data, trial_ops, meas_ops, meas_ctx, prop_ops,
                   prop_ctx, sr_fn=wk.stochastic_reconfiguration, observable_names=()):
-        if observable_names:
-            raise ValueError("the MPS block measures the energy only (observable_names must be empty)")
+        unknown = [name for name in observable_names if name not in BATCHED_OBSERVABLES]
+        if unknown:
+            raise ValueError(
+                f"the MPS block measures the energy and the observables {sorted(BATCHED_OBSERVABLES)}, not {unknown}"
+            )
         if not isinstance(meas_ctx, MpsMeasCtx):
             raise ValueError("the MPS block needs meas_ctx = meas_ops.build_meas_ctx(ham_data, trial_data)")
         kernels, data = meas_ctx.kernels, meas_ctx.data(prop_ctx)
@@ -161,6 +168,13 @@ def make_block(record: Callable | None = None):
         alpha = jnp.asarray(params.shift_ema, dtype=jnp.result_type(e_block))
         e_estimate = (1.0 - alpha) * state.e_estimate + alpha * e_block
 
+        observables = {}
+        for name in observable_names:  # the weighted mean over the pre-comb walkers, as blocks.block
+            samples = engine.chunked(lambda a, b: BATCHED_OBSERVABLES[name](meas_ctx)(a, b, data), n_chunks, qu, qd)
+            w_shape = (n,) + (1,) * (samples.ndim - 1)
+            mean = jnp.sum(weights.reshape(w_shape) * samples, axis=0) / w_sum_safe
+            observables[name] = jnp.where(w_sum == 0, jnp.zeros_like(mean), mean)
+
         key, subkey = jax.random.split(state.rng_key)
         zeta = jax.random.uniform(subkey)
         if sr_fn is wk.stochastic_reconfiguration:
@@ -177,7 +191,7 @@ def make_block(record: Callable | None = None):
         if record is not None:
             jax.experimental.io_callback(record, record_spec, walkers[0], walkers[1], weights, idx.astype(jnp.int32),
                                          e_block, w_sum, e_estimate, state.node_encounters, ordered=True)
-        return state, BlockObs(scalars={"energy": e_block, "weight": w_sum}, observables={})
+        return state, BlockObs(scalars={"energy": e_block, "weight": w_sum}, observables=observables)
 
     return mps_block
 

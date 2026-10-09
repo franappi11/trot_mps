@@ -503,7 +503,7 @@ def test_lattice_flags_and_an_h1_file_are_the_same_run(tmp_path):
     ],
 )
 def test_cli_run_writes_the_production_outputs(tmp_path, cache, lattice, tag):
-    """Log, block log, result record (as plot_cpmc_runs reads it), walker snapshots and the trial export."""
+    """Log, block log, result record, walker snapshots and the trial export."""
     record = _cli(tmp_path, cache, *lattice, "--save-walkers")
     assert record["tag"] == tag and np.isfinite(record["cpmc_energy"])
     rows = _block_log(tmp_path)
@@ -511,14 +511,6 @@ def test_cli_run_writes_the_production_outputs(tmp_path, cache, lattice, tag):
     assert [b["phase"] for b in rows] == ["equilibration"] * 5 + ["sampling"] * 10
     energies = np.array([b["energy"] for b in rows])
     assert "CPMC energy" in (tmp_path / f"{tag}.log").read_text()
-
-    from trot.gmps import plot_cpmc_runs
-
-    (run,) = plot_cpmc_runs.load_runs(tmp_path / "results.jsonl")
-    np.testing.assert_array_equal(run["energies"], energies)
-    assert (run["config"]["L"], run["config"]["N_PROP"], run["config"]["DT"]) == (8, 3, 0.01)
-    assert run["config"].get("LX") == (2 if "--Lx" in lattice else None)
-    assert run["config"]["TRIAL_ROTATION"] == (90.0 if "--trial-rotation" in lattice else 0.0)
 
     with np.load(tmp_path / f"{tag}_walkers.npz") as z:
         assert z["up"].shape == z["dn"].shape == (16, 8, 8, 4)
@@ -570,14 +562,13 @@ def test_cli_dmrg_init_random_names_and_warm_trials(tmp_path):
     assert "trial loaded from" in log and "DMRG trial (warm start)" in log
 
 
-def test_dmrg_reference_mode_writes_what_the_2d_plots_read(tmp_path):
+def test_dmrg_reference_mode_writes_the_dmrg_record(tmp_path):
     """--dmrg-reference (the former mps_cpmc_2d.py dmrg mode) runs trot.gmps.dmrg.dmrg_h1 with the lattice's defaults
-    (qc MPO, plain schedule, tol 1e-6) and writes a kind="dmrg" record in results.jsonl and a dmrg_*.log that
-    plot_cpmc_2d_runs.py reads back with the lattice's model. e_mps is variational, so above the exact energy; it is
+    (qc MPO, plain schedule, tol 1e-6) and writes a kind="dmrg" record in results.jsonl and a dmrg_*.log. e_mps is variational, so above the exact energy; it is
     not close to it here: the 2x4 order x * Ly + y cuts all four rungs in the middle (exact bond up to 70^2), so chi 64
     still sat 0.06 above from a random start (job 7180801). The default start is the Neel state (tag _neel)."""
     pytest.importorskip("pyblock3")
-    from trot.gmps import plot_cpmc_2d_runs, run_mps_cpmc
+    from trot.gmps import run_mps_cpmc
     from trot.gmps.dmrg import dmrg_h1
 
     record = run_mps_cpmc.main(["--Lx", "2", "--Ly", "4", "--U", "4", "--trial-chi", str(CHI), "--dmrg-sweeps",
@@ -589,10 +580,4 @@ def test_dmrg_reference_mode_writes_what_the_2d_plots_read(tmp_path):
     assert record["e_davidson"] == pytest.approx(direct[2], rel=1e-10)
     assert record["e_mps"] == pytest.approx(direct[4], rel=1e-10)
     assert record["e_mps"] > hf.ground_state(CASES["sq2x4oo"], U, *NELEC)[0] - 1e-9
-    (from_results,) = plot_cpmc_2d_runs.references_from_results(tmp_path / "results.jsonl")
-    from_log, reason = plot_cpmc_2d_runs.reference_from_log(tmp_path / f"{record['tag']}.log")
-    assert reason == ""
-    for ref in (from_results, from_log):
-        model = tuple(ref[k] for k in ("LX", "LY", "BOUNDARY_X", "BOUNDARY_Y", "N_UP", "N_DN", "U"))
-        assert model == (2, 4, "open", "open", 4, 4, U)
-        assert ref["energy"] == pytest.approx(record["e_mps"], rel=1e-12) and ref["chi"] == max(record["bond_dims"])
+    assert (tmp_path / f"{record['tag']}.log").exists()

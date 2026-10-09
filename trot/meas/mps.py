@@ -12,20 +12,27 @@ of any real symmetric h1 plus on-site U (hubbard_mpo_from_h1). Two kernels:
 Both give the same number up to rounding. build_meas_ctx (make_mps_meas_ops_hubbard) gathers the padded trial and
 H|trial> blocks of the plan's engine (trot.gmps.engine) once; the propagation step reads the trial blocks from the
 same context. A precomputed H|trial> (trot.gmps.trials: block form for 6x6 and larger lattices) can be passed in.
+
+The observable "szsz" is the mixed estimator <trial|S^z_i S^z_j|walker> / <trial|walker> as an (L, L) matrix, for a
+trial with (N_up, N_dn) bond labels or with particle-number labels (a spin-rotated trial used as it is). It reuses
+the trial blocks of the overlap layout, so it needs no extra context, and follows the energy kernel ("blocked" or
+"dense"). The MPS block measures it for the whole walker batch at once (BATCHED_OBSERVABLES).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import partial
+from typing import Callable, NamedTuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import tree_util
 
-from trot.core.ops import MeasOps, k_energy
+from trot.core.ops import MeasOps, k_energy, o_szsz
 from trot.gmps import engine
+from trot.gmps.utils import combine_channels
 from trot.trial.mps import (
     MpsWalkerPlan,
     _hashable_charges,
@@ -35,6 +42,7 @@ from trot.trial.mps import (
     label_array,
     mps_overlap_fn,
 )
+from trot.walkers import _qr as qr_with_det
 
 ENERGY_KERNELS = ("blocked", "dense")
 
@@ -358,8 +366,67 @@ def mps_energy_fn(plan: MpsWalkerPlan):
     return fn
 
 
+class SzszFns(NamedTuple):
+    batch: Callable  # (ca, cb, data) -> (n, L, L) <S^z_i S^z_j> of a walker batch
+    one: Callable  # (ca, cb, data) -> (L, L) of one walker
+
+
+def szsz_fns(meas_ctx: MpsMeasCtx) -> SzszFns:
+    """The <trial|S^z_i S^z_j|walker> / <trial|walker> kernels of a context, cached on the plan.
+
+    Like the energy: the walker is QR-orthonormalised and converted, then contracted against the trial blocks
+    ("blocked", engine.szsz_contract) or as the d=4 MPS against the dense trial ("dense", engine.szsz_dense).
+    """
+    plan, kernels = meas_ctx.plan, meas_ctx.kernels
+    key = ("szsz", meas_ctx.trial_charges, meas_ctx.kernel)
+    fns = plan.caches.get(key)
+    if fns is None:
+        qa_labels, qb_labels = kernels.converter.charges
+
+        def value(qa, qb, data):
+            alpha, beta, _ = kernels.converter.convert(qa, qb)
+            if kernels.energy_kind == "dense":
+                tensors, _ = combine_channels(alpha, qa_labels, beta, qb_labels)
+                return engine.szsz_dense(tensors, data.dense_trial)
+            blocks = engine.walker_blocks(alpha, beta, kernels.overlap_plan)
+            return engine.szsz_contract(blocks, data.trial, kernels.overlap_plan)
+
+        def batch(ca, cb, data):
+            qa, _ = kernels.batch_qr(ca)
+            qb, _ = kernels.batch_qr(cb)
+            return jax.vmap(lambda a, b: value(a, b, data))(qa, qb)
+
+        def one(ca, cb, data):
+            qa, _ = qr_with_det(ca)
+            qb, _ = qr_with_det(cb)
+            return value(qa, qb, data)
+
+        fns = plan.caches[key] = SzszFns(batch, one)
+    return fns
+
+
+def mps_szsz(walker, ham_data, meas_ctx: MpsMeasCtx, trial_data, plan: MpsWalkerPlan):
+    """<trial|S^z_i S^z_j|walker> / <trial|walker> (L, L) for one SD walker."""
+    check_meas_ctx(meas_ctx, plan, trial_data)
+    check_walker(walker)
+    return szsz_fns(meas_ctx).one(walker[0], walker[1], meas_ctx.data())
+
+
+def mps_szsz_fn(plan: MpsWalkerPlan):
+    """The jitted per-walker szsz observable of a plan (cached on the plan)."""
+    fn = plan.caches.get("szsz")
+    if fn is None:
+        fn = jax.jit(lambda walker, ham, ctx, trial: mps_szsz(walker, ham, ctx, trial, plan))
+        plan.caches["szsz"] = fn
+    return fn
+
+
+# observables the MPS block (trot.prop.mps_cpmc) measures for the whole walker batch: name -> meas_ctx -> batch fn
+BATCHED_OBSERVABLES = {o_szsz: lambda meas_ctx: szsz_fns(meas_ctx).batch}
+
+
 def make_mps_meas_ops_hubbard(plan: MpsWalkerPlan, *, energy_kernel: str = "blocked", htrial=None) -> MeasOps:
-    """MeasOps for an MpsTrial and a HamHubbard: overlap, build_meas_ctx and the energy kernel.
+    """MeasOps for an MpsTrial and a HamHubbard: overlap, build_meas_ctx, the energy kernel and the szsz observable.
 
     htrial: optional precomputed H|trial> for build_meas_ctx (see build_mps_meas_ctx).
     """
@@ -369,4 +436,5 @@ def make_mps_meas_ops_hubbard(plan: MpsWalkerPlan, *, energy_kernel: str = "bloc
         overlap=mps_overlap_fn(plan),
         build_meas_ctx=partial(build_mps_meas_ctx, plan=plan, kernel=energy_kernel, htrial=htrial),
         kernels={k_energy: mps_energy_fn(plan)},
+        observables={o_szsz: mps_szsz_fn(plan)},
     )

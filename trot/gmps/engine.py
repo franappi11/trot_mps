@@ -865,6 +865,79 @@ def field_sweep(ca, cb, randoms, wblocks, prefactor, right, overlap_in, *, hs, w
 
 
 # ============================================================================
+# Spin correlations <trial| S^z_i S^z_j |walker> / <trial|walker>
+# ============================================================================
+
+SZ_LOCAL = np.array([0.0, 0.5, -0.5, 0.0])  # S^z on |0>, |up>, |dn>, |up dn> (p = n_alpha + 2 n_beta)
+
+
+def _symmetric_matrix(diagonal, pairs):
+    """(L, L) matrix with `diagonal` on the diagonal and pairs[k] = values at (i, k) for i < k, mirrored."""
+    n = len(diagonal)
+    C = jnp.zeros((n, n)).at[jnp.arange(n), jnp.arange(n)].set(jnp.stack(diagonal))
+    for k, values in enumerate(pairs):
+        if k:
+            C = C.at[jnp.arange(k), k].set(values).at[k, jnp.arange(k)].set(values)
+    return C
+
+
+def szsz_contract(wblocks, fixed_blocks, plan: ContractionPlan):
+    """<fixed|S^z_i S^z_j|walker channels> / <fixed|walker channels> as an (L, L) matrix.
+
+    S^z is diagonal in the local basis, so an insertion is the weight SZ_LOCAL[p] on each transition of the
+    factorized layout; the walker, the fixed MPS and their labels (width 2 or 1) are those of left_contract. One
+    left sweep carries the plain environment and a stack of environments with one S^z already inserted at an
+    earlier site i; closing the stack at site k gives the pair (i, k) against the right environments, and the
+    diagonal (k, k) is the double insertion SZ_LOCAL**2. The gauges and det R of the walker cancel in the ratio.
+    """
+    right = right_environments(wblocks, fixed_blocks, plan)
+    sz, sz2 = jnp.asarray(SZ_LOCAL), jnp.asarray(SZ_LOCAL**2)
+    left = jnp.ones((1, 1, 1, 1))
+    stack = None  # (k, n_shared, Pa, Pb, Pt): left environments holding one S^z at sites 0..k-1
+    diagonal, pairs = [], [jnp.zeros(0)]
+    for site, ((Wa, Wb), F, sp) in enumerate(zip(wblocks, fixed_blocks, plan.sites)):
+        step = lambda X: _legs(X[sp.src], (Wa, Wb, F), sp.left_order, True) * sp.sign
+        into = lambda Y: _reduce(Y, sp.into)
+        close = right[site + 1][sp.dst]
+        local = step(left)
+        weight = sz[sp.physical][:, None, None, None]
+        diagonal.append(jnp.sum(sz2[sp.physical][:, None, None, None] * local * close))
+        if stack is None:
+            stack = into(weight * local)[None]
+        else:
+            moved = jax.vmap(step)(stack)
+            pairs.append(jnp.sum(weight[None] * moved * close[None], axis=(1, 2, 3, 4)))
+            stack = jnp.concatenate((jax.vmap(into)(moved), into(weight * local)[None]), axis=0)
+        left = into(local)
+    overlap = right[0][0, 0, 0, 0]
+    return _symmetric_matrix(diagonal, pairs) / overlap
+
+
+def szsz_dense(tensors, fixed):
+    """szsz_contract for dense d=4 tensors (the combined walker) against a dense fixed MPS."""
+    sz, sz2 = jnp.asarray(SZ_LOCAL), jnp.asarray(SZ_LOCAL**2)
+    right = [jnp.ones((1, 1))]
+    for A, B in zip(reversed(tensors), reversed(fixed)):
+        right.append(jnp.einsum("apr,bps,rs->ab", A, B, right[-1]))
+    right = right[::-1]
+    left = jnp.ones((1, 1))
+    stack = None
+    diagonal, pairs = [], [jnp.zeros(0)]
+    for site, (A, B) in enumerate(zip(tensors, fixed)):
+        close = right[site + 1]
+        diagonal.append(jnp.einsum("ab,apr,bps,p,rs->", left, A, B, sz2, close))
+        opened = jnp.einsum("ab,apr,bps,p->rs", left, A, B, sz)
+        if stack is not None:
+            moved = jnp.einsum("mab,apr,bps->mrs", stack, A, B)
+            pairs.append(jnp.einsum("mab,apr,bps,p,rs->m", stack, A, B, sz, close))
+            stack = jnp.concatenate((moved, opened[None]), axis=0)
+        else:
+            stack = opened[None]
+        left = jnp.einsum("ab,apr,bps->rs", left, A, B)
+    return _symmetric_matrix(diagonal, pairs) / right[0][0, 0]
+
+
+# ============================================================================
 # Walker ops against a fixed trial
 # ============================================================================
 
