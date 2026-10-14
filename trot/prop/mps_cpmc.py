@@ -172,6 +172,7 @@ def make_block(record: Callable | None = None):
         for name in observable_names:  # the weighted mean over the pre-comb walkers, as blocks.block
             samples = engine.chunked(lambda a, b: BATCHED_OBSERVABLES[name](meas_ctx)(a, b, data), n_chunks, qu, qd)
             w_shape = (n,) + (1,) * (samples.ndim - 1)
+            samples = jnp.where(weights.reshape(w_shape) == 0.0, 0.0, samples)  # a dead walker's NaN must not leak (0 * NaN)
             mean = jnp.sum(weights.reshape(w_shape) * samples, axis=0) / w_sum_safe
             observables[name] = jnp.where(w_sum == 0, jnp.zeros_like(mean), mean)
 

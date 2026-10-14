@@ -51,11 +51,12 @@ class MpsCpmcOps(NamedTuple):
     prop_ops: PropOps
 
 
-def make_mps_cpmc_ops(ham_data, trial_data: MpsTrial, sys, params, htrial=None) -> MpsCpmcOps:
+def make_mps_cpmc_ops(ham_data, trial_data: MpsTrial, sys, params, htrial=None, pairing=None) -> MpsCpmcOps:
     """Walker plan and trot ops for trial_data (an MpsTrial) with QmcParamsMps settings.
 
     htrial: optional precomputed H|trial> (tensors or block form, labels, trial_energy) for energy_kernel="blocked"
     (trot.meas.mps.build_mps_meas_ctx).
+    pairing: optional trot.meas.mps_pairing.PairingSpec, which adds the "pairing" observable (mixed pair correlations).
     """
     if not isinstance(trial_data, MpsTrial):
         raise TypeError(
@@ -66,7 +67,7 @@ def make_mps_cpmc_ops(ham_data, trial_data: MpsTrial, sys, params, htrial=None) 
     return MpsCpmcOps(
         plan=plan,
         trial_ops=make_mps_trial_ops(plan),
-        meas_ops=make_mps_meas_ops_hubbard(plan, energy_kernel=params.energy_kernel, htrial=htrial),
+        meas_ops=make_mps_meas_ops_hubbard(plan, energy_kernel=params.energy_kernel, htrial=htrial, pairing=pairing),
         prop_ops=make_prop_ops(ham_data, sys, plan),
     )
 
@@ -303,11 +304,12 @@ class MpsCpmcRun(NamedTuple):
     info: dict
 
 
-def prepare_mps_cpmc(*, sys, params, ham_data, trial, htrial=None, state=None, mesh=None, dmrg=None,
+def prepare_mps_cpmc(*, sys, params, ham_data, trial, htrial=None, pairing=None, state=None, mesh=None, dmrg=None,
                      verbose=True) -> MpsCpmcRun:
     """Ops, contexts, the walkers' start and the diagnostics for an MpsTrial.
 
     htrial: optional precomputed H|trial> (tensors or block form, labels, trial_energy), energy_kernel="blocked".
+    pairing: optional PairingSpec for the "pairing" observable (see make_mps_cpmc_ops).
     dmrg: the trot.gmps.dmrg.DmrgTrial the trial came from, for the printout.
     """
     if sys.walker_kind.lower() != "unrestricted":
@@ -317,7 +319,7 @@ def prepare_mps_cpmc(*, sys, params, ham_data, trial, htrial=None, state=None, m
             raise TypeError("params must be a QmcParamsMps (trot.prop.types)")
     clock, seconds = time.perf_counter, {}
     start = clock()
-    ops = make_mps_cpmc_ops(ham_data, trial, sys, params, htrial)  # walker plan (orbital and bond plans, circuit)
+    ops = make_mps_cpmc_ops(ham_data, trial, sys, params, htrial, pairing)  # walker plan (orbital and bond plans, circuit)
     seconds["walker_plan"] = clock() - start
     start = clock()
     meas_ctx = ops.meas_ops.build_meas_ctx(ham_data, trial)  # H|trial>, layouts, padded blocks
@@ -396,6 +398,7 @@ def run_qmc_mps(
     target_error=None,
     observable_names=(),
     htrial=None,
+    pairing=None,
 ):
     """CPMC for a HamHubbard with an MPS trial, through trot.driver.run_qmc.
 
@@ -404,6 +407,7 @@ def run_qmc_mps(
     params: QmcParamsMps. block_fn: None (the MPS block, trot.prop.mps_cpmc.block), trot.prop.blocks.block,
       or e.g. make_block_logger(...) for a JSONL log.
     htrial: optional precomputed H|trial> (see prepare_mps_cpmc).
+    pairing: optional PairingSpec: adds the "pairing" observable, (2, n_rows, L) [s, d], to observable_names.
     Returns trot's QmcResult.
     """
     dmrg = None
@@ -415,7 +419,7 @@ def run_qmc_mps(
         trial = dmrg.trial
     else:
         trial = as_mps_trial(trial_data, nelec=sys.nelec)
-    run = prepare_mps_cpmc(sys=sys, params=params, ham_data=ham_data, trial=trial, htrial=htrial, state=state,
+    run = prepare_mps_cpmc(sys=sys, params=params, ham_data=ham_data, trial=trial, htrial=htrial, pairing=pairing, state=state,
                            mesh=mesh, dmrg=dmrg)
     return run_prepared(run, block_fn=block_fn, mesh=mesh, target_error=target_error,
                         observable_names=observable_names)

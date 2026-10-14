@@ -279,6 +279,7 @@ o_rdm1 = "rdm1"
 o_density_corr = "density_corr"
 o_orb_corr = "orb_corr"
 o_szsz = "szsz"
+o_pairing = "pairing"
 
 
 @dataclass(frozen=True)

@@ -632,6 +632,7 @@ class ContractionPlan(NamedTuple):
     pads: tuple  # (Pa, Pb, Pt) per bond
     blocks: tuple | None  # (T, Pt, Pt') blocks of the fixed MPS (trial or H|trial>); None in a bare layout
     stats: dict
+    shift: tuple = (0, 0)  # walker label c meets the fixed MPS's label key(c + shift) (_fixed_key)
 
 
 def _index_1d(labels):
@@ -669,17 +670,93 @@ def _table(keys, n):
 N_PHYSICAL = np.array([0, 1, 1, 2])  # n_alpha + n_beta of p = n_alpha + 2 n_beta
 
 
-def _fixed_key(width):
+def _fixed_key(width, shift=(0, 0)):
     """The fixed MPS's label that a walker label pair c = (N_alpha, N_beta) contracts
-    with: c itself for (N_up, N_dn) labels, (N_alpha + N_beta,) for N labels."""
+    with: c itself for (N_up, N_dn) labels, (N_alpha + N_beta,) for N labels. With a shift the walker label
+    is moved first, to c + shift: the label of the walker once operators acting on it have removed (or added)
+    electrons left of the bond (trot.meas.mps_pairing)."""
+    s0, s1 = int(shift[0]), int(shift[1])
     if width == 2:
-        return lambda c: c
+        if s0 == 0 and s1 == 0:
+            return lambda c: c
+        return lambda c: (c[0] + s0, c[1] + s1)
     if width == 1:
-        return lambda c: (c[0] + c[1],)
+        return lambda c: (c[0] + c[1] + s0 + s1,)
     raise ValueError(f"fixed MPS labels must be (N_up, N_dn) pairs or particle numbers, got width {width}")
 
 
-def make_factorized_layout(qa, qb, fixed_charges) -> ContractionPlan:
+# (walker physical p, fixed physical p', coefficient, Jordan-Wigner sign): the plain transitions, p' = p
+IDENTITY_MOVES = tuple((p, p, 1.0, False) for p in range(4))
+
+
+def _layout_index(qa, qb, fixed_charges):
+    """Label -> indices of the walker channels and of the fixed MPS, per bond."""
+    fixed_charges = [label_array(q) for q in fixed_charges]
+    return ([_index_1d(q) for q in qa], [_index_1d(q) for q in qb], [_charge_index(q) for q in fixed_charges],
+            fixed_charges)
+
+
+def _site_plan(site, qa, qb, index, shared_in, shared_out, pads_in, pads_out, key_in, key_out, moves,
+               allow_empty=False):
+    """The transitions of one site between the shared labels of bond `site` (key_in) and bond `site` + 1
+    (key_out). moves: (p_walker, p_fixed, coefficient, jw) tuples. The walker side (src, dst, gather_a/b) follows
+    p_walker; the fixed side (physical, fixed rows/cols/keys) follows p_fixed; the sign carries the coefficient,
+    the walker's interleave sign (-1)^(n_alpha N_beta) and, if jw, the Jordan-Wigner sign (-1)^(N_alpha + N_beta)
+    of the walker label left of the site (a fermion operator acting on the walker there). Plain transitions:
+    IDENTITY_MOVES. Returns None for no transition if allow_empty."""
+    ia, ib, it, fixed_charges = index
+    (Pa, Pb, Pt), (Pa2, Pb2, Pt2) = pads_in, pads_out
+    out_index = {c: j for j, c in enumerate(shared_out)}
+    Dla, Dra = len(qa[site]), len(qa[site + 1])
+    Dlb, Drb = len(qb[site]), len(qb[site + 1])
+    Dlt, Drt = len(fixed_charges[site]), len(fixed_charges[site + 1])
+    src, dst, physical, sign, ga, gb, rows, cols, keys, shapes = [], [], [], [], [], [], [], [], [], []
+    for s, c in enumerate(shared_in):
+        for p_walker, p_fixed, coefficient, jw in moves:
+            na, nb = PHYSICAL[p_walker]
+            c2 = (c[0] + na, c[1] + nb)
+            if c2 not in out_index:
+                continue
+            ra, ca_ = ia[site][c[0]], ia[site + 1][c2[0]]
+            rb, cb_ = ib[site][c[1]], ib[site + 1][c2[1]]
+            rt, ct = it[site][key_in(c)], it[site + 1][key_out(c2)]
+            a = np.full((Pa, Pa2), Dla * 2 * Dra, np.int32)
+            a[:len(ra), :len(ca_)] = ra[:, None] * 2 * Dra + na * Dra + ca_[None, :]
+            b = np.full((Pb, Pb2), Dlb * 2 * Drb, np.int32)
+            b[:len(rb), :len(cb_)] = rb[:, None] * 2 * Drb + nb * Drb + cb_[None, :]
+            r = np.full(Pt, Dlt, np.int32)
+            r[:len(rt)] = rt
+            k = np.full(Pt2, Drt, np.int32)
+            k[:len(ct)] = ct
+            src.append(s)
+            dst.append(out_index[c2])
+            physical.append(p_fixed)
+            sign.append(coefficient * (-1.0) ** (na * c[1]) * ((-1.0) ** (c[0] + c[1]) if jw else 1.0))
+            ga.append(a)
+            gb.append(b)
+            rows.append(r)
+            cols.append(k)
+            keys.append((key_in(c), p_fixed, key_out(c2)))
+            shapes.append((len(rt), len(ct)))
+    T = len(src)
+    if T == 0:
+        if allow_empty:
+            return None
+        raise AssertionError(f"no allowed transition at site {site}: the walker and trial share no path")
+    src, dst, physical = np.asarray(src), np.asarray(dst), np.asarray(physical)
+    left_order, left_fma, left_peak = _leg_order(T, (Pa, Pb, Pt), (Pa2, Pb2, Pt2))
+    right_order, right_fma, right_peak = _leg_order(T, (Pa2, Pb2, Pt2), (Pa, Pb, Pt))
+    return SitePlan(
+        src=src, dst=dst, physical=physical,
+        sign=np.asarray(sign).reshape(T, 1, 1, 1), onehot=np.eye(4)[physical],
+        gather_a=np.stack(ga), gather_b=np.stack(gb),
+        into=_table(dst, len(shared_out)), outof=_table(src, len(shared_in)),
+        left_order=left_order, right_order=right_order, left_fma=left_fma, right_fma=right_fma,
+        peak=max(left_peak, right_peak), fixed_rows=np.stack(rows), fixed_cols=np.stack(cols),
+        fixed_keys=tuple(keys), fixed_shapes=tuple(shapes))
+
+
+def make_factorized_layout(qa, qb, fixed_charges, shift=(0, 0), allow_empty=False) -> ContractionPlan:
     """Layout of <fixed MPS|walker> with the walker kept as its two spin channels.
 
     Environments at bond i are (n_shared, Pa, Pb, Pt): one padded (alpha, beta,
@@ -693,71 +770,42 @@ def make_factorized_layout(qa, qb, fixed_charges) -> ContractionPlan:
     and the interleave sign (-1)^(n_alpha N_beta) keep their own labels, so nothing
     else changes. The layout depends on the labels only; fixed_blocks gathers the
     blocks of any fixed MPS with these labels (blocks is None here).
+
+    shift: the walker label c meets the fixed label key(c + shift) (_fixed_key), for walkers on which operators
+    have removed electrons left of every bond (default: none). The walker side is unchanged. A shifted layout can
+    have no shared label at the first or last bonds: with allow_empty their site plans are None.
     """
     n = len(qa) - 1
-    ia, ib = [_index_1d(q) for q in qa], [_index_1d(q) for q in qb]
-    fixed_charges = [label_array(q) for q in fixed_charges]
-    key = _fixed_key(fixed_charges[0].shape[1])
-    it = [_charge_index(q) for q in fixed_charges]
+    index = _layout_index(qa, qb, fixed_charges)
+    ia, ib, it, fixed_charges = index
+    key = _fixed_key(fixed_charges[0].shape[1], shift)
     shared = [sorted(c for c in itertools.product(ia[i], ib[i]) if key(c) in it[i]) for i in range(n + 1)]
     pads = [(max((len(ia[i][c[0]]) for c in shared[i]), default=1),
              max((len(ib[i][c[1]]) for c in shared[i]), default=1),
              max((len(it[i][key(c)]) for c in shared[i]), default=1)) for i in range(n + 1)]
 
-    sites = []
     exact = sum(len(ia[i][c[0]]) * len(ib[i][c[1]]) * len(it[i][key(c)]) for i in range(n + 1) for c in shared[i])
     padded = sum(len(shared[i]) * int(np.prod(pads[i])) for i in range(n + 1))
-    for site in range(n):
-        (Pa, Pb, Pt), (Pa2, Pb2, Pt2) = pads[site], pads[site + 1]
-        out_index = {c: j for j, c in enumerate(shared[site + 1])}
-        Dla, Dra = len(qa[site]), len(qa[site + 1])
-        Dlb, Drb = len(qb[site]), len(qb[site + 1])
-        Dlt, Drt = len(fixed_charges[site]), len(fixed_charges[site + 1])
-        src, dst, physical, sign, ga, gb, rows, cols, keys, shapes = [], [], [], [], [], [], [], [], [], []
-        for s, c in enumerate(shared[site]):
-            for p, (na, nb) in enumerate(PHYSICAL):
-                c2 = (c[0] + na, c[1] + nb)
-                if c2 not in out_index:
-                    continue
-                ra, ca_ = ia[site][c[0]], ia[site + 1][c2[0]]
-                rb, cb_ = ib[site][c[1]], ib[site + 1][c2[1]]
-                rt, ct = it[site][key(c)], it[site + 1][key(c2)]
-                a = np.full((Pa, Pa2), Dla * 2 * Dra, np.int32)
-                a[:len(ra), :len(ca_)] = ra[:, None] * 2 * Dra + na * Dra + ca_[None, :]
-                b = np.full((Pb, Pb2), Dlb * 2 * Drb, np.int32)
-                b[:len(rb), :len(cb_)] = rb[:, None] * 2 * Drb + nb * Drb + cb_[None, :]
-                r = np.full(Pt, Dlt, np.int32)
-                r[:len(rt)] = rt
-                k = np.full(Pt2, Drt, np.int32)
-                k[:len(ct)] = ct
-                src.append(s)
-                dst.append(out_index[c2])
-                physical.append(p)
-                sign.append((-1.0) ** (na * c[1]))
-                ga.append(a)
-                gb.append(b)
-                rows.append(r)
-                cols.append(k)
-                keys.append((key(c), p, key(c2)))
-                shapes.append((len(rt), len(ct)))
-        T = len(src)
-        if T == 0:
-            raise AssertionError(f"no allowed transition at site {site}: the walker and trial share no path")
-        src, dst, physical = np.asarray(src), np.asarray(dst), np.asarray(physical)
-        left_order, left_fma, left_peak = _leg_order(T, (Pa, Pb, Pt), (Pa2, Pb2, Pt2))
-        right_order, right_fma, right_peak = _leg_order(T, (Pa2, Pb2, Pt2), (Pa, Pb, Pt))
-        sites.append(SitePlan(
-            src=src, dst=dst, physical=physical,
-            sign=np.asarray(sign).reshape(T, 1, 1, 1), onehot=np.eye(4)[physical],
-            gather_a=np.stack(ga), gather_b=np.stack(gb),
-            into=_table(dst, len(shared[site + 1])), outof=_table(src, len(shared[site])),
-            left_order=left_order, right_order=right_order, left_fma=left_fma, right_fma=right_fma,
-            peak=max(left_peak, right_peak), fixed_rows=np.stack(rows), fixed_cols=np.stack(cols),
-            fixed_keys=tuple(keys), fixed_shapes=tuple(shapes)))
-    stats = dict(exact_entries=exact, padded_entries=padded, transitions=sum(len(s.src) for s in sites),
-                 env_entries=padded, contraction_fma=sum(s.left_fma for s in sites),
+    sites = [_site_plan(site, qa, qb, index, shared[site], shared[site + 1], pads[site], pads[site + 1], key, key,
+                        IDENTITY_MOVES, allow_empty) for site in range(n)]
+    stats = dict(exact_entries=exact, padded_entries=padded, transitions=sum(len(s.src) for s in sites if s),
+                 env_entries=padded, contraction_fma=sum(s.left_fma for s in sites if s),
                  max_pads=tuple(int(max(p[j] for p in pads)) for j in range(3)))
-    return ContractionPlan(tuple(sites), tuple(shared), tuple(pads), None, stats)
+    return ContractionPlan(tuple(sites), tuple(shared), tuple(pads), None, stats, (int(shift[0]), int(shift[1])))
+
+
+def insertion_site_plan(qa, qb, fixed_charges, layout_in: ContractionPlan, layout_out: ContractionPlan, site,
+                        moves):
+    """The transitions of `site` from layout_in's bond `site` to layout_out's bond `site` + 1 for an operator
+    acting on the walker there: moves (p_walker, p_fixed, coefficient, jw) as in _site_plan, layout_out.shift =
+    layout_in.shift + charge(p_fixed) - charge(p_walker). Both layouts must pair the walker with the same fixed
+    labels (fixed_charges). None if no transition is allowed. For contractions only, not for field_sweep or
+    szsz_contract, which read the site plan's physical index as the walker's."""
+    index = _layout_index(qa, qb, fixed_charges)
+    width = index[3][0].shape[1]
+    return _site_plan(site, qa, qb, index, layout_in.shared[site], layout_out.shared[site + 1],
+                      layout_in.pads[site], layout_out.pads[site + 1], _fixed_key(width, layout_in.shift),
+                      _fixed_key(width, layout_out.shift), moves, allow_empty=True)
 
 
 def fixed_blocks(fixed, plan: ContractionPlan, xp=jnp) -> tuple:
@@ -935,6 +983,158 @@ def szsz_dense(tensors, fixed):
             stack = opened[None]
         left = jnp.einsum("ab,apr,bps->rs", left, A, B)
     return _symmetric_matrix(diagonal, pairs) / right[0][0, 0]
+
+
+# ============================================================================
+# Pair operators on the walker: <tau| c_u c_v |walker> for bra states tau (trot.meas.mps_pairing)
+# ============================================================================
+
+PAIR_SHIFTS = ((0, 0), (-1, 0), (0, -1), (-1, -1))  # walker electrons removed left of the bond: none, up, down, both
+
+
+class PairKernel(NamedTuple):
+    """The static contraction structure of the pair kernel for one walker plan and one pair space (host data).
+
+    A bra state tau (an MPS in the pair space: labelled slots that every term of the pairing observable shares)
+    meets the walker with S_b = c_{u s} c_{v s'} (u < v) applied to it. The walker label c of the factorized
+    layout is the label of the *original* walker; once c_u has acted (bonds u + 1 .. v) the operated walker has
+    one electron fewer of spin s, and tau's label is matched to c + shift. So four layouts (PAIR_SHIFTS): plain
+    sweeps with no operator yet, with c_u applied (shift -e_s), and after c_v the right environments (-(1, 1)).
+    The operators are insertions between layouts: opening c_u (plain -> shift -e_s) and closing c_v (shift -e_s ->
+    shift -(1, 1)); the walker's physical state p is replaced by p - e_s on the bra side.
+    """
+
+    n_sites: int
+    n_bonds: int
+    plain: tuple  # 4 layouts x sites: SitePlan or None where the schedule never uses it
+    opening: tuple  # spin s x sites
+    closing: tuple  # spin s x sites
+    schedule: tuple  # per lower site u: (u, last partner site, ((v, bond index), ...))
+    left_stop: int  # plain left environments are needed up to this bond
+    right_stop: int  # right environments are needed down to this bond
+
+
+class PairBlocks(NamedTuple):
+    """Per-site gathered blocks, with the structure of a PairKernel's plans (None where the plan is None)."""
+
+    plain: tuple
+    opening: tuple
+    closing: tuple
+
+
+def make_pair_kernel(qa, qb, plabels, bonds, opening_moves, closing_moves) -> PairKernel:
+    """plabels: the pair space's label arrays per bond (every bra term's slots, by true label); bonds: list of (u, v),
+    u < v; opening_moves[s] / closing_moves[s]: the (p_walker, p_fixed, coefficient, True) moves of c_{.. s} acting on
+    the walker at the opening / closing site (the coefficient of an opening includes the singlet's sign for s)."""
+    n = len(qa) - 1
+    layouts = [make_factorized_layout(qa, qb, plabels, shift, allow_empty=True) for shift in PAIR_SHIFTS]
+    partners = {}
+    for b, (u, v) in enumerate(bonds):
+        partners.setdefault(u, []).append((v, b))
+    left_stop = max(partners)
+    right_stop = min(v for _, v in bonds) + 1
+    need_plain = [set(range(left_stop)), set(), set(), set(range(right_stop, n))]
+    need_open, need_close, schedule = [set(), set()], [set(), set()], []
+    for u, plist in sorted(partners.items()):
+        last = max(v for v, _ in plist)
+        schedule.append((u, last, tuple(sorted(plist))))
+        for s in (0, 1):
+            need_open[s].add(u)
+            need_plain[1 + s].update(range(u + 1, last))
+            need_close[s].update(v for v, _ in plist)
+
+    def pick(plans, needed, what):
+        out = []
+        for site, sp in enumerate(plans):
+            if site in needed and sp is None:
+                raise ValueError(f"the pair space and the walker share no path at site {site} ({what})")
+            out.append(sp if site in needed else None)
+        return tuple(out)
+
+    plain = tuple(pick(layouts[k].sites, need_plain[k], f"plain, shift {PAIR_SHIFTS[k]}") for k in range(4))
+    opening = tuple(pick([insertion_site_plan(qa, qb, plabels, layouts[0], layouts[1 + s], site, opening_moves[s])
+                          if site in need_open[s] else None for site in range(n)], need_open[s], f"opening {s}")
+                    for s in (0, 1))
+    closing = tuple(pick([insertion_site_plan(qa, qb, plabels, layouts[1 + s], layouts[3], site, closing_moves[s])
+                          if site in need_close[s] else None for site in range(n)], need_close[s], f"closing {s}")
+                    for s in (0, 1))
+    return PairKernel(n, len(bonds), plain, opening, closing, tuple(schedule), left_stop, right_stop)
+
+
+def pair_walker_blocks(alpha, beta, kernel: PairKernel) -> PairBlocks:
+    """The walker channels' gathered (alpha, beta) blocks of every plan the schedule uses."""
+    def gather(plans):
+        return tuple(None if sp is None else (_gather_flat(alpha[site], sp.gather_a, 3),
+                                              _gather_flat(beta[site], sp.gather_b, 3))
+                     for site, sp in enumerate(plans))
+    return PairBlocks(tuple(gather(p) for p in kernel.plain), tuple(gather(p) for p in kernel.opening),
+                      tuple(gather(p) for p in kernel.closing))
+
+
+def pair_fixed_blocks(kernel: PairKernel, trial, slot_to_trial, phys_src, phys_sign) -> PairBlocks:
+    """The bra term's blocks of every plan the schedule uses, gathered from the dense trial tensors.
+
+    The term is the trial with a physical remap and sign per site (phys_src[site, p] is the trial's physical state
+    that the term's local operator sends to p, phys_sign[site, p] the matrix element, zero if there is none), on a
+    slot space shared by all terms: slot_to_trial[bond][slot] is the trial's bond index of that slot for this term,
+    the trial's bond dimension (the zero fill) if the slot is unused. All plans of one bond share the slots."""
+    def gather(plans):
+        out = []
+        for site, sp in enumerate(plans):
+            if sp is None:
+                out.append(None)
+                continue
+            rows = slot_to_trial[site][sp.fixed_rows]
+            cols = slot_to_trial[site + 1][sp.fixed_cols]
+            src, sign = phys_src[site][sp.physical], phys_sign[site][sp.physical]
+            blocks = jnp.asarray(trial[site]).at[rows[:, :, None], src[:, None, None], cols[:, None, :]].get(
+                mode="fill", fill_value=0.0)
+            out.append(blocks * sign[:, None, None])
+        return tuple(out)
+    return PairBlocks(tuple(gather(p) for p in kernel.plain), tuple(gather(p) for p in kernel.opening),
+                      tuple(gather(p) for p in kernel.closing))
+
+
+def pair_term_values(kernel: PairKernel, wblocks: PairBlocks, fblocks: PairBlocks):
+    """<tau| S_b |walker> (before dividing by <T|walker>) for every walker bond b = (u, v), one walker and one bra
+    term tau; S_b = sum_s sign_s c_{u s} c_{v, 1-s}. Returns (n_bonds,).
+
+    One right sweep (shift -(1, 1)) stores R[bond]; one plain left sweep gives the environment E[u] at every lower
+    site. For every lower site u and spin s the member "c_u applied" opens at u from E[u], moves through the
+    sites to the last partner in the shift -e_s layout and closes with c_v at each partner v against R[v + 1]."""
+    n = kernel.n_sites
+
+    right = {n: jnp.ones((1, 1, 1, 1))}
+    for site in range(n - 1, kernel.right_stop - 1, -1):
+        sp = kernel.plain[3][site]
+        (Wa, Wb), F = wblocks.plain[3][site], fblocks.plain[3][site]
+        Y = _legs(right[site + 1][sp.dst], (Wa, Wb, F), sp.right_order, False) * sp.sign
+        right[site] = _reduce(Y, sp.outof)
+
+    def move(env, plans, wfam, ffam, site):
+        sp = plans[site]
+        (Wa, Wb), F = wfam[site], ffam[site]
+        return sp, _legs(env[sp.src], (Wa, Wb, F), sp.left_order, True) * sp.sign
+
+    left = {0: jnp.ones((1, 1, 1, 1))}
+    for site in range(kernel.left_stop):
+        sp, Y = move(left[site], kernel.plain[0], wblocks.plain[0], fblocks.plain[0], site)
+        left[site + 1] = _reduce(Y, sp.into)
+
+    values = [jnp.zeros(()) for _ in range(kernel.n_bonds)]
+    for u, last, partners in kernel.schedule:
+        closes = dict(partners)
+        for s in (0, 1):
+            sp, Y = move(left[u], kernel.opening[s], wblocks.opening[s], fblocks.opening[s], u)
+            member = _reduce(Y, sp.into)
+            for site in range(u + 1, last + 1):
+                if site in closes:
+                    sp, Y = move(member, kernel.closing[s], wblocks.closing[s], fblocks.closing[s], site)
+                    values[closes[site]] = values[closes[site]] + jnp.sum(Y * right[site + 1][sp.dst])
+                if site < last:
+                    sp, Y = move(member, kernel.plain[1 + s], wblocks.plain[1 + s], fblocks.plain[1 + s], site)
+                    member = _reduce(Y, sp.into)
+    return jnp.stack(values)
 
 
 # ============================================================================
