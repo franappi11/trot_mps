@@ -62,7 +62,7 @@ params = QmcParamsMps(
     occupation_tolerance=1e-10,
     orbital_plan="adaptive",
     #Bond dimension per spin
-    walker_channel_chi=32,
+    walker_channel_chi=16,
     plan_reference="natural",  # determinant that freezes the conversion circuit: the trial's natural orbitals
     walker_start="natural",  # every walker starts from the trial's natural determinant
 )

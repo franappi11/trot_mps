@@ -25,15 +25,25 @@ from trot.gmps.utils import contract_real
 
 
 class PairingSpec(NamedTuple):
-    """The lattice of the pairing operators (hashable: it goes into the measurement context's static key).
+    """The lattice of the pairing operators and how the blocked kernel evaluates them (hashable: it goes into the
+    measurement context's static key).
 
-    rows: sites j of Delta^dag(j) to measure, or None for all (the observable is (2, len(rows), L))."""
+    rows: sites j of Delta^dag(j) to measure, or None for all (the observable is (2, len(rows), L)).
+    method: "windows" (engine.pair_window_values: the contractions outside every bra bond's window are shared by all
+      bra terms) or "terms" (engine.pair_term_values: every bra term over the whole lattice, a lax.map over the terms).
+    term_batch: "terms" only, bra terms evaluated together (lax.map batch_size; 1: one after the other).
+    walker_batch: "windows" only, walkers evaluated together (lax.map batch_size), None: the whole batch at once.
+      The windowed kernel keeps the shared right objects of every bond of a walker alive, so this bounds the memory.
+    """
 
     Lx: int
     Ly: int
     boundary_x: str = "open"
     boundary_y: str = "open"
     rows: tuple | None = None
+    method: str = "windows"
+    term_batch: int = 1
+    walker_batch: int | None = None
 
     @property
     def n_sites(self) -> int:
@@ -196,7 +206,12 @@ class PairingStatic(NamedTuple):
     assemble: np.ndarray
 
 
+PAIRING_METHODS = ("windows", "terms")
+
+
 def pairing_static(spec: PairingSpec) -> PairingStatic:
+    if spec.method not in PAIRING_METHODS:
+        raise ValueError(f"PairingSpec.method must be one of {PAIRING_METHODS}, got {spec.method!r}")
     bonds, G = bond_structure(spec)
     rows = tuple(range(spec.n_sites)) if spec.rows is None else tuple(int(j) for j in spec.rows)
     active = [b for b in range(len(bonds)) if np.any(G[:, list(rows), b] != 0.0)]
@@ -224,6 +239,11 @@ class PairingData(NamedTuple):
     slot_to_trial: tuple  # per bond: (n_terms, n_slots + 1) int32, the trial's bond dimension where a slot is unused
     phys_src: np.ndarray  # (n_terms, L, 4) int32
     phys_sign: np.ndarray  # (n_terms, L, 4)
+    # per bond (n_slots + 1,): the slot maps of the trial with nothing / both electrons removed, which every bra term
+    # equals left / right of its window (the windowed kernel); valid where some bra term is so (bonds <= max u,
+    # bonds > min v), elsewhere unused
+    slot_plain: tuple
+    slot_both: tuple
 
 
 def phys_maps(site, u, v, s):
@@ -250,19 +270,23 @@ def build_pairing_data(trial_tensors, trial_charges, spec: PairingSpec):
     L = spec.n_sites
     labels = [label_array(q) for q in trial_charges]
     width = labels[0].shape[1]
+
+    def grouped(k, removed):
+        """True label -> trial indices at bond k of the trial with `removed` electrons removed left of it."""
+        g = {}
+        for i, lab in enumerate(map(tuple, (labels[k] - removed).tolist())):
+            if min(lab) >= 0:
+                g.setdefault(lab, []).append(i)
+        return g
+
     groups = []  # per term, per bond: true label -> trial indices
     for b, s in static.terms:
         u, v = static.bonds[b]
-        per_bond = []
-        for k in range(L + 1):
-            true = labels[k] - removed_electrons(width, k, u, v, s)
-            g = {}
-            for i, lab in enumerate(map(tuple, true.tolist())):
-                if min(lab) >= 0:
-                    g.setdefault(lab, []).append(i)
-            per_bond.append(g)
-        groups.append(per_bond)
-    plabels, slot_maps = [], [[] for _ in range(L + 1)]
+        groups.append([grouped(k, removed_electrons(width, k, u, v, s)) for k in range(L + 1)])
+    both = np.ones(2, int) if width == 2 else np.array([2])
+    plain_groups = [grouped(k, np.zeros(width, int)) for k in range(L + 1)]
+    both_groups = [grouped(k, both) for k in range(L + 1)]
+    plabels, slot_maps, slot_plain, slot_both = [], [[] for _ in range(L + 1)], [], []
     for k in range(L + 1):
         counts = {}
         for per_bond in groups:
@@ -271,14 +295,22 @@ def build_pairing_data(trial_tensors, trial_charges, spec: PairingSpec):
         order = sorted(counts)
         plabels.append(np.array([lab for lab in order for _ in range(counts[lab])], int).reshape(-1, width))
         D_T = labels[k].shape[0]
-        for per_bond in groups:
+
+        def slots_of(group):
+            # a label's indices fill its first slots; the plain / both maps are cut to the slots where no bra term
+            # has them (bonds where they are unused), the terms' never are
             slots = np.full(len(plabels[k]) + 1, D_T, np.int32)
             at = 0
             for lab in order:
-                idx = per_bond[k].get(lab, [])
+                idx = group.get(lab, [])[:counts[lab]]
                 slots[at:at + len(idx)] = idx
                 at += counts[lab]
-            slot_maps[k].append(slots)
+            return slots
+
+        for per_bond in groups:
+            slot_maps[k].append(slots_of(per_bond[k]))
+        slot_plain.append(slots_of(plain_groups[k]))
+        slot_both.append(slots_of(both_groups[k]))
     src = np.zeros((len(static.terms), L, 4), np.int32)
     sign = np.zeros((len(static.terms), L, 4))
     for t, (b, s) in enumerate(static.terms):
@@ -287,39 +319,96 @@ def build_pairing_data(trial_tensors, trial_charges, spec: PairingSpec):
             src[t, site], sign[t, site] = phys_maps(site, u, v, s)
         sign[t, u] *= SINGLET[s][1]
     data = PairingData(tuple(jnp.asarray(A) for A in trial_tensors),
-                       tuple(jnp.asarray(np.stack(m)) for m in slot_maps), jnp.asarray(src), jnp.asarray(sign))
+                       tuple(jnp.asarray(np.stack(m)) for m in slot_maps), jnp.asarray(src), jnp.asarray(sign),
+                       tuple(jnp.asarray(m) for m in slot_plain), tuple(jnp.asarray(m) for m in slot_both))
     return data, _hashable_charges(plabels)
 
 
 def pair_kernel_for(plan, plabels_key, spec: PairingSpec) -> engine.PairKernel:
-    """The static contraction structure for a walker plan and a pair space (cached on the plan)."""
-    key = ("pair_kernel", plabels_key, spec)
+    """The static contraction structure of the "terms" kernel for a walker plan and a pair space (cached on the plan)."""
+    lattice = spec._replace(method="terms", term_batch=1, walker_batch=None)  # the batch sizes do not change it
+    key = ("pair_kernel", plabels_key, lattice)
     kernel = plan.caches.get(key)
     if kernel is None:
         qa, qb = engine.converter_for(plan).charges
         plabels = [np.asarray(q, int).reshape(len(q), -1) for q in plabels_key]
-        kernel = engine.make_pair_kernel(qa, qb, plabels, list(pairing_static(spec).bonds),
+        kernel = engine.make_pair_kernel(qa, qb, plabels, list(pairing_static(lattice).bonds),
                                          (opening_moves(0), opening_moves(1)), (closing_moves(0), closing_moves(1)))
         plan.caches[key] = kernel
     return kernel
 
 
-def pairing_batch_blocked(kernel, static, kernels, data, pdata, spec, qa, qb):
-    """(n_walkers, 2, n_rows, L) pairing correlations of orthonormalised walkers (qa, qb), blocked kernel."""
+def pair_windows_for(plan, plabels_key, spec: PairingSpec) -> engine.PairWindows:
+    """The static structure of the "windows" kernel for a walker plan and a pair space (cached on the plan)."""
+    lattice = spec._replace(method="windows", term_batch=1, walker_batch=None)
+    key = ("pair_windows", plabels_key, lattice)
+    kernel = plan.caches.get(key)
+    if kernel is None:
+        static = pairing_static(lattice)
+        if static.terms[1::2] != tuple((b, 1) for b, _ in static.terms[::2]):
+            raise AssertionError("the windowed kernel expects the bra terms as (bond, 0), (bond, 1) pairs")
+        qa, qb = engine.converter_for(plan).charges
+        plabels = [np.asarray(q, int).reshape(len(q), -1) for q in plabels_key]
+        kernel = engine.make_pair_windows(qa, qb, plabels, list(static.bonds),
+                                          [static.bonds[b] for b, _ in static.terms[::2]],
+                                          (opening_moves(0), opening_moves(1)), (closing_moves(0), closing_moves(1)))
+        plan.caches[key] = kernel
+    return kernel
+
+
+def _converted(kernels, data, qa, qb):
+    """The walkers' channel MPS and their overlaps with the trial (no gauges: the ratios do not need them)."""
     alpha, beta, _ = jax.vmap(kernels.converter.convert)(qa, qb)
-    wblocks = jax.vmap(lambda a, b: engine.pair_walker_blocks(a, b, kernel))(alpha, beta)
     overlap = jax.vmap(lambda a, b: engine.left_contract(engine.walker_blocks(a, b, kernels.overlap_plan),
                                                          data.trial, kernels.overlap_plan))(alpha, beta)
+    return alpha, beta, overlap
+
+
+def _pairing_from(static, B):
+    """P_a = G_a B G_a^T for every walker: (n_walkers, 2, n_rows, L)."""
+    G = jnp.asarray(static.G)
+    return jnp.einsum("ajb,wbc,alc->wajl", G[:, list(static.rows)], B, G)
+
+
+def pairing_batch_blocked(kernel, static, kernels, data, pdata, spec, qa, qb):
+    """(n_walkers, 2, n_rows, L) pairing correlations of orthonormalised walkers (qa, qb), "terms" kernel: a lax.map
+    over the bra terms, spec.term_batch of them at a time."""
+    alpha, beta, overlap = _converted(kernels, data, qa, qb)
+    wblocks = jax.vmap(lambda a, b: engine.pair_walker_blocks(a, b, kernel))(alpha, beta)
 
     def one_term(xs):
         slot, src, sign = xs
         fixed = engine.pair_fixed_blocks(kernel, pdata.trial, slot, src, sign)
         return jax.vmap(lambda wb: engine.pair_term_values(kernel, wb, fixed))(wblocks)  # (n_walkers, n_bonds)
 
-    values = lax.map(one_term, (pdata.slot_to_trial, pdata.phys_src, pdata.phys_sign))  # (n_terms, n_walkers, n_bonds)
+    batch = min(int(spec.term_batch), len(static.terms)) if spec.term_batch and spec.term_batch > 1 else None
+    values = lax.map(one_term, (pdata.slot_to_trial, pdata.phys_src, pdata.phys_sign),
+                     batch_size=batch)  # (n_terms, n_walkers, n_bonds)
     B = jnp.einsum("bt,twc->wbc", jnp.asarray(static.assemble), values) / overlap[:, None, None]
-    G = jnp.asarray(static.G)
-    return jnp.einsum("ajb,wbc,alc->wajl", G[:, list(static.rows)], B, G)
+    return _pairing_from(static, B)
+
+
+def pairing_batch_windows(kernel, static, kernels, data, pdata, spec, qa, qb):
+    """(n_walkers, 2, n_rows, L) pairing correlations of orthonormalised walkers (qa, qb), "windows" kernel
+    (engine.pair_window_values), spec.walker_batch walkers at a time."""
+    alpha, beta, overlap = _converted(kernels, data, qa, qb)
+    L = len(pdata.trial)
+    identity = (jnp.tile(jnp.arange(4, dtype=jnp.int32), (L, 1)), jnp.ones((L, 4)))
+    plain_maps, both_maps = (pdata.slot_plain,) + identity, (pdata.slot_both,) + identity
+    window_maps = tuple((tuple(m[2 * i:2 * i + 2] for m in pdata.slot_to_trial), pdata.phys_src[2 * i:2 * i + 2],
+                         pdata.phys_sign[2 * i:2 * i + 2]) for i in range(len(kernel.windows)))
+
+    def one(walker):
+        wblocks = engine.pair_walker_blocks(*walker, kernel)
+        return engine.pair_window_values(kernel, wblocks, pdata.trial, plain_maps, both_maps, window_maps)
+
+    n = qa.shape[0]
+    if spec.walker_batch and spec.walker_batch < n:
+        values = lax.map(one, (alpha, beta), batch_size=int(spec.walker_batch))  # (n_walkers, n_terms, n_bonds)
+    else:
+        values = jax.vmap(one)((alpha, beta))
+    B = jnp.einsum("bt,wtc->wbc", jnp.asarray(static.assemble), values) / overlap[:, None, None]
+    return _pairing_from(static, B)
 
 
 class PairingFns(NamedTuple):
@@ -346,11 +435,14 @@ def pairing_fns(meas_ctx) -> PairingFns:
                 return pairing_dense(tensors, list(pdata.trial), spec)
             return jax.vmap(value)(qa, qb)
     else:
-        kernel = pair_kernel_for(plan, plabels_key, spec)
+        if spec.method == "windows":
+            kernel, blocked = pair_windows_for(plan, plabels_key, spec), pairing_batch_windows
+        else:
+            kernel, blocked = pair_kernel_for(plan, plabels_key, spec), pairing_batch_blocked
 
         def batch(ca, cb, data):
             qa, _ = kernels.batch_qr(ca)
             qb, _ = kernels.batch_qr(cb)
-            return pairing_batch_blocked(kernel, static, kernels, data, pdata, spec, qa, qb)
+            return blocked(kernel, static, kernels, data, pdata, spec, qa, qb)
 
     return PairingFns(batch, lambda ca, cb, data: batch(ca[None], cb[None], data)[0])

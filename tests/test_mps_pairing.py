@@ -227,6 +227,33 @@ def test_pairing_rows_are_the_rows_of_the_full_matrix(ed_2x3, kernel):
     np.testing.assert_allclose(sub, full[:, :, [1, 4], :], rtol=0, atol=1e-11)
 
 
+def _pairing_batch(case, plan_kind, spec):
+    """(n_walkers, 2, n_rows, L) from the batched kernel the MPS block uses, all walkers in one call."""
+    ops = make_mps_meas_ops_hubbard(case.plans[plan_kind], energy_kernel="blocked", pairing=spec)
+    ctx = ops.build_meas_ctx(case.ham, case.trial)
+    ca = jnp.stack([jnp.asarray(w[0]) for w in case.walkers])
+    cb = jnp.stack([jnp.asarray(w[1]) for w in case.walkers])
+    return np.asarray(jax.jit(lambda a, b, c: mp.pairing_fns(c).batch(a, b, c.data()))(ca, cb, ctx))
+
+
+@pytest.mark.parametrize("plan_kind", ["exact", "truncated"])
+@pytest.mark.parametrize("case", ENERGY_CASES, indirect=True)
+def test_pairing_kernels_agree(case, plan_kind):
+    """The windowed kernel (the default) equals the per-term one, for all rows and a subset, with the walkers together
+    or in batches and the terms one at a time or several (lax.map with remainders: 6 walkers by 4, 8-14 terms by 3)."""
+    for rows in (None, (1, 4)):
+        spec = _spec(case)._replace(rows=rows)
+        want = _pairing_batch(case, plan_kind, spec._replace(method="terms"))
+        assert np.abs(want).max() > 1e-3
+        for variant in (spec, spec._replace(walker_batch=4), spec._replace(method="terms", term_batch=3)):
+            np.testing.assert_allclose(_pairing_batch(case, plan_kind, variant), want, rtol=0, atol=1e-10)
+
+
+def test_pairing_spec_rejects_unknown_methods():
+    with pytest.raises(ValueError, match="method"):
+        mp.pairing_static(mp.PairingSpec(1, 4, method="fast"))
+
+
 def test_pairing_without_a_spec_is_not_an_observable(ed_2x3):
     """Ops built without a pairing spec do not offer the observable, and a context without data refuses it."""
     ops = make_mps_meas_ops_hubbard(ed_2x3.plans["exact"])

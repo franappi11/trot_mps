@@ -1079,20 +1079,20 @@ def pair_fixed_blocks(kernel: PairKernel, trial, slot_to_trial, phys_src, phys_s
     slot space shared by all terms: slot_to_trial[bond][slot] is the trial's bond index of that slot for this term,
     the trial's bond dimension (the zero fill) if the slot is unused. All plans of one bond share the slots."""
     def gather(plans):
-        out = []
-        for site, sp in enumerate(plans):
-            if sp is None:
-                out.append(None)
-                continue
-            rows = slot_to_trial[site][sp.fixed_rows]
-            cols = slot_to_trial[site + 1][sp.fixed_cols]
-            src, sign = phys_src[site][sp.physical], phys_sign[site][sp.physical]
-            blocks = jnp.asarray(trial[site]).at[rows[:, :, None], src[:, None, None], cols[:, None, :]].get(
-                mode="fill", fill_value=0.0)
-            out.append(blocks * sign[:, None, None])
-        return tuple(out)
+        return tuple(None if sp is None else _pair_block(sp, site, trial, slot_to_trial, phys_src, phys_sign)
+                     for site, sp in enumerate(plans))
     return PairBlocks(tuple(gather(p) for p in kernel.plain), tuple(gather(p) for p in kernel.opening),
                       tuple(gather(p) for p in kernel.closing))
+
+
+def _pair_block(sp, site, trial, slot_to_trial, phys_src, phys_sign):
+    """The (T, Pt, Pt') blocks of one plan of a bra term (see pair_fixed_blocks)."""
+    rows = slot_to_trial[site][sp.fixed_rows]
+    cols = slot_to_trial[site + 1][sp.fixed_cols]
+    src, sign = phys_src[site][sp.physical], phys_sign[site][sp.physical]
+    blocks = jnp.asarray(trial[site]).at[rows[:, :, None], src[:, None, None], cols[:, None, :]].get(
+        mode="fill", fill_value=0.0)
+    return blocks * sign[:, None, None]
 
 
 def pair_term_values(kernel: PairKernel, wblocks: PairBlocks, fblocks: PairBlocks):
@@ -1135,6 +1135,221 @@ def pair_term_values(kernel: PairKernel, wblocks: PairBlocks, fblocks: PairBlock
                     sp, Y = move(member, kernel.plain[1 + s], wblocks.plain[1 + s], fblocks.plain[1 + s], site)
                     member = _reduce(Y, sp.into)
     return jnp.stack(values)
+
+
+# Windowed pair kernel: a bra term differs from the trial only inside its bond's window, so the contractions outside
+# the windows are shared by all terms.
+
+class PairWindows(NamedTuple):
+    """The static structure of the windowed pair kernel (host data; pair_window_values).
+
+    The bra term c_{p s} c_{q, 1-s}|T> of the bond (p, q) is, on the pair space, the trial with nothing removed left
+    of p and the trial with both electrons removed right of q: only its window [p, q] (the operators and the
+    Jordan-Wigner string between them) is its own. The plans are those of PairKernel (four layouts, the insertions
+    c_u and c_v), here for every site, so that the shared contractions can run in both directions.
+    """
+
+    n_sites: int
+    bonds: tuple  # walker bonds (u, v), u < v
+    plain: tuple  # 4 layouts x sites: SitePlan, None where the layout shares no label
+    opening: tuple  # spin s x sites: c_{u s} at every lower site u of a walker bond, else None
+    closing: tuple  # spin s x sites: c_{v, 1-s} at every upper site v
+    lower: tuple  # (u, ((v, b), ...)) for every lower site u, increasing
+    upper: tuple  # (v, ((u, b), ...)) for every upper site v, increasing
+    windows: tuple  # (p, q) of every bra bond, in the order of the bra terms (spins 0 and 1 of each bond)
+
+
+def make_pair_windows(qa, qb, plabels, bonds, windows, opening_moves, closing_moves) -> PairWindows:
+    """As make_pair_kernel, with windows: the bonds (p, q) of the bra terms, two terms (spins 0, 1) per bond."""
+    if not windows:
+        raise ValueError("the pairing observable has no bra term")
+    n = len(qa) - 1
+    layouts = [make_factorized_layout(qa, qb, plabels, shift, allow_empty=True) for shift in PAIR_SHIFTS]
+    lower, upper = {}, {}
+    for b, (u, v) in enumerate(bonds):
+        lower.setdefault(u, []).append((v, b))
+        upper.setdefault(v, []).append((u, b))
+    opening = tuple(tuple(insertion_site_plan(qa, qb, plabels, layouts[0], layouts[1 + s], site, opening_moves[s])
+                          if site in lower else None for site in range(n)) for s in (0, 1))
+    closing = tuple(tuple(insertion_site_plan(qa, qb, plabels, layouts[1 + s], layouts[3], site, closing_moves[s])
+                          if site in upper else None for site in range(n)) for s in (0, 1))
+    return PairWindows(n, tuple((int(u), int(v)) for u, v in bonds), tuple(layout.sites for layout in layouts),
+                       opening, closing, tuple((u, tuple(sorted(p))) for u, p in sorted(lower.items())),
+                       tuple((v, tuple(sorted(p))) for v, p in sorted(upper.items())),
+                       tuple((int(p), int(q)) for p, q in windows))
+
+
+def _pair_plan(kernel, family, k, site):
+    sp = getattr(kernel, family)[k][site]
+    if sp is None:
+        raise ValueError(f"the pair space and the walker share no path at site {site} ({family} {k})")
+    return sp
+
+
+def _env_step(env, plan, forward=True):
+    """Carry an environment over the plan's site: left to right (bond site -> site + 1) or right to left."""
+    sp, (Wa, Wb), F = plan
+    if forward:
+        return _reduce(_legs(env[sp.src], (Wa, Wb, F), sp.left_order, True) * sp.sign, sp.into)
+    return _reduce(_legs(env[sp.dst], (Wa, Wb, F), sp.right_order, False) * sp.sign, sp.outof)
+
+
+def _env_close(env, plan, right):
+    """A left environment carried over the plan's site and contracted with the right environment after it."""
+    sp, (Wa, Wb), F = plan
+    return jnp.sum(_legs(env[sp.src], (Wa, Wb, F), sp.left_order, True) * sp.sign * right[sp.dst])
+
+
+def _push(stack, ids, new):
+    """Append the environments new {walker bond: env} to a stack of environments of one bond."""
+    if not new:
+        return stack, ids
+    keys = tuple(sorted(new))
+    add = jnp.stack([new[b] for b in keys])
+    return (add, keys) if stack is None else (jnp.concatenate((stack, add)), ids + keys)
+
+
+def pair_window_values(kernel: PairWindows, wblocks: PairBlocks, trial, plain_maps, both_maps, window_maps):
+    """<tau_t| S_b |walker> (before dividing by <T|walker>) for every bra term t and walker bond b of one walker:
+    (n_terms, n_bonds), the terms in the order of kernel.windows (spins 0 and 1 of each bond).
+
+    maps: (slot_to_trial per bond, phys_src (L, 4), phys_sign (L, 4)) as in pair_fixed_blocks; plain_maps / both_maps
+    the trial on the pair space with nothing / both electrons removed, window_maps[i] the two terms of bra bond i (a
+    leading axis 2 on every array; the window is evaluated for both at once). With Kl = max p and Kr = min q + 1:
+      right of the windows, against both_maps down to bond Kr: the right environments R (shift -(1, 1)), the members
+        "c_v applied" of every upper site v carried left (shift -e_s), and per bond the stack of the walker bonds
+        that lie right of it (shift 0) -- the walker bonds right of a window;
+      left of the windows, against plain_maps, one sweep up to bond Kl: the plain environment E, the members "c_u
+        applied" of every lower site u (shift -e_s) and the stack of the walker bonds that lie left of the bond
+        (shift -(1, 1)). A window (p, q) is evaluated when the sweep is at bond p.
+    Only the window's sites are contracted with the term's own blocks: E and R through it, and the walker bonds that
+    cross it (c_u before or inside, c_v inside or after) meet the shared objects at its edges. Every (b, t) pair is
+    counted once: b left of the window (v < p), right of it (u > q), or crossing it.
+    """
+    n, bonds = kernel.n_sites, kernel.bonds
+    lower = dict(kernel.lower)
+    last = {u: max(v for v, _ in partners) for u, partners in kernel.lower}
+    first = {v: min(u for u, _ in partners) for v, partners in kernel.upper}
+    Kl = max(p for p, _ in kernel.windows)
+    Kr = min(q for _, q in kernel.windows) + 1
+    one = jnp.ones((1, 1, 1, 1))
+
+    def plans(maps):
+        """(plan, walker blocks, fixed blocks) of (family, layout or spin, site) for one bra MPS, gathered once."""
+        cache = {}
+
+        def at(family, k, site):
+            if (family, k, site) not in cache:
+                sp = _pair_plan(kernel, family, k, site)
+                cache[family, k, site] = (sp, getattr(wblocks, family)[k][site],
+                                          _pair_block(sp, site, trial, *maps))
+            return cache[family, k, site]
+        return at
+
+    # Right of the windows: the trial with both electrons removed
+    at = plans(both_maps)
+    right = {n: one}
+    for site in range(n - 1, Kr - 1, -1):
+        right[site] = _env_step(right[site + 1], at("plain", 3, site), False)
+    applied_v, right_of = {}, {}  # (v, s) -> {bond: env}; walker bond -> env at bond u (c_u and c_v applied)
+    for v, partners in kernel.upper:
+        if v < Kr:
+            continue
+        stop = max(first[v] + 1, Kr)
+        for s in (0, 1):
+            track = {v: _env_step(right[v + 1], at("closing", s, v), False)}
+            for bond in range(v, stop - 1, -1):
+                for u, b in partners:
+                    if u == bond - 1 and u >= Kr:
+                        env = _env_step(track[bond], at("opening", s, u), False)
+                        right_of[b] = right_of[b] + env if b in right_of else env
+                if bond > stop:
+                    track[bond - 1] = _env_step(track[bond], at("plain", 1 + s, bond - 1), False)
+            applied_v[v, s] = track
+    right_stacks, stack, ids = {}, None, ()  # bond -> (stack of the walker bonds right of it, their indices)
+    for site in range(n - 1, Kr - 1, -1):
+        if stack is not None:
+            plan = at("plain", 0, site)
+            stack = jax.vmap(lambda env: _env_step(env, plan, False))(stack)
+        stack, ids = _push(stack, ids, {b: env for b, env in right_of.items() if bonds[b][0] == site})
+        if stack is not None:
+            right_stacks[site] = (stack, ids)
+
+    def window(p, q, env_p, applied_p, left_p, slots, src, sign):
+        """The values of one bra term (one spin of the bond (p, q)), the left objects at bond p given."""
+        at_w = plans((slots, src, sign))
+        held = dict(applied_p)  # (u, s) -> env: the members c_u applied before p whose c_v is at p or later
+        opens = [u for u in range(p, q + 1) if u in lower]
+        closes = ({v for u, _ in held for v, _ in lower[u] if p <= v <= q}
+                  | {v for u in opens for v, _ in lower[u] if v <= q})
+        top = q + 1 if q + 1 in right_stacks else max(opens, default=p)
+        bottom = p if left_p is not None else min((v + 1 for v in closes), default=q + 1)
+        E = {p: env_p}
+        for site in range(p, top):
+            E[site + 1] = _env_step(E[site], at_w("plain", 0, site))
+        R = {q + 1: right[q + 1]}
+        for site in range(q, bottom - 1, -1):
+            R[site] = _env_step(R[site + 1], at_w("plain", 3, site), False)
+        index, values = [], []
+        if left_p is not None:  # walker bonds left of the window
+            index += left_p[1]
+            values.append(jnp.tensordot(left_p[0], R[p], axes=R[p].ndim))
+        if q + 1 in right_stacks:  # right of it
+            stack_r, ids_r = right_stacks[q + 1]
+            index += ids_r
+            values.append(jnp.tensordot(stack_r, E[q + 1], axes=E[q + 1].ndim))
+        for site in range(p, q + 1):  # crossing it
+            moved = {}
+            for (u, s), env in held.items():
+                for v, b in lower[u]:
+                    if v == site:
+                        index.append(b)
+                        values.append(_env_close(env, at_w("closing", s, site), R[site + 1])[None])
+                if last[u] > site:
+                    moved[u, s] = _env_step(env, at_w("plain", 1 + s, site))
+            if site in lower:
+                for s in (0, 1):
+                    moved[site, s] = _env_step(E[site], at_w("opening", s, site))
+            held = moved
+        for (u, s), env in held.items():  # c_v after the window: the right members close them
+            for v, b in lower[u]:
+                if v > q:
+                    index.append(b)
+                    values.append(jnp.sum(env * applied_v[v, s][q + 1])[None])
+        out = jnp.zeros(len(bonds))
+        return out.at[np.asarray(index, int)].add(jnp.concatenate(values)) if index else out
+
+    # Left of the windows: the plain trial, one sweep; each window when the sweep reaches its p
+    at = plans(plain_maps)
+    starts = {}
+    for i, (p, _) in enumerate(kernel.windows):
+        starts.setdefault(p, []).append(i)
+    rows = [None] * len(kernel.windows)
+    env, applied, stack, ids = one, {}, None, ()  # at bond k: E, members {(u, s): env}, left stack
+    for k in range(Kl + 1):
+        for i in starts.get(k, ()):
+            p, q = kernel.windows[i]
+            rows[i] = jax.vmap(partial(window, p, q, env, applied, None if stack is None else (stack, ids)))(
+                *window_maps[i])
+        if k == Kl:
+            break
+        closed, moved = {}, {}
+        for (u, s), member in applied.items():
+            for v, b in lower[u]:
+                if v == k:
+                    x = _env_step(member, at("closing", s, k))
+                    closed[b] = closed[b] + x if b in closed else x
+            if last[u] > k:
+                moved[u, s] = _env_step(member, at("plain", 1 + s, k))
+        if k in lower:
+            for s in (0, 1):
+                moved[k, s] = _env_step(env, at("opening", s, k))
+        if stack is not None:
+            plan = at("plain", 3, k)
+            stack = jax.vmap(lambda e: _env_step(e, plan))(stack)
+        stack, ids = _push(stack, ids, closed)
+        env, applied = _env_step(env, at("plain", 0, k)), moved
+    return jnp.concatenate(rows)
 
 
 # ============================================================================
