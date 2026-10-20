@@ -2,10 +2,8 @@ from trot import config
 
 config.configure_once()  # set the precision; before importing jax
 from pathlib import Path
-
 import jax.numpy as jnp
 import numpy as np
-
 from trot.core.system import System
 from trot.driver import run_qmc
 from trot.gmps.dmrg import make_dmrg_trial
@@ -14,7 +12,6 @@ from trot.meas.mps import make_mps_meas_ops_hubbard
 from trot.prop import mps_cpmc
 from trot.prop.types import QmcParamsMps
 from trot.trial.mps import make_mps_trial, make_mps_trial_ops, make_walker_plan, rotate_spin, spin_rotation_y
-
 from trot.trial.mps_rotation import rotate_mps_trial, rotated_rdm1
 
 
@@ -42,7 +39,7 @@ params = QmcParamsMps(
     n_chunks=4,  # 4 chunks of 100 walkers, so each fits in the 20 GB MIG slice
     auto_n_chunks=False,  # skip the automatic chunk search
     n_eql_blocks=50,  
-    n_blocks=500,
+    n_blocks=200,
     dt=0.005,
     n_prop_steps=50,
     weight_floor=1e-8,
@@ -55,8 +52,8 @@ params = QmcParamsMps(
     #Adaptive uses the smaller block size that satisfies the tolerance
     occupation_tolerance=1e-10,
     orbital_plan="adaptive",
-    #Bond dimensio per spin
-    walker_channel_chi=32,
+    #Bond dimension per spin
+    walker_channel_chi=16,
     plan_reference="natural",  # determinant that freezes the conversion circuit: the trial's natural orbitals
     walker_start="natural",  # every walker starts from the trial's natural determinant
 )
@@ -88,7 +85,7 @@ prop_ctx = prop_ops.build_prop_ctx(ham, trial_ops.get_rdm1(trial), params)  # (h
 
 # Walkers at the start and after every SAVE_EVERY-th block (equilibration blocks count too), one npz each:
 # up, dn of shape (n_walkers, N, n_up / n_dn). After a block's comb every walker has the same weight.
-OUT = Path("/mnt/ceph/users/fnappi/trot_walkers/sq6x6_U8_ex2d")
+OUT = Path("/mnt/ceph/users/fnappi/trot_walkers/sq6x6_U8_ex2d_timing")
 OUT.mkdir(parents=True, exist_ok=True)
 SAVE_EVERY = 50
 state = prop_ops.init_prop_state(sys=sys, ham_data=ham, trial_ops=trial_ops, trial_data=trial, meas_ops=meas_ops,

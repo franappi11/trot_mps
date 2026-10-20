@@ -427,6 +427,49 @@ def test_block_form_htrial_gives_the_dense_energies(dmrg, name):
 
 
 @pytest.mark.parametrize("name", ["L8", "sq2x4oo"])
+def test_cached_block_form_htrial_rotated_gives_the_dense_energies_of_the_as_is_rotated_trial(dmrg, name):
+    """run_mps_cpmc.py --cache-htrial --trial-rotation 90 --rotated-trial as_is: H commutes with the spin rotation, so
+    the cached block-form H|trial> of the unrotated trial, relabelled by N and rotated (trials.rotate_htrial_blocks),
+    gives the local energies of the dense H|trial> of the rotated trial, which a run without the cache builds."""
+    h1, d = CASES[name], dmrg(name)
+    (tensors, labels), info = trials.load_or_make_htrial(d.path, h1, U, d.tensors, d.charges, d.variational_energy,
+                                                        say=_quiet)
+    trial, _ = trials.make_trial(d.tensors, d.charges, NELEC, rotation=90.0, rotated_trial="as_is",
+                                 natural_rdm1="before", rdm1=info["gamma"])
+    rotated, rotated_labels = trials.rotate_htrial_blocks(tensors, labels, 90.0)
+    assert all(q.shape[1] == 1 for q in rotated_labels)  # particle-number labels, like the as-is trial's
+    params = _params(orbital_plan="adaptive", walker_channel_chi=4)
+    dense = _prepare(h1, trial, params)
+    blocked = _prepare(h1, trial, params, htrial=(rotated, rotated_labels, info["trial_energy"]))
+    walkers = _walkers(h1, trial)
+    np.testing.assert_allclose(_engine_values(blocked, walkers)[1], _engine_values(dense, walkers)[1], rtol=1e-10)
+    assert blocked.meas_ctx.trial_energy == pytest.approx(dense.meas_ctx.trial_energy, rel=1e-12)
+    for angle in (0.0, 90.0):  # the site rotation is orthogonal and the relabelling a permutation: norms are kept
+        moved, _ = trials.rotate_htrial_blocks(tensors, labels, angle)
+        for a, b in zip(moved, tensors, strict=True):
+            norm_a, norm_b = (sum(float(np.sum(X**2)) for X in site.values()) for site in (a, b))
+            assert norm_a == pytest.approx(norm_b, rel=1e-12)
+
+
+@pytest.mark.parametrize("name", ["L8", "sq2x4oo"])
+def test_block_form_htrial_at_a_looser_cutoff(dmrg, name):
+    """relative_tolerance of load_or_make_htrial: its own cache file, the recorded tolerance and discarded weight, bonds
+    no larger than at the default cutoff and the same trial energy; the file is read back with its tolerance."""
+    h1, d = CASES[name], dmrg(name)
+    args = (d.path, h1, U, d.tensors, d.charges, d.variational_energy)
+    (_, exact_labels), exact_info = trials.load_or_make_htrial(*args, say=_quiet)
+    (_, loose_labels), info = trials.load_or_make_htrial(*args, say=_quiet, relative_tolerance=1e-9)
+    assert trials.htrial_cache_file(d.path, 1e-9).exists()
+    assert trials.htrial_cache_file(d.path, 1e-9) != trials.htrial_cache_file(d.path)
+    assert exact_info["relative_tolerance"] == 1e-13 and info["relative_tolerance"] == 1e-9
+    assert all(len(a) <= len(b) for a, b in zip(loose_labels, exact_labels, strict=True))
+    assert info["discarded"].max() < 1e-12  # at most n singular values below 1e-9 of the largest
+    assert info["trial_energy"] == pytest.approx(exact_info["trial_energy"], rel=1e-8)
+    _, again = trials.load_or_make_htrial(*args, say=_quiet, relative_tolerance=1e-9)
+    np.testing.assert_array_equal(again["discarded"], info["discarded"])
+
+
+@pytest.mark.parametrize("name", ["L8", "sq2x4oo"])
 def test_block_form_htrial_matches_the_dense_product(dmrg, name):
     """The block form of trot.gmps.trials: to_blocks / from_blocks round trip; trial_times_h_blocks has trial_times_h's
     labels and entries, and htrial_block_bytes is what it allocates; compress_blocks_qn gives compress_mps_qn's bonds,

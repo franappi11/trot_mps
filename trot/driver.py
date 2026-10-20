@@ -869,6 +869,7 @@ def run_qmc(
     mesh: Mesh | None = None,
     observable_names: tuple[str, ...] = (),
     runtime: QmcRuntime | None = None,
+    chunk_hook: Callable | None = None,
 ) -> QmcResult:
     """
     equilibration blocks then sampling blocks.
@@ -877,9 +878,26 @@ def run_qmc(
     Jobs supply it automatically. Separate array arguments are borrowed, so
     automatic Cholesky redistribution is disabled for that calling convention.
 
+    ``chunk_hook(phase, blocks_done, state, meas_ctx, prop_ctx)``, if given, is
+    called after every chunk of blocks (phase "equilibration" or "sampling",
+    blocks_done counted over both phases). It may return ``(state, meas_ctx,
+    prop_ctx)`` to continue with: e.g. the contexts of a new walker plan and the
+    state's overlaps recomputed with it (trot.gmps.driver.make_retrain_hook).
+    run_blocks takes the contexts as arguments, so contexts with other shapes
+    retrace and recompile it on the next chunk. ``None`` changes nothing.
+
     Returns:
       QmcResult with energy statistics plus block-level observable estimates.
     """
+
+    def after_chunk(phase: str, blocks_done: int) -> None:
+        nonlocal state, meas_ctx, prop_ctx
+        if chunk_hook is None:
+            return
+        update = chunk_hook(phase, blocks_done, state, meas_ctx, prop_ctx)
+        if update is not None:
+            state, meas_ctx, prop_ctx = update
+
     for name in observable_names:
         meas_ops.require_observable(name)
 
@@ -985,6 +1003,7 @@ def run_qmc(
             f"{int(state.node_encounters):10d}  "
             f"{elapsed:8.1f}"
         )
+        after_chunk("equilibration", len(block_e_eq) - 1)
     if meas_ops.retune_block_energy is not None:
         print("\nRetuning block-energy sampling after equilibration:")
 
@@ -1062,6 +1081,7 @@ def run_qmc(
                     f"E={float(jnp.mean(scalars_chunk['energy'])):14.10f}  "
                     f"dt={(time.perf_counter() - start_batch) / n:.3f} s/block"
                 )
+                after_chunk("equilibration", len(block_e_eq) - 1)
 
     block_e_eq = jnp.asarray(block_e_eq)
     block_w_eq = jnp.asarray(block_w_eq)
@@ -1137,6 +1157,7 @@ def run_qmc(
             f"{elapsed:8.1f}"
             f"{diagnostic_text}"
         )
+        after_chunk("sampling", int(block_e_eq.shape[0]) - 1 + len(block_e_s))
         if (
             np.isfinite(se)
             and (error_analysis.reliable or error_analysis.error_method == "blocking")

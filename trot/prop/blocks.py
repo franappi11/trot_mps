@@ -220,6 +220,98 @@ def make_block_state_logger(
     return logging_block_fn
 
 
+def make_periodic_state_saver(
+    directory: str | Path,
+    *,
+    every: int = 20,
+    prefix: str = "walkers",
+    base_block_fn: BlockFn | None = None,
+    compressed: bool = True,
+) -> tuple[BlockFn, Callable[[], Path]]:
+    """
+    Wrap a block function so the PropState is written to disk after every ``every`` blocks.
+
+    Files are ``<directory>/<prefix>_<n>.npz`` with ``n`` the number of blocks run so far,
+    equilibration included (same ``.npz`` layout as ``dump_prop_state_npz``, readable by
+    ``load_prop_state_npz`` and ``load_all_prop_states_npz(directory, prefix=prefix)``). Each
+    file is written under a hidden temporary name and renamed, so a job killed mid-write
+    leaves only complete files.
+
+    Returns ``(block_fn, save)``: pass ``block_fn`` to the driver. After the run, ``save()``
+    also writes the final PropState if the last block was not a multiple of ``every``, and
+    returns the path of the last file.
+    """
+    if every < 1:
+        raise ValueError("every must be at least 1.")
+    if base_block_fn is None:
+        base_block_fn = block
+
+    out_dir = Path(directory).expanduser().resolve()
+    latest: list[PropState] = []
+    n_blocks = 0
+    n_saved = 0
+    result_spec = jax.ShapeDtypeStruct((), jnp.int32)
+
+    def _write() -> Path:
+        nonlocal n_saved
+        out = out_dir / f"{prefix}_{n_blocks:05d}.npz"
+        tmp = out.with_name(f".{out.name}")  # hidden: not matched by the ``<prefix>_*.npz`` glob
+        dump_prop_state_npz(latest[0], tmp, compressed=compressed)
+        tmp.replace(out)
+        n_saved = n_blocks
+        return out
+
+    def _keep_state(state: PropState) -> np.int32:
+        nonlocal n_blocks
+        n_blocks += 1
+        # Copy: the callback arguments may alias device buffers that later blocks reuse.
+        latest[:] = [tree_util.tree_map(np.array, state)]
+        if n_blocks % every == 0:
+            _write()
+        return np.int32(0)
+
+    def periodic_state_block_fn(
+        state: PropState,
+        *,
+        sys: System,
+        params: Any,
+        ham_data: Any,
+        trial_data: Any,
+        trial_ops: TrialOps,
+        meas_ops: MeasOps,
+        meas_ctx: Any,
+        prop_ops: Any,
+        prop_ctx: Any,
+        sr_fn: SrFn = wk.stochastic_reconfiguration,
+        observable_names: tuple[str, ...] = (),
+    ) -> tuple[PropState, BlockObs]:
+        state, obs = base_block_fn(
+            state,
+            sys=sys,
+            params=params,
+            ham_data=ham_data,
+            trial_data=trial_data,
+            trial_ops=trial_ops,
+            meas_ops=meas_ops,
+            meas_ctx=meas_ctx,
+            prop_ops=prop_ops,
+            prop_ctx=prop_ctx,
+            sr_fn=sr_fn,
+            observable_names=observable_names,
+        )
+        _ = io_callback(_keep_state, result_spec, state, ordered=True)
+        return state, obs
+
+    def save() -> Path:
+        if not latest:
+            raise RuntimeError("No block has run yet; there is no PropState to save.")
+        if n_saved != n_blocks:
+            return _write()
+        return out_dir / f"{prefix}_{n_blocks:05d}.npz"
+
+    return periodic_state_block_fn, save
+
+
 def block(
     state: PropState,
     *,

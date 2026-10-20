@@ -40,17 +40,20 @@ from jax import lax
 
 from tests.helpers import hubbard_fock as hf
 from trot.core.system import System
+from trot.gmps import dense_conversion as dc
 from trot.gmps import engine
 from trot.gmps import trials
 from trot.gmps import utils as gmps_utils
 from trot.ham.hubbard import HamHubbard, hopping_matrix, square_hopping_matrix
-from trot.meas.mps import build_mps_meas_ctx, hubbard_mpo_from_h1, trial_times_h
+from trot.meas.mps import build_mps_meas_ctx, hubbard_mpo_from_h1, szsz_fns, trial_times_h
 from trot.prop.hubbard_cpmc_ops import _build_prop_ctx
 from trot.prop.types import PropState, QmcParams, QmcParamsMps
 from trot.trial.mps import (
     compress_mps_qn,
+    make_dense_walker_plan,
     make_mps_trial,
     make_walker_plan,
+    make_walker_plan_from_plans,
     mps_trial_from_sd,
     rotate_spin,
     spin_rotation_y,
@@ -184,11 +187,11 @@ def _ctx(model, plan_kind, trial_kind="sz", kernel="blocked"):
 
 
 def _sweep_engine(model, plan_kind, trial_kind, dt=DT):
-    """kernels_for(plan, labels, energy=None) and its DeviceData: the trial blocks (fixed_blocks) and the propagator."""
+    """kernels_for(plan, labels, energy=None) and its DeviceData: the trial blocks (plan_blocks) and the propagator."""
     plan, trial = model.plans[plan_kind], model.trials[trial_kind]
     kernels = engine.kernels_for(plan, trial.charges, energy=None)
     prop = _prop(model, dt)
-    data = engine.DeviceData(engine.fixed_blocks(trial.tensors, kernels.overlap_plan), (), (), prop.exp_h1_half,
+    data = engine.DeviceData(engine.plan_blocks(trial.tensors, kernels.overlap_plan), (), (), prop.exp_h1_half,
                              prop.hs_constant)
     return kernels, data
 
@@ -574,6 +577,103 @@ def test_truncated_batched_conversion_matches_the_host_oracle(model, spin_batch)
             assert abs(float(g_original) * _mps_overlap(host, tensors) - reference) <= 1e-10 * abs(reference)
 
 
+def test_plan_bonds_with_given_counts_rebuild_and_transfer_an_allocation(model):
+    """plan_bonds(..., counts=...) keeps the given number of states in each charge sector. A walker's own top-chi
+    counts (recorded with spectra=, whose dropped weights add up to the discarded weight) rebuild its own bond plan;
+    the bond structure depends on the counts only, so the same counts planned on the reference give the walker's bond
+    labels and, in the host oracle, its own truncation; make_walker_plan_from_plans runs such a trained bond plan on
+    the device, and the device conversion keeps the host oracle's Schmidt subspaces."""
+    plans, trained = [], []
+    for R, C in zip(model.reference, model.walkers[1]):
+        plan = gmps_utils.make_orbital_plan(R, "adaptive")
+        Q = np.linalg.qr(np.asarray(C))[0]
+        spectra = []
+        own = gmps_utils.plan_bonds(Q, plan, CHI_TRUNC, spectra=spectra)
+        assert own.reference_discarded_weight > 1e-6 and len(spectra) == len(own.kept_per_sector)
+        dropped = sum(float(np.sum(w[k:])) for gate, kept in zip(spectra, own.kept_per_sector)
+                      for w, k in zip(gate.values(), kept))
+        np.testing.assert_allclose(dropped, own.reference_discarded_weight, rtol=1e-12)
+        counts = [dict(zip(gate.keys(), kept)) for gate, kept in zip(spectra, own.kept_per_sector)]
+        again = gmps_utils.plan_bonds(Q, plan, counts=counts)
+        assert again.kept_per_sector == own.kept_per_sector
+        assert all(np.array_equal(a, b) for a, b in zip(again.charges, own.charges))
+        np.testing.assert_allclose(again.reference_discarded_weight, own.reference_discarded_weight, rtol=1e-12)
+        moved = gmps_utils.plan_bonds(R, plan, counts=counts)  # the walker's counts, planned on the reference
+        assert all(np.array_equal(a, b) for a, b in zip(moved.charges, own.charges))
+        tensors, _, _ = engine.channel_mps_host(Q, plan, moved)
+        np.testing.assert_allclose(1.0 - _mps_overlap(tensors, tensors), own.reference_discarded_weight,
+                                   rtol=1e-6, atol=1e-12)
+        plans.append(plan)
+        trained.append(moved)
+    walker_plan = make_walker_plan_from_plans(*model.reference, plans, trained)
+    convert = jax.jit(engine.converter_for(walker_plan).convert)
+    for ca, cb in model.walkers:
+        alpha, beta, gauges = convert(jnp.asarray(ca), jnp.asarray(cb))
+        for C, plan, bond, dev, g_dev in zip((ca, cb), plans, trained, (alpha, beta), gauges):
+            host, _, g_host = engine.channel_mps_host(C, plan, bond)
+            reference = g_host * _mps_overlap(host, host)
+            assert abs(float(g_dev) * _mps_overlap(host, dev) - reference) <= 1e-10 * abs(reference)
+
+
+def test_trained_counts_follow_their_rules_and_run_on_the_device(model):
+    """trot.gmps.allocation: trained on one walker, every rule at its bond gives that walker's own top-chi counts;
+    trained on several, the rules keep at most chi states per gate, the union holds every walker's own counts and is
+    the 100th percentile; trained_walker_plan keeps the plan's gates and reference, and the device conversion with
+    its trained counts keeps the host oracle's Schmidt subspaces."""
+    from trot.gmps import allocation
+
+    plan = model.plans["truncated"]
+    for s in range(2):
+        channel = [w[s] for w in model.walkers]
+        own = allocation.allocations_of(channel, plan.orbital_plans[s], CHI_TRUNC)
+        alone = [{q: k for q, k in gate.items() if k} for gate in own[0][0]]
+        for rule in allocation.RULES:
+            assert allocation.train_counts(own[:1], CHI_TRUNC, rule) == alone
+            counts = allocation.train_counts(own, CHI_TRUNC, rule)
+            assert len(counts) == len(own[0][0]) and all(0 < sum(gate.values()) <= CHI_TRUNC for gate in counts)
+        union = allocation.train_counts(own, rule="union")
+        assert union == allocation.train_counts(own, rule="p100")
+        assert all(union[g].get(q, 0) >= k for counts, _, _ in own for g, gate in enumerate(counts)
+                   for q, k in gate.items())
+        with pytest.raises(ValueError):
+            allocation.train_counts(own, CHI_TRUNC, rule="majority")
+    trained = allocation.trained_walker_plan(plan, tuple(np.stack([w[s] for w in model.walkers]) for s in range(2)),
+                                             CHI_TRUNC, "consensus")
+    assert all(a is b for a, b in zip(trained.orbital_plans, plan.orbital_plans))
+    assert all(np.array_equal(a, b) for a, b in zip(trained.reference, plan.reference))
+    assert all(b.max_bond <= CHI_TRUNC for b in trained.bond_plans)
+    convert = jax.jit(engine.converter_for(trained).convert)
+    for ca, cb in model.walkers:
+        alpha, beta, gauges = convert(jnp.asarray(ca), jnp.asarray(cb))
+        for C, orbital_plan, bond, dev, g_dev in zip((ca, cb), trained.orbital_plans, trained.bond_plans,
+                                                     (alpha, beta), gauges):
+            host, _, g_host = engine.channel_mps_host(C, orbital_plan, bond)
+            reference = g_host * _mps_overlap(host, host)
+            assert abs(float(g_dev) * _mps_overlap(host, dev) - reference) <= 1e-10 * abs(reference)
+
+
+def test_drift_check_scores_walkers_with_the_host_oracle(model):
+    """allocation.discarded_under is the norm channel_mps_host's conversion loses, per walker and spin;
+    slots_changed is 0 between an allocation and itself; drift_check takes the trained candidate exactly when it
+    lowers the mean discarded weight by more than the gain."""
+    from trot.gmps import allocation
+
+    plan = model.plans["truncated"]
+    walkers = tuple(np.stack([w[s] for w in model.walkers]) for s in range(2))
+    lost = allocation.discarded_under(walkers, plan.orbital_plans, plan.bond_plans)
+    assert lost.shape == (len(model.walkers), 2) and np.max(lost) > 1e-6
+    for k, walker in enumerate(model.walkers):
+        for s in range(2):
+            Q = np.linalg.qr(np.asarray(walker[s]))[0]
+            tensors, _, _ = engine.channel_mps_host(Q, plan.orbital_plans[s], plan.bond_plans[s])
+            np.testing.assert_allclose(lost[k, s], 1.0 - _mps_overlap(tensors, tensors), rtol=1e-12, atol=1e-14)
+    assert allocation.slots_changed(plan.bond_plans, plan.bond_plans) == 0.0
+    taken, info = allocation.drift_check(plan, walkers, CHI_TRUNC, gain=-1.0)
+    assert taken is not None and info["accepted"] and 0.0 <= info["slots_changed"] <= 1.0
+    kept, info = allocation.drift_check(plan, walkers, CHI_TRUNC, gain=1.0)
+    assert kept is None and not info["accepted"] and info["discarded_current"] > 0.0
+
+
 def test_spin_batching_keeps_each_channels_own_truncation(model):
     """Alpha and beta with different kept counts (hence different bond labels) still convert in one batch, each
     with its own labels and bond dimensions, exactly as the host oracle converts it alone."""
@@ -708,6 +808,245 @@ def test_cholesky_qr2_matches_trots_qr():
 # ---------------------------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("forward", [True, False])
+def test_legs_give_the_same_block_in_every_contraction_order(forward):
+    """_legs writes each einsum in dot_general's output order and transposes at most once at the end: every one of
+    the six leg orders gives the canonical (t, A, B, K) (left) or (t, a, b, k) (right) block of the three operands."""
+    import itertools
+
+    rng = np.random.default_rng(7)
+    T, lower, upper = 3, (2, 3, 4), (5, 2, 3)
+    start, end = (lower, upper) if forward else (upper, lower)
+    X = rng.normal(size=(T,) + start)
+    operands = tuple(rng.normal(size=(T, n, m)) for n, m in zip(lower, upper))  # (t, lower, upper) per leg
+    spec = "tabk,taA,tbB,tkK->tABK" if forward else "tABK,taA,tbB,tkK->tabk"
+    want = np.einsum(spec, X, *operands)
+    assert want.shape == (T,) + end
+    for order in itertools.permutations(range(3)):
+        got = engine._legs(jnp.asarray(X), tuple(jnp.asarray(W) for W in operands), order, forward)
+        np.testing.assert_allclose(np.asarray(got), want, rtol=1e-12, atol=1e-12)
+
+
+def test_leg_order_prefers_the_transpose_free_order_unless_it_costs_much():
+    """engine._leg_order keeps the order a, b, k within `tolerance` of the cheapest and otherwise takes the cheapest;
+    prefer=None is the plain cheapest order."""
+    T = 4
+    assert engine._leg_order(T, (7, 6, 1500), (7, 6, 1500))[0] == (0, 1, 2)
+    start, end = (2, 2, 1000), (40, 40, 1000)  # contracting k first is far cheaper than last
+    forced = engine._leg_order(T, start, end, tolerance=float("inf"))
+    cheapest = engine._leg_order(T, start, end, prefer=None)
+    default = engine._leg_order(T, start, end)
+    assert forced[0] == (0, 1, 2) and cheapest[1] < forced[1] / 1.25
+    assert default == cheapest and default[0] != (0, 1, 2)
+    # a near tie keeps the preferred order even though another is a little cheaper
+    near = engine._leg_order(T, (6, 6, 800), (7, 6, 800))
+    plain = engine._leg_order(T, (6, 6, 800), (7, 6, 800), prefer=None)
+    assert near[0] == (0, 1, 2) and near[1] <= 1.25 * plain[1]
+
+
+def test_measure_chunks_cap_the_walkers_per_chunk():
+    """The energy and the observables are measured in chunks of at most MEASURE_CHUNK walkers (and never in fewer
+    chunks than the steps use); small runs are unchanged."""
+    cap = engine.MEASURE_CHUNK
+    assert engine.measure_chunks(cap * 4, 1) == 4  # `cap` walkers per chunk
+    assert engine.measure_chunks(cap * 4, 8) == 8
+    assert engine.measure_chunks(6, 1) == 1 and engine.measure_chunks(cap, 1) == 1
+    assert engine.measure_chunks(cap * 3 // 2, 1) == 2  # the smallest divisor with at most `cap` walkers per chunk
+    assert engine.measure_chunks(cap * 5 + 1, 1) >= 5 and (cap * 5 + 1) % engine.measure_chunks(cap * 5 + 1, 1) == 0
+
+
+@pytest.mark.parametrize("trial_kind", ["sz", "number"])
+def test_size_bucketed_energy_blocks_give_the_uniform_numerators(model, trial_kind):
+    """engine.bucket_plan regroups the transitions of every site by block size: <H trial|walker> through the size
+    classes equals the uniformly padded contraction (the same sums), for any class split, (N_up, N_dn) and N labels,
+    and the padded entries lie between the blocks' own entries and the uniform padding."""
+    from trot.trial.mps import _hashable_charges
+
+    plan = model.plans["truncated"]
+    h_np, h_q, _ = model.htrial[trial_kind]
+    layout = engine.layout_for(plan, _hashable_charges(h_q))
+    uniform = tuple(jnp.asarray(b) for b in engine.fixed_blocks(h_np, layout, xp=np))
+    kernels = engine.kernels_for(plan, model.trials[trial_kind].charges, energy=None)
+    ca, cb = _batch(model, n=4)
+    qa, _ = kernels.batch_qr(jnp.asarray(ca))
+    qb, _ = kernels.batch_qr(jnp.asarray(cb))
+
+    def numerators(energy_plan, blocks):
+        def one(a, b):
+            alpha, beta, _ = engine.converter_for(plan).convert(a, b)
+            return engine.energy_numerator(alpha, beta, blocks, energy_plan)
+        return np.asarray(jax.vmap(one)(qa, qb))
+
+    want = numerators(layout, uniform)
+    for settings in (dict(), dict(ratio=1.2, minimum=2), dict(bounds=[2, 4, 8])):
+        bucketed = engine.bucket_plan(layout, **settings)
+        blocks = tuple(tuple(jnp.asarray(b) for b in site) for site in engine.bucketed_blocks(h_np, bucketed))
+        np.testing.assert_allclose(numerators(bucketed, blocks), want, rtol=1e-12, atol=1e-14)
+        stats = bucketed.stats
+        assert stats["fixed_exact_entries"] <= stats["fixed_bucketed_entries"] <= stats["fixed_uniform_entries"]
+        assert sum(c.rows * c.cols * len(c.idx) for site in bucketed.sites for c in site) == \
+            stats["fixed_bucketed_entries"]
+
+
+def _block_form(tensors, labels):
+    """A dense charge-labelled MPS in block form {(left label, p, right label): block} with the engine's fixed keys:
+    trials.to_blocks for (N_up, N_dn) labels, the same per particle number N for N labels (the rotated trial's
+    H|trial>, whose cached block form trials.to_blocks does not make)."""
+    labels = [gmps_utils.label_array(q) for q in labels]
+    if labels[0].shape[1] == 2:
+        return trials.to_blocks(tensors, labels)
+    out = []
+    for k, A in enumerate(tensors):
+        A = np.asarray(A)
+        left, right = engine._charge_index(labels[k]), engine._charge_index(labels[k + 1])
+        site = {}
+        for ql, rows in left.items():
+            for p in range(4):
+                qr = (ql[0] + int(engine.N_PHYSICAL[p]),)
+                if qr in right:
+                    block = A[np.ix_(rows, [p], right[qr])][:, 0]
+                    if block.any():
+                        site[(ql, p, qr)] = block
+        out.append(site)
+    return out
+
+
+@pytest.mark.parametrize("trial_kind", ["sz", "number"])
+def test_deduplicated_energy_blocks_give_the_same_numerators(model, trial_kind):
+    """bucket_plan(dedup=True) stores each distinct H|trial> block of a class once and left_contract gathers it per
+    transition: <H trial|walker> equals the per-transition blocks', from dense and block-form H|trial> sites alike.
+    With particle-number labels several walker label pairs meet the same block, so fewer entries are stored."""
+    from trot.trial.mps import _hashable_charges
+
+    plan = model.plans["truncated"]
+    h_np, h_q, _ = model.htrial[trial_kind]
+    layout = engine.layout_for(plan, _hashable_charges(h_q))
+    kernels = engine.kernels_for(plan, model.trials[trial_kind].charges, energy=None)
+    ca, cb = _batch(model, n=4)
+    qa, _ = kernels.batch_qr(jnp.asarray(ca))
+    qb, _ = kernels.batch_qr(jnp.asarray(cb))
+
+    def numerators(energy_plan, blocks):
+        def one(a, b):
+            alpha, beta, _ = engine.converter_for(plan).convert(a, b)
+            return engine.energy_numerator(alpha, beta, blocks, energy_plan)
+        return np.asarray(jax.jit(jax.vmap(one))(qa, qb))
+
+    plain = engine.bucket_plan(layout)
+    want = numerators(plain, engine.bucketed_blocks(h_np, plain))
+    dedup = engine.bucket_plan(layout, dedup=True)
+    assert dedup.dedup and not plain.dedup
+    block_form = _block_form(h_np, h_q)
+    np.testing.assert_allclose(numerators(plain, engine.bucketed_blocks(block_form, plain)), want, rtol=1e-12,
+                               atol=1e-14)  # the block form itself is right
+    for sites in (h_np, block_form):
+        blocks = engine.bucketed_blocks(sites, dedup)
+        assert all(B.shape[0] == len(c.unique_first) for site, classes in zip(blocks, dedup.sites)
+                   for B, c in zip(site, classes))
+        np.testing.assert_allclose(numerators(dedup, blocks), want, rtol=1e-12, atol=1e-14)
+    stats = dedup.stats
+    assert stats["fixed_unique_entries"] <= stats["fixed_bucketed_entries"]
+    if trial_kind == "number":
+        assert stats["fixed_unique_entries"] < stats["fixed_bucketed_entries"]
+    with pytest.raises(ValueError, match="left_contract only"):
+        engine.right_environments((), (), dedup)
+
+
+def test_energy_dedup_flag_reaches_the_context_and_the_kernels(model, monkeypatch):
+    """TROT_ENERGY_DEDUP (engine.ENERGY_DEDUP): the measurement context stores the distinct H|trial> blocks
+    (energy_plan_for, bucketed_blocks) and its kernels contract them, with the local energies of the per-transition
+    blocks; the flag is part of the plan's and the kernels' cache keys."""
+    trial = model.trials["number"]
+    ca, cb = _batch(model)
+    energies = []
+    for flag in (False, True):
+        monkeypatch.setattr(engine, "ENERGY_DEDUP", flag)
+        plan = make_walker_plan(model.ham, model.trials["sz"], model.system,
+                                _mps_params(orbital_plan="adaptive", walker_channel_chi=CHI_TRUNC,
+                                            sector_buckets=(8, 16), walker_qr="cholesky"))
+        ctx = build_mps_meas_ctx(model.ham, trial, plan=plan, kernel="blocked", htrial=model.htrial["number"])
+        assert ctx.kernels.energy_plan.dedup == flag
+        energies.append(np.asarray(jax.jit(ctx.kernels.energies)(ca, cb, ctx.data())))
+    np.testing.assert_allclose(energies[1], energies[0], rtol=1e-11, atol=1e-12)
+
+
+def _assert_trees_close(got, want, rtol=1e-10):
+    """Leaf by leaf, each to rtol of its own largest entry (environments are not normalised)."""
+    got, want = jax.tree_util.tree_leaves(got), jax.tree_util.tree_leaves(want)
+    assert len(got) == len(want)
+    for x, y in zip(got, want):
+        x, y = np.asarray(x), np.asarray(y)
+        assert x.shape == y.shape
+        np.testing.assert_allclose(x, y, rtol=rtol, atol=rtol * np.max(np.abs(y), initial=0.0))
+
+
+@pytest.mark.parametrize("plan_kind, trial_kind", SWEEP_CASES, ids=[f"{p}-{t}" for p, t in SWEEP_CASES])
+def test_size_bucketed_overlap_plan_gives_the_uniform_contractions(model, plan_kind, trial_kind):
+    """bucket_plan on the trial's layout (the overlap plan with TROT_OVERLAP_BUCKET_RATIO): every contraction through
+    the size classes, each class's walker and trial blocks cut to its largest and its sums padded back to the bond,
+    equals the uniform one for any class split: the right environments at every bond, szsz, the overlaps and the
+    step with its field sweep. The host blocks equal the traced gathers (plan_blocks)."""
+    plan, trial = model.plans[plan_kind], model.trials[trial_kind]
+    layout, prop = engine.layout_for(plan, trial.charges), _prop(model)
+    ca, cb = _batch(model)
+    randoms = np.random.default_rng(2).random((len(ca), L))
+
+    def contractions(op, blocks):
+        kernels = engine.make_kernels(engine.converter_for(plan), op, None, None,
+                                      engine.resolve_walker_qr(plan.walker_qr))
+        data = engine.DeviceData(blocks, (), (), prop.exp_h1_half, prop.hs_constant)
+
+        def per_walker(qa, qb):
+            alpha, beta, _ = kernels.converter.convert(qa, qb)
+            wb = engine.walker_blocks(alpha, beta, op)
+            return engine.right_environments(wb, blocks, op), engine.szsz_contract(wb, blocks, op)
+
+        def run(a, b, r):
+            qa, _ = kernels.batch_qr(a)
+            qb, _ = kernels.batch_qr(b)
+            return jax.vmap(per_walker)(qa, qb), kernels.overlaps(a, b, data), kernels.step_batch(a, b, r, True, data,
+                                                                                                    1e-8)
+        return jax.jit(run)(ca, cb, randoms)
+
+    want = contractions(layout, engine.plan_blocks(trial.tensors, layout))
+    for settings in (dict(), dict(ratio=1.2, minimum=2), dict(bounds=[2, 4, 8])):
+        bucketed = engine.bucket_plan(layout, **settings)
+        stats = bucketed.stats
+        assert stats["fixed_exact_entries"] <= stats["fixed_bucketed_entries"] <= stats["fixed_uniform_entries"]
+        host = engine.plan_blocks([np.asarray(A) for A in trial.tensors], bucketed, xp=np)
+        traced = jax.jit(lambda tensors: engine.plan_blocks(tensors, bucketed))(trial.tensors)
+        _assert_trees_close(traced, host, rtol=0)
+        _assert_trees_close(contractions(bucketed, traced), want)
+
+
+def test_overlap_bucket_ratio_buckets_the_contexts_trial_blocks(model, monkeypatch):
+    """TROT_OVERLAP_BUCKET_RATIO > 0 (engine.OVERLAP_BUCKET_RATIO): the kernels and the measurement context both take
+    the size-bucketed overlap plan (overlap_plan_for) and its trial blocks per class, and the overlaps, local energies,
+    szsz and three CPMC steps equal those of the uniform plan; the ratio is part of the kernels' cache key."""
+    trial, prop, params = model.trials["number"], _prop(model), _qmc_params()
+    ca, cb = _batch(model)
+    out = []
+    for ratio in (0.0, 1.2):
+        monkeypatch.setattr(engine, "OVERLAP_BUCKET_RATIO", ratio)
+        plan = make_walker_plan(model.ham, model.trials["sz"], model.system,
+                                _mps_params(orbital_plan="adaptive", walker_channel_chi=CHI_TRUNC,
+                                            sector_buckets=(8, 16), walker_qr="cholesky"))
+        ctx = build_mps_meas_ctx(model.ham, trial, plan=plan, kernel="blocked", htrial=model.htrial["number"])
+        kernels, data = ctx.kernels, ctx.data(prop)
+        assert isinstance(kernels.overlap_plan, engine.BucketedPlan) == (ratio > 0)
+        assert kernels.overlap_plan is engine.overlap_plan_for(plan, trial.charges)
+        overlaps = np.asarray(jax.jit(kernels.overlaps)(ca, cb, data))
+        energies = np.asarray(jax.jit(kernels.energies)(ca, cb, data))
+        szsz = np.asarray(jax.jit(szsz_fns(ctx).batch)(ca, cb, data))
+        start = _state(ca, cb, out[0][0] if out else overlaps)
+        out.append((overlaps, energies, szsz, _half_steps(kernels, params, 1, 6)(start, data)))
+    (o0, e0, z0, s0), (o1, e1, z1, s1) = out
+    np.testing.assert_allclose(o1, o0, rtol=1e-11, atol=0)
+    np.testing.assert_allclose(e1, e0, rtol=1e-11, atol=1e-12)
+    np.testing.assert_allclose(z1, z0, rtol=1e-10, atol=1e-12)
+    _assert_states_close(s1, s0, rtol=1e-10)
+
+
 @pytest.mark.parametrize("spin_batch", [True, False])
 @pytest.mark.parametrize("plan_kind", ["exact", "truncated"])
 def test_overlaps_match_the_references(model, plan_kind, spin_batch):
@@ -762,7 +1101,7 @@ def test_one_walker_kernels_and_the_probe_equal_the_batched_ones(model, plan_kin
     kernels, data = ctx.kernels, ctx.data()
     assert kernels is engine.kernels_for(plan, trial.charges, ctx.h_charges, "blocked")
     assert kernels.converter is engine.converter_for(plan)
-    assert kernels.overlap_plan is engine.layout_for(plan, trial.charges)
+    assert kernels.overlap_plan is engine.overlap_plan_for(plan, trial.charges)
     ca, cb = _batch(model)
     overlaps = np.asarray(jax.jit(kernels.overlaps)(ca, cb, data))
     energies = np.asarray(jax.jit(kernels.energies)(ca, cb, data))
@@ -819,6 +1158,13 @@ def test_block_form_sites_give_the_same_blocks_and_energies(model, plan_kind):
         for a, b, c in zip(blocked.blocks, dense.blocks, engine.fixed_blocks(blocks, dense)):
             np.testing.assert_array_equal(a, b)
             np.testing.assert_array_equal(np.asarray(c), b)
+        # device=True: each site goes to the device as it is assembled (block-form and dense sites alike)
+        for streamed in (engine.fixed_blocks(blocks, dense, xp=np, device=True),
+                         engine.fixed_blocks(tensors, dense, xp=np, device=True)):
+            assert len(streamed) == len(dense.blocks)
+            for s, b in zip(streamed, dense.blocks):
+                assert isinstance(s, jax.Array)
+                np.testing.assert_array_equal(np.asarray(s), b)
 
     (h_blocks, h_labels), info = trials.load_or_make_htrial(None, model.h1, U, trial_np, labels, None, say=_quiet)
     for a, b in zip(h_labels, h_q):
@@ -939,6 +1285,185 @@ def test_walker_chunking_is_exact(model):
                                    rtol=1e-12, atol=0)
     assert [engine.divisor_at_least(6, k) for k in (0, 1, 2, 4)] == [1, 1, 2, 6]
     assert engine.divisor_at_least(1000, 3) == 4 and engine.divisor_at_least(7, 2) == 7
+
+
+# ---------------------------------------------------------------------------------------------
+# Dense walker legs (trot.gmps.dense_engine)
+# ---------------------------------------------------------------------------------------------
+
+
+def _dense_kernels(model, chi, trial_kind, move="gram", gap=None, trial="sector"):
+    """(dense walker plan, kernels_for it, its DeviceData with the trial's blocks and the propagator): the exact plan's
+    gates at bond chi, the trial in particle-number sector blocks or as full matrices."""
+    plan = make_dense_walker_plan(*model.reference, model.plans["exact"].orbital_plans,
+                                  dc.DenseSpec(chi, move, gap, trial=trial), walker_qr="native")
+    trial, prop = model.trials[trial_kind], _prop(model)
+    kernels = engine.kernels_for(plan, trial.charges, energy=None)
+    assert isinstance(kernels.overlap_plan, engine.DensePlan) and kernels.converter is None
+    data = engine.DeviceData(engine.plan_blocks(trial.tensors, kernels.overlap_plan), (), (), prop.exp_h1_half,
+                             prop.hs_constant)
+    return plan, kernels, data
+
+
+@pytest.mark.parametrize("trial_kind", ["sz", "number", "sd"])
+def test_dense_overlaps_equal_the_exact_references_when_nothing_is_truncated(model, trial_kind):
+    """A dense bond far above what 8 sites need converts exactly: the overlaps (non-orthonormal walkers included, the
+    trial with (N_up, N_dn) labels, particle-number labels or a determinant) are the enumerated amplitudes."""
+    _, kernels, data = _dense_kernels(model, 64, trial_kind)
+    ca, cb = _batch(model)
+    got = np.asarray(jax.jit(kernels.overlaps)(ca, cb, data))
+    want, _ = _reference_values(model, "exact", trial_kind, ca, cb)
+    np.testing.assert_allclose(got, want, rtol=1e-8, atol=0)
+    overlap_one = jax.jit(kernels.overlap_one)
+    one = np.array([float(overlap_one(a, b, data)) for a, b in zip(ca, cb)])
+    np.testing.assert_allclose(one, got, rtol=1e-9, atol=0)  # one walker vs the batch: rounding (1.1e-10 seen)
+
+
+@pytest.mark.parametrize("trial_kind", ["sz", "number"])
+def test_dense_truncated_overlaps_equal_the_dense_contraction_of_the_converted_walkers(model, trial_kind):
+    """With the bond capped (each walker keeping its own largest states) the dense kernels give det R g_a g_b times the
+    plain contraction of the converted walkers' d=4 MPS (combine_channels with the converter's labels) against the
+    trial: the left contraction, environments and sign of dense_engine, against trot.gmps.utils."""
+    plan, kernels, data = _dense_kernels(model, CHI_TRUNC, trial_kind)
+    converters = [jax.jit(dc.make_dense_converter(p, CHI_TRUNC, "gram", charge_gap=plan.dense.gap()).convert)
+                  for p in plan.orbital_plans]
+    ca, cb = _batch(model)
+    got = np.asarray(jax.jit(kernels.overlaps)(ca, cb, data))
+    trial = [jnp.asarray(A) for A in model.trials[trial_kind].tensors]
+    for w, (a, b) in enumerate(zip(ca, cb)):
+        qa, da = qr_with_det(jnp.asarray(a))
+        qb, db = qr_with_det(jnp.asarray(b))
+        alpha, charges_a, ga = converters[0](qa)
+        beta, charges_b, gb = converters[1](qb)
+        label = lambda charges: [np.round(np.asarray(q)).astype(int) for q in charges]
+        tensors, _ = gmps_utils.combine_channels(alpha, label(charges_a), beta, label(charges_b))
+        want = float(da * db * ga * gb * gmps_utils.contract_real(tensors, trial))
+        np.testing.assert_allclose(got[w], want, rtol=1e-9, atol=0)
+    exact, _ = _reference_values(model, "exact", trial_kind, ca, cb)
+    assert np.max(np.abs(got / exact - 1.0)) > 1e-6  # the cap truncates these walkers
+
+
+@pytest.mark.parametrize("floor", [1e-8, 0.5])
+@pytest.mark.parametrize("trial_kind", ["sz", "number"])
+def test_dense_step_equals_the_sector_step_when_nothing_is_truncated(model, trial_kind, floor):
+    """step_batch of the dense kernels (conversion, right environments, overlap, the HS field sweep with the sampled
+    fields, the weights and the node count) equals the sector engine's on the exact plan for the same randoms, with and
+    without the sweep; the high floor makes the constraint remove proposals."""
+    ca, cb = _batch(model)
+    randoms = np.random.default_rng(2).random((len(ca), L))
+    sector, sector_data = _sweep_engine(model, "exact", trial_kind)
+    _, dense, dense_data = _dense_kernels(model, 64, trial_kind)
+    for sweep in (True, False):
+        want = jax.jit(lambda a, b, r, d: sector.step_batch(a, b, r, sweep, d, floor))(ca, cb, randoms, sector_data)
+        got = jax.jit(lambda a, b, r, d: dense.step_batch(a, b, r, sweep, d, floor))(ca, cb, randoms, dense_data)
+        _assert_trees_close(got, want, rtol=1e-8)
+
+
+@pytest.mark.parametrize("trial_kind", ["sz", "number", "sd"])
+def test_dense_sector_trial_blocks_equal_the_full_trial_matrices(model, trial_kind):
+    """The trial applied block by block between its particle-number sectors (each bond's reached states sorted by N,
+    unreached ones dropped) gives the overlaps and the step (right environments, field sweep) of the full trial
+    matrices, for (N_up, N_dn) labels, particle-number labels and a determinant trial; the layout's sectors hold one
+    N each, and its multiply-adds are fewer."""
+    ca, cb = _batch(model)
+    randoms = np.random.default_rng(2).random((len(ca), L))
+    results = []
+    for trial in ("sector", "dense"):
+        _, kernels, data = _dense_kernels(model, CHI_TRUNC, trial_kind, trial=trial)
+        assert (kernels.overlap_plan.layout is None) == (trial == "dense")
+        step = jax.jit(lambda a, b, r, d, k=kernels: k.step_batch(a, b, r, True, d, 1e-8))
+        results.append((jax.jit(kernels.overlaps)(ca, cb, data), step(ca, cb, randoms, data)))
+    _assert_trees_close(results[0], results[1], rtol=1e-11)
+    _, kernels, _ = _dense_kernels(model, CHI_TRUNC, trial_kind)
+    layout, charges = kernels.overlap_plan.layout, model.trials[trial_kind].charges
+    for order, sectors, q in zip(layout.orders, layout.sectors, charges):
+        n = gmps_utils.label_array(q).sum(axis=1)[order]
+        assert [N for N, _, _ in sectors] == sorted({int(x) for x in n})
+        assert all(np.all(n[start:stop] == N) for N, start, stop in sectors)
+    stats = kernels.overlap_plan.stats
+    assert stats["trial_mac_sector"] <= stats["trial_mac_dense"]
+
+
+@pytest.mark.parametrize("trial_kind", ["sz", "number", "sd"])
+def test_mpo_local_energies_equal_the_exact_references(model, trial_kind):
+    """energy_kernel="mpo": <T|H|W>/<T|W> through the MPO on the fly (no H|trial>), dense walker legs at a bond far above
+    8 sites' needs and the trial in particle-number sector blocks or as full matrices, equals the enumerated local
+    energies (non-orthonormal walkers included), through the context, the one-walker kernel and the probe; the context's
+    <T|H|T>/<T|T> is the trial energy of the stored H|trial>."""
+    ca, cb = _batch(model)
+    _, want = _reference_values(model, "exact", trial_kind, ca, cb)
+    trial = model.trials[trial_kind]
+    for layout in ("sector", "dense"):
+        plan = make_dense_walker_plan(*model.reference, model.plans["exact"].orbital_plans,
+                                      dc.DenseSpec(64, trial=layout), walker_qr="native")
+        ctx = build_mps_meas_ctx(model.ham, trial, plan=plan, kernel="mpo")
+        assert ctx.kernel == "mpo" and ctx.kernels.energy_kind == "mpo" and ctx.h_charges is None
+        if trial_kind != "sd":
+            assert ctx.trial_energy == pytest.approx(model.htrial[trial_kind][2], rel=1e-10)
+        got = np.asarray(jax.jit(ctx.kernels.energies)(ca, cb, ctx.data()))
+        np.testing.assert_allclose(got, want, rtol=1e-8, atol=1e-10)
+        one = jax.jit(ctx.kernels.energy_one)
+        np.testing.assert_allclose([float(one(a, b, ctx.data())) for a, b in zip(ca, cb)], got, rtol=1e-9)
+        probe = jax.jit(ctx.kernels.probe)(ca[0], cb[0], ctx.data())
+        np.testing.assert_allclose(float(probe["energy"]), got[0], rtol=1e-9)
+
+
+@pytest.mark.parametrize("trial_kind", ["sz", "number"])
+def test_mpo_truncated_energies_equal_the_contraction_with_the_stored_h_trial(model, trial_kind):
+    """With the bond capped, the MPO energy is that of the converted walkers: the plain contraction of their d=4 MPS
+    (combine_channels, the converter's labels) with the uncompressed H|trial> (trial_times_h) and with the trial,
+    independent of the MPO contraction and of the sector layout."""
+    plan = make_dense_walker_plan(*model.reference, model.plans["exact"].orbital_plans, dc.DenseSpec(CHI_TRUNC),
+                                  walker_qr="native")
+    trial = model.trials[trial_kind]
+    ctx = build_mps_meas_ctx(model.ham, trial, plan=plan, kernel="mpo")
+    ca, cb = _batch(model)
+    got = np.asarray(jax.jit(ctx.kernels.energies)(ca, cb, ctx.data()))
+    h_np, _ = trial_times_h(hubbard_mpo_from_h1(model.h1, U), [np.asarray(A) for A in trial.tensors],
+                            trial.charge_arrays())
+    h_np, trial_np = [jnp.asarray(A) for A in h_np], [jnp.asarray(A) for A in trial.tensors]
+    converters = [jax.jit(dc.make_dense_converter(p, CHI_TRUNC, "gram", snap=True).convert)
+                  for p in plan.orbital_plans]
+    label = lambda charges: [np.round(np.asarray(q)).astype(int) for q in charges]
+    for w, (a, b) in enumerate(zip(ca, cb)):
+        qa, _ = qr_with_det(jnp.asarray(a))
+        qb, _ = qr_with_det(jnp.asarray(b))
+        alpha, charges_a, _ = converters[0](qa)
+        beta, charges_b, _ = converters[1](qb)
+        tensors, _ = gmps_utils.combine_channels(alpha, label(charges_a), beta, label(charges_b))
+        want = float(gmps_utils.contract_real(tensors, h_np) / gmps_utils.contract_real(tensors, trial_np))
+        np.testing.assert_allclose(got[w], want, rtol=1e-9)
+    exact = _reference_values(model, "exact", trial_kind, ca, cb)[1]
+    assert np.max(np.abs(got / exact - 1.0)) > 1e-8  # the cap truncates these walkers
+
+
+def test_mpo_kernel_needs_a_dense_plan_and_no_szsz(model):
+    """energy_kernel="mpo" on a sector plan has nothing to contract with; on a dense plan the szsz observable is not
+    available; the stored-H|trial> kernels are not offered by a dense plan."""
+    trial = model.trials["sz"]
+    with pytest.raises(ValueError, match="dense walker plan"):
+        build_mps_meas_ctx(model.ham, trial, plan=model.plans["exact"], kernel="mpo")
+    plan = make_dense_walker_plan(*model.reference, model.plans["exact"].orbital_plans, dc.DenseSpec(8),
+                                  walker_qr="native")
+    ctx = build_mps_meas_ctx(model.ham, trial, plan=plan, kernel="mpo")
+    with pytest.raises(NotImplementedError, match="sector measurement plan"):
+        szsz_fns(ctx)
+    with pytest.raises(ValueError, match="measures its energy through the MPO"):
+        engine.kernels_for(plan, trial.charges, energy="blocked")
+
+
+def test_dense_half_steps_run_in_a_scan(model):
+    """The dense kernels in trot's half-step scan (make_half_step): finite weights and overlaps, the walkers keep
+    their shapes, and the state's overlaps stay those of the walkers (recomputed fresh by the next step's right
+    environments)."""
+    _, kernels, data = _dense_kernels(model, CHI_TRUNC, "sz")
+    ca, cb = _batch(model)
+    state = _state(ca, cb, jax.jit(kernels.overlaps)(ca, cb, data))
+    out = _half_steps(kernels, _qmc_params(n_walkers=len(ca)), 1, 4)(state, data)
+    assert np.all(np.isfinite(np.asarray(out.weights))) and np.all(np.isfinite(np.asarray(out.overlaps)))
+    assert out.walkers[0].shape == state.walkers[0].shape
+    fresh = jax.jit(kernels.overlaps)(out.walkers[0], out.walkers[1], data)
+    np.testing.assert_allclose(np.asarray(out.overlaps), np.asarray(fresh), rtol=1e-7)
 
 
 # ---------------------------------------------------------------------------------------------

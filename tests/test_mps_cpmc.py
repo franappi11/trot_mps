@@ -13,6 +13,7 @@ config.configure_once()
 import dataclasses
 import sys
 import types
+from functools import partial
 from typing import Any, cast
 
 import jax
@@ -25,14 +26,31 @@ from tests.helpers import hubbard_fock as hf
 from trot.core.ops import k_energy
 from trot.core.system import System
 from trot.driver import make_run_blocks, run_qmc
-from trot.gmps.driver import make_mps_cpmc_ops, run_qmc_chunk_sizes, run_qmc_mps
+from trot.gmps import allocation, engine
+from trot.gmps.driver import (
+    make_mps_cpmc_ops,
+    make_retrain_hook,
+    prepare_mps_cpmc,
+    run_prepared,
+    run_qmc_chunk_sizes,
+    run_qmc_mps,
+    run_warmup,
+)
 from trot.gmps.utils import sd_to_gmps
 from trot.ham.hubbard import HamHubbard, hopping_matrix, square_hopping_matrix
 from trot.meas.ghf import make_ghf_meas_ops_hubbard
+from trot.meas.mps import szsz_fns
 from trot.prop import blocks, cpmc, cpmc_slow, mps_cpmc
 from trot.prop.types import PropState, QmcParams, QmcParamsMps
 from trot.trial.ghf import GhfTrial, get_rdm1_block_diag, make_ghf_trial_ops
-from trot.trial.mps import make_mps_trial, mps_trial_from_sd, natural_orbitals, rotate_spin
+from trot.trial.mps import (
+    dense_measurement_plan,
+    make_mps_trial,
+    measurement_plan,
+    mps_trial_from_sd,
+    natural_orbitals,
+    rotate_spin,
+)
 
 U = 4.0
 E_L4 = -1.953145308685  # exact, L=4 chain, (2,2), U=4
@@ -329,7 +347,7 @@ def test_qmc_params_mps_defaults_and_validation():
     assert (p.orbital_plan, p.occupation_tolerance) == ("adaptive", 1.0e-10)
     assert (p.walker_channel_chi, p.walker_cutoff) == (4, 0.0)
     assert (p.plan_reference, p.walker_start, p.energy_kernel) == ("natural", "natural", "blocked")
-    assert (p.walker_qr, p.sector_buckets) == ("auto", (8, 16))
+    assert (p.walker_qr, p.sector_buckets, p.measure_channel_chi) == ("auto", (8, 16), None)
     for bad in (
         dict(orbital_plan="greedy"),
         dict(plan_reference="uhf"),
@@ -343,6 +361,7 @@ def test_qmc_params_mps_defaults_and_validation():
         dict(dmrg_sweeps=1),
         dict(walker_channel_chi=0),
         dict(walker_cutoff=-1.0),
+        dict(measure_channel_chi=0),
     ):
         with pytest.raises(ValueError):
             QmcParamsMps(seed=1, **bad)  # pyright: ignore[reportArgumentType]
@@ -508,6 +527,237 @@ def test_overlaps_and_energies_match_enumeration(lattice_model, walker_qr, energ
         np.testing.assert_allclose(np.asarray(overlaps), want_overlaps, rtol=1e-9)
         np.testing.assert_allclose(np.asarray(energies), want_energies, rtol=1e-9)
     assert meas_ctx.kernel == kernels.energy_kind == energy_kernel
+
+
+def test_a_run_continues_on_a_new_plan_after_warm_up_blocks(lattice_model):
+    """driver.run_warmup, then prepare_mps_cpmc(state=, plan=, recompute_overlaps=True): split after warm-up blocks
+    and continued on the same plan, a run reproduces the unsplit run block by block (the recomputed overlaps equal
+    the carried ones); continued on a plan with kept counts trained on the warm-up's walkers
+    (trot.gmps.allocation.trained_walker_plan), it starts from that plan's overlaps of the same walkers and runs."""
+    m = lattice_model
+    trial = _noisy_trial(m.trial, m.nelec, seed=5)
+    params = _params(orbital_plan="adaptive", walker_channel_chi=2, n_eql_blocks=4, n_blocks=4, n_prop_steps=2)
+    prepare = partial(prepare_mps_cpmc, sys=m.sys, ham_data=m.ham, trial=trial, verbose=False)
+    want = np.asarray(run_prepared(prepare(params=params)).block_energies)  # start, 4 equilibration, 4 sampling
+    first = prepare(params=params)
+    state, energies, _ = run_warmup(first, 2)
+    later = dataclasses.replace(params, n_eql_blocks=2)
+    same = prepare(params=later, state=state, plan=first.ops.plan, recompute_overlaps=True)
+    np.testing.assert_allclose(np.asarray(same.state.overlaps), np.asarray(state.overlaps), rtol=1e-9)
+    got = np.concatenate([energies, np.asarray(run_prepared(same).block_energies)[1:]])
+    np.testing.assert_allclose(got, want[1:], rtol=1e-8)
+
+    walkers = tuple(np.asarray(w) for w in state.walkers)
+    trained = allocation.trained_walker_plan(first.ops.plan, walkers, 2, "consensus")
+    other = prepare(params=later, state=state, plan=trained, recompute_overlaps=True)
+    assert other.ops.plan is trained and other.meas_ctx.plan is trained
+    expected = jax.vmap(other.ops.trial_ops.overlap, in_axes=(0, None))(state.walkers, trial)
+    np.testing.assert_allclose(np.asarray(other.state.overlaps), np.asarray(expected), rtol=1e-9)
+    assert np.all(np.isfinite(np.asarray(run_prepared(other).block_energies)))
+
+
+def test_run_qmc_chunk_hook_changes_the_walker_plan_within_one_run(lattice_model):
+    """trot.driver.run_qmc's chunk_hook through driver.make_retrain_hook, all within one run_qmc call:
+    - a check that keeps the plan changes nothing;
+    - one that returns the same plan rebuilds its contexts (sharing the measurement context) and recomputes the
+      overlaps, and the run reproduces the hook-free one;
+    - a plan trained on the walkers at block 2 is the plan run_qmc's chunks run on from then on."""
+    m = lattice_model
+    trial = _noisy_trial(m.trial, m.nelec, seed=5)
+    params = _params(orbital_plan="adaptive", walker_channel_chi=2, measure_channel_chi=4, n_eql_blocks=5,
+                     n_blocks=10, n_prop_steps=2)  # chunks of one block in both phases
+    prepare = partial(prepare_mps_cpmc, sys=m.sys, ham_data=m.ham, trial=trial, verbose=False)
+    want = np.asarray(run_prepared(prepare(params=params)).block_energies)
+
+    run = prepare(params=params)
+    keep = make_retrain_hook(run, lambda plan, walkers: (None, {}), every=1)
+    np.testing.assert_allclose(np.asarray(run_prepared(run, chunk_hook=keep).block_energies), want, rtol=1e-12)
+    assert [entry["block"] for entry in keep.log] == list(range(1, 15))  # never after the last block
+    assert not any(entry["retrained"] for entry in keep.log) and len(keep.plans) == 1
+
+    run = prepare(params=params)
+    same = make_retrain_hook(run, lambda plan, walkers: (plan, {}), every=2)
+    np.testing.assert_allclose(np.asarray(run_prepared(run, chunk_hook=same).block_energies), want, rtol=1e-8)
+    assert len(same.log) == 7 and all(entry["retrained"] for entry in same.log)
+
+    run = prepare(params=params)
+    hook = make_retrain_hook(run, lambda plan, walkers: allocation.drift_check(plan, walkers, 2, gain=-1.0), at=(2,))
+    seen = []
+
+    def spy(phase, blocks_done, state, meas_ctx, prop_ctx):
+        seen.append((blocks_done, meas_ctx.plan, meas_ctx.measure))
+        return hook(phase, blocks_done, state, meas_ctx, prop_ctx)
+
+    result = run_prepared(run, chunk_hook=spy)
+    assert len(hook.plans) == 2 and hook.log[0]["block"] == 2 and hook.log[0]["retrained"]
+    later = [(plan, measure) for block, plan, measure in seen if block > 2]
+    assert later and all(plan is hook.plans[1] and measure is run.meas_ctx.measure for plan, measure in later)
+    assert np.all(np.isfinite(np.asarray(result.block_energies)))
+
+
+def test_measurement_plan_measures_with_its_own_bond(lattice_model):
+    """measure_channel_chi: the overlaps and the propagation keep the walker plan (bond 2, truncated) while the local
+    energy converts the walkers with the measurement plan (the same gates at bond 64, exact here) in the trot kernel,
+    the walkers' start and the MPS block, which therefore give the enumerated <T|H|W>/<T|W> of a trial that is not
+    an eigenstate (no zero variance to hide behind); the block's szsz uses the measurement plan too. The context
+    holds only the walker plan's trial blocks and nests the measurement plan's context; it stays a pytree."""
+    m = lattice_model
+    trial = _noisy_trial(m.trial, m.nelec, seed=5)
+    params = _params(walker_channel_chi=2, measure_channel_chi=64, n_prop_steps=1)  # maximal plan
+    ops = make_mps_cpmc_ops(m.ham, trial, m.sys, params)
+    ctx = ops.meas_ops.build_meas_ctx(m.ham, trial)
+    assert ctx.measurement is ctx.measure and ctx.measure.plan is measurement_plan(ops.plan, 64)
+    assert ctx.kernel is None and ctx.h_blocks == () and ctx.measure.kernel == "blocked"
+    leaves, treedef = jax.tree_util.tree_flatten(ctx)
+    assert jax.tree_util.tree_unflatten(treedef, leaves).measure.plan is ctx.measure.plan
+
+    rng = np.random.default_rng(3)
+    walkers = [
+        (hf.nonorthonormal(a, rng), hf.nonorthonormal(b, rng))
+        for a, b in hf.random_field_walkers(
+            m.h1, U, 0.1, *_determinant("uhf", m.h1, m.nelec), n=params.n_walkers, steps=40, seed=3
+        )
+    ]
+    amplitudes = hf.mps_sector_amplitudes(trial.tensors, *m.nelec)
+    H = hf.hubbard_sector_hamiltonian(m.h1, U, *m.nelec)
+    exact = lambda a, b: hf.local_energy(amplitudes, H, np.asarray(a), np.asarray(b))
+    want_overlaps = np.array([hf.overlap_with_sd(amplitudes, a, b) for a, b in walkers])
+    stack = tuple(jnp.asarray(np.stack([w[s] for w in walkers])) for s in range(2))
+    overlaps = np.asarray(jax.vmap(ops.trial_ops.overlap, in_axes=(0, None))(stack, trial))
+    energies = jax.vmap(ops.meas_ops.require_kernel(k_energy), in_axes=(0, None, None, None))(
+        stack, m.ham, ctx, trial
+    )
+    np.testing.assert_allclose(np.asarray(energies), [exact(a, b) for a, b in walkers], rtol=1e-9)
+    assert np.max(np.abs(overlaps / want_overlaps - 1.0)) > 1e-6  # the walker plan truncates
+
+    state = ops.prop_ops.init_prop_state(sys=m.sys, ham_data=m.ham, trial_ops=ops.trial_ops, trial_data=trial,
+                                         meas_ops=ops.meas_ops, params=params, meas_ctx=ctx, initial_walkers=stack)
+    np.testing.assert_allclose(np.asarray(state.overlaps), overlaps, rtol=1e-9)
+    np.testing.assert_allclose(float(state.e_estimate), np.mean([exact(a, b) for a, b in walkers]), rtol=1e-9)
+
+    # one block, against its propagation redone with the walker plan and the propagated walkers measured exactly
+    prop_ctx = ops.prop_ops.build_prop_ctx(m.ham, None, params)
+    kwargs = dict(sys=m.sys, params=params, ham_data=m.ham, trial_data=trial, trial_ops=ops.trial_ops,
+                  meas_ops=ops.meas_ops, meas_ctx=ctx, prop_ops=ops.prop_ops, prop_ctx=prop_ctx)
+    _, obs = jax.jit(lambda s: mps_cpmc.block(s, observable_names=("szsz",), **kwargs))(state)
+    half, data = engine.make_half_step(ctx.kernels, params, 1), ctx.data(prop_ctx)
+    moved = jax.lax.scan(lambda s, i: (half(s, i, data), None), state, jnp.arange(2 * params.n_prop_steps))[0]
+    w = np.asarray(moved.weights)
+    e = np.array([exact(a, b) for a, b in zip(*moved.walkers)])
+    e_ref = float(state.e_estimate)
+    e = np.where(np.abs(e - e_ref) > np.sqrt(2.0 / params.dt), e_ref, e)  # the block's outlier rule
+    np.testing.assert_allclose(float(obs.scalars["energy"]), np.sum(w * e) / np.sum(w), rtol=1e-9)
+    z = np.asarray(szsz_fns(ctx.measure).batch(*moved.walkers, ctx.measure.data()))
+    np.testing.assert_allclose(np.asarray(obs.observables["szsz"]), np.tensordot(w, z, 1) / np.sum(w),
+                               rtol=1e-9, atol=1e-12)
+
+
+def test_dense_params_need_the_bond_and_the_measurement_plan():
+    """walker_conversion="dense" propagates only: it needs the dense bond and the sector plan that measures."""
+    with pytest.raises(ValueError, match="measure_channel_chi"):
+        _params(walker_channel_chi=4, walker_conversion="dense")
+    with pytest.raises(ValueError, match="walker_channel_chi"):
+        _params(walker_channel_chi=None, measure_channel_chi=8, walker_conversion="dense")
+    with pytest.raises(ValueError, match="dense_move"):
+        _params(walker_channel_chi=4, measure_channel_chi=8, walker_conversion="dense", dense_move="qr")
+    params = _params(walker_channel_chi=4, measure_channel_chi=8, walker_conversion="dense")
+    assert (params.dense_move, params.dense_charge_gap) == ("gram", None)
+
+
+def test_dense_walker_plan_reproduces_the_sector_run_when_nothing_is_truncated(lattice_model):
+    """walker_conversion="dense" at a bond far above the 6 sites' needs: the context nests the measurement plan and holds
+    the trial as dense matrices, and the start overlaps and energy, one MPS block (energy, szsz, weights, node count) and
+    the next walkers equal those of the sector plan, which is exact at that bond; a truncating dense bond differs."""
+    m = lattice_model
+    trial = _noisy_trial(m.trial, m.nelec, seed=5)
+    common = dict(walker_channel_chi=64, measure_channel_chi=64, n_prop_steps=2)  # maximal plan: exact at this bond
+    sector = make_mps_cpmc_ops(m.ham, trial, m.sys, _params(**common))
+    params = _params(walker_conversion="dense", **common)
+    dense = make_mps_cpmc_ops(m.ham, trial, m.sys, params)
+    assert sector.plan.dense is None and dense.plan.dense is not None
+    ctx = dense.meas_ops.build_meas_ctx(m.ham, trial)
+    assert ctx.kernel is None and ctx.h_blocks == () and ctx.measure.plan is measurement_plan(dense.plan, 64)
+    assert isinstance(ctx.kernels.overlap_plan, engine.DensePlan) and ctx.kernels.converter is None
+    assert all(isinstance(blocks, tuple) and len(blocks) == 2 for blocks in ctx.trial_blocks)
+
+    rng = np.random.default_rng(3)
+    walkers = [
+        (hf.nonorthonormal(a, rng), hf.nonorthonormal(b, rng))
+        for a, b in hf.random_field_walkers(
+            m.h1, U, 0.1, *_determinant("uhf", m.h1, m.nelec), n=params.n_walkers, steps=40, seed=3
+        )
+    ]
+    stack = tuple(jnp.asarray(np.stack([w[s] for w in walkers])) for s in range(2))
+    results = []
+    for ops, p in ((sector, _params(**common)), (dense, params)):
+        meas_ctx = ops.meas_ops.build_meas_ctx(m.ham, trial)
+        state = ops.prop_ops.init_prop_state(sys=m.sys, ham_data=m.ham, trial_ops=ops.trial_ops, trial_data=trial,
+                                             meas_ops=ops.meas_ops, params=p, meas_ctx=meas_ctx, initial_walkers=stack)
+        kwargs = dict(sys=m.sys, params=p, ham_data=m.ham, trial_data=trial, trial_ops=ops.trial_ops,
+                      meas_ops=ops.meas_ops, meas_ctx=meas_ctx, prop_ops=ops.prop_ops,
+                      prop_ctx=ops.prop_ops.build_prop_ctx(m.ham, None, p))
+        new, obs = jax.jit(lambda s, kwargs=kwargs: mps_cpmc.block(s, observable_names=("szsz",), **kwargs))(state)
+        results.append((state, new, obs))
+    (s0, n0, o0), (s1, n1, o1) = results
+    np.testing.assert_allclose(np.asarray(s1.overlaps), np.asarray(s0.overlaps), rtol=1e-8)
+    np.testing.assert_allclose(float(s1.e_estimate), float(s0.e_estimate), rtol=1e-8)
+    np.testing.assert_allclose(float(o1.scalars["energy"]), float(o0.scalars["energy"]), rtol=1e-8)
+    np.testing.assert_allclose(float(o1.scalars["weight"]), float(o0.scalars["weight"]), rtol=1e-7)
+    np.testing.assert_allclose(np.asarray(o1.observables["szsz"]), np.asarray(o0.observables["szsz"]), rtol=1e-7,
+                               atol=1e-10)
+    np.testing.assert_allclose(np.asarray(n1.weights), np.asarray(n0.weights), rtol=1e-7, atol=1e-12)
+    assert int(n1.node_encounters) == int(n0.node_encounters)
+    for x, y in zip(n1.walkers, n0.walkers):
+        np.testing.assert_allclose(np.asarray(x), np.asarray(y), rtol=1e-7, atol=1e-9)
+
+
+def test_mpo_energy_kernel_reproduces_the_blocked_run_when_nothing_is_truncated(lattice_model):
+    """energy_kernel="mpo" (no H|trial>, build_meas_ctx without a precomputed one): with a sector propagation plan it
+    measures with a nested dense plan, with a dense one on the plan itself; at a bond far above the 6 sites' needs the
+    start energy, one block (energy, weight, node count) and the next walkers equal the blocked kernel's."""
+    m = lattice_model
+    trial = _noisy_trial(m.trial, m.nelec, seed=5)
+    common = dict(walker_channel_chi=64, measure_channel_chi=64, n_prop_steps=2)  # maximal plan: exact at this bond
+    rng = np.random.default_rng(3)
+    walkers = [
+        (hf.nonorthonormal(a, rng), hf.nonorthonormal(b, rng))
+        for a, b in hf.random_field_walkers(
+            m.h1, U, 0.1, *_determinant("uhf", m.h1, m.nelec), n=10, steps=40, seed=3
+        )
+    ]
+    stack = tuple(jnp.asarray(np.stack([w[s] for w in walkers])) for s in range(2))
+    variants = {
+        "blocked": _params(**common),
+        "sector-mpo": _params(energy_kernel="mpo", **common),
+        "dense-mpo": _params(energy_kernel="mpo", walker_conversion="dense", **common),
+    }
+    results = {}
+    for name, params in variants.items():
+        ops = make_mps_cpmc_ops(m.ham, trial, m.sys, params)
+        ctx = ops.meas_ops.build_meas_ctx(m.ham, trial)
+        if name == "sector-mpo":
+            assert ops.plan.dense is None and ctx.measure.plan.dense is not None and ctx.measure.kernel == "mpo"
+            assert ctx.measure.h_charges is None and ctx.measure.plan is dense_measurement_plan(ops.plan, 64, params)
+        if name == "dense-mpo":
+            assert ctx.measure is None and ctx.kernel == "mpo" and ctx.plan is ops.plan
+        state = ops.prop_ops.init_prop_state(sys=m.sys, ham_data=m.ham, trial_ops=ops.trial_ops, trial_data=trial,
+                                             meas_ops=ops.meas_ops, params=params, meas_ctx=ctx, initial_walkers=stack)
+        kwargs = dict(sys=m.sys, params=params, ham_data=m.ham, trial_data=trial, trial_ops=ops.trial_ops,
+                      meas_ops=ops.meas_ops, meas_ctx=ctx, prop_ops=ops.prop_ops,
+                      prop_ctx=ops.prop_ops.build_prop_ctx(m.ham, None, params))
+        new, obs = jax.jit(lambda s, kwargs=kwargs: mps_cpmc.block(s, **kwargs))(state)
+        results[name] = (state, new, obs)
+    s0, n0, o0 = results["blocked"]
+    for name in ("sector-mpo", "dense-mpo"):
+        s1, n1, o1 = results[name]
+        np.testing.assert_allclose(float(s1.e_estimate), float(s0.e_estimate), rtol=1e-8)
+        np.testing.assert_allclose(float(o1.scalars["energy"]), float(o0.scalars["energy"]), rtol=1e-8)
+        np.testing.assert_allclose(float(o1.scalars["weight"]), float(o0.scalars["weight"]), rtol=1e-7)
+        assert int(n1.node_encounters) == int(n0.node_encounters)
+        for x, y in zip(n1.walkers, n0.walkers):
+            np.testing.assert_allclose(np.asarray(x), np.asarray(y), rtol=1e-7, atol=1e-9)
+    with pytest.raises(ValueError, match="needs measure_channel_chi"):
+        _params(walker_channel_chi=4, walker_conversion="dense")  # no energy kernel without a measurement plan
 
 
 # ---------------------------------------------------------------------------------------------
@@ -714,16 +964,19 @@ def test_step_chunking_is_exact(lattice_model, walker_qr):
 
 
 @pytest.mark.parametrize(
-    "walker_channel_chi, energy_kernel", [(None, "blocked"), (2, "blocked"), (None, "dense")]
+    "walker_channel_chi, energy_kernel, measure_channel_chi",
+    [(None, "blocked", None), (2, "blocked", None), (None, "dense", None), (2, "blocked", 4), (2, "dense", 4)],
 )
-def test_mps_block_matches_trots_block(walker_channel_chi, energy_kernel):
+def test_mps_block_matches_trots_block(walker_channel_chi, energy_kernel, measure_channel_chi):
     """trot.prop.mps_cpmc.block (det-R rescaled and gathered overlaps, 2 n + 1 conversions) against
-    trot.prop.blocks.block on the same ops, from diffused, non-orthonormal walkers with unequal weights."""
+    trot.prop.blocks.block on the same ops, from diffused, non-orthonormal walkers with unequal weights; with a
+    measurement plan (measure_channel_chi) both propagate with the walker plan and measure with the other."""
     L, nelec = 6, (3, 2)
     h1 = hopping_matrix(L, 1.0)
     ham, sys_ = HamHubbard(h1=jnp.asarray(h1), u=U), _system(L, nelec)
     params = _params(
-        orbital_plan="adaptive", walker_channel_chi=walker_channel_chi, energy_kernel=energy_kernel
+        orbital_plan="adaptive", walker_channel_chi=walker_channel_chi, energy_kernel=energy_kernel,
+        measure_channel_chi=measure_channel_chi,
     )
     Ca, Cb = _determinant("uhf", h1, nelec)
     trial = mps_trial_from_sd(Ca, Cb)
@@ -750,6 +1003,7 @@ def test_mps_block_matches_trots_block(walker_channel_chi, energy_kernel):
         prop_ops=ops.prop_ops,
         prop_ctx=ops.prop_ops.build_prop_ctx(ham, None, params),
     )
+    assert (kwargs["meas_ctx"].measure is None) == (measure_channel_chi is None)
     got, got_obs = jax.jit(lambda s: mps_cpmc.block(s, **kwargs))(state)
     want, want_obs = jax.jit(lambda s: blocks.block(s, **kwargs))(state)
 

@@ -28,6 +28,7 @@ from jax import tree_util
 
 from trot.core.ops import TrialOps
 from trot.gmps import engine
+from trot.gmps.dense_conversion import DenseSpec
 from trot.gmps.utils import (
     PHYSICAL_CHARGE,
     combined_charges,
@@ -489,6 +490,7 @@ class MpsWalkerPlan:
     sector_buckets: tuple = ()
     walker_qr: str = "auto"
     caches: dict = field(default_factory=dict, compare=False, repr=False)
+    dense: Any = None  # a trot.gmps.dense_conversion.DenseSpec: walkers at fixed bond, no sectors (make_dense_walker_plan)
 
 
 def rhf_orbitals(ham_data, nelec):
@@ -509,10 +511,6 @@ def make_walker_plan_from_reference(
     walker_qr="auto",
 ) -> MpsWalkerPlan:
     """Freeze the gate circuit and the per-sector kept counts on the determinant (Ra, Rb)."""
-    engine.resolve_walker_qr(walker_qr)  # validates
-    buckets = tuple(int(b) for b in sector_buckets)
-    if any(b < 1 for b in buckets) or list(buckets) != sorted(set(buckets)):
-        raise ValueError(f"sector_buckets must be increasing positive sizes, got {sector_buckets!r}")
     Ra, Rb = np.asarray(Ra, dtype=float), np.asarray(Rb, dtype=float)
     if Ra.shape[1] == 0 or Rb.shape[1] == 0:
         raise ValueError("MPS walkers need at least one electron of each spin")
@@ -522,6 +520,21 @@ def make_walker_plan_from_reference(
     if walker_channel_chi is not None or walker_cutoff:
         bond_a = plan_bonds(Ra, plan_a, walker_channel_chi, walker_cutoff)
         bond_b = plan_bonds(Rb, plan_b, walker_channel_chi, walker_cutoff)
+    return make_walker_plan_from_plans(Ra, Rb, (plan_a, plan_b), (bond_a, bond_b), sector_buckets=sector_buckets,
+                                       walker_qr=walker_qr)
+
+
+def make_walker_plan_from_plans(Ra, Rb, orbital_plans, bond_plans, *, sector_buckets=(), walker_qr="auto"
+                                ) -> MpsWalkerPlan:
+    """A walker plan from given orbital plans and bond plans (per spin; bond plans None for no truncation), e.g. bond
+    plans whose kept counts were trained on walkers (trot.gmps.utils.plan_bonds(..., counts=...)) rather than taken
+    from the reference's own top chi. (Ra, Rb) is the reference the orbital plans were frozen on."""
+    engine.resolve_walker_qr(walker_qr)  # validates
+    buckets = tuple(int(b) for b in sector_buckets)
+    if any(b < 1 for b in buckets) or list(buckets) != sorted(set(buckets)):
+        raise ValueError(f"sector_buckets must be increasing positive sizes, got {sector_buckets!r}")
+    Ra, Rb = np.asarray(Ra, dtype=float), np.asarray(Rb, dtype=float)
+    (plan_a, plan_b), (bond_a, bond_b) = orbital_plans, bond_plans
     # the walker labels are those of the compiled conversion circuit (host bookkeeping, no numerics); the circuit is
     # what the plan's engine runs, so it goes into the plan's cache
     converter = engine.make_converter(plan_a, plan_b, bond_a, bond_b, spin_batch=True, buckets=buckets or None)
@@ -539,6 +552,59 @@ def make_walker_plan_from_reference(
     )
     plan.caches["converter"] = converter
     return plan
+
+
+def make_dense_walker_plan(Ra, Rb, orbital_plans, spec, *, sector_buckets=(), walker_qr="auto") -> MpsWalkerPlan:
+    """A walker plan with dense walker legs (trot.gmps.dense_engine): only the gate circuit is frozen, on the reference
+    (Ra, Rb); the walkers' bonds have the fixed size spec.chi (a DenseSpec) and no frozen sectors, so there are no bond
+    plans and no static labels. It propagates only: measure with a sector plan (measurement_plan, which takes this
+    plan's sector_buckets)."""
+    engine.resolve_walker_qr(walker_qr)  # validates
+    Ra, Rb = np.asarray(Ra, dtype=float), np.asarray(Rb, dtype=float)
+    if spec.chi < 1:
+        raise ValueError("the dense bond must be positive")
+    return MpsWalkerPlan(
+        orbital_plans=tuple(orbital_plans),
+        bond_plans=(None, None),
+        channel_charges=(),
+        walker_charges=(),
+        reference=(Ra, Rb),
+        nelec=(Ra.shape[1], Rb.shape[1]),
+        norb=Ra.shape[0],
+        sector_buckets=tuple(int(b) for b in sector_buckets),
+        walker_qr=walker_qr,
+        dense=spec,
+    )
+
+
+def measurement_plan(plan: MpsWalkerPlan, chi) -> MpsWalkerPlan:
+    """The walker plan of the measurements (QmcParamsMps.measure_channel_chi): plan's reference and orbital plans (the
+    same gates, so the same angles for every walker) with the kept counts frozen on the reference at bond chi, cached
+    on plan."""
+    key = ("measurement_plan", int(chi))
+    measure = plan.caches.get(key)
+    if measure is None:
+        (Ra, Rb), orbital_plans = plan.reference, plan.orbital_plans
+        bonds = tuple(plan_bonds(R, p, int(chi)) for R, p in zip((Ra, Rb), orbital_plans))
+        measure = make_walker_plan_from_plans(Ra, Rb, orbital_plans, bonds, sector_buckets=plan.sector_buckets,
+                                              walker_qr=plan.walker_qr)
+        plan.caches[key] = measure
+    return measure
+
+
+def dense_measurement_plan(plan: MpsWalkerPlan, chi, params) -> MpsWalkerPlan:
+    """The walker plan of an MPO energy (QmcParamsMps.energy_kernel "mpo"): plan's reference and orbital plans with dense
+    walker legs of bond chi (each walker keeping its own states), settings from params (dense_move, dense_charge_gap,
+    dense_snap), cached on plan. The MPO kernel contracts H on the fly, so no H|trial> exists for it."""
+    key = ("dense_measurement_plan", int(chi), params.dense_move, params.dense_charge_gap, params.dense_snap)
+    measure = plan.caches.get(key)
+    if measure is None:
+        (Ra, Rb), orbital_plans = plan.reference, plan.orbital_plans
+        spec = DenseSpec(int(chi), params.dense_move, params.dense_charge_gap, snap=bool(params.dense_snap))
+        measure = make_dense_walker_plan(Ra, Rb, orbital_plans, spec, sector_buckets=plan.sector_buckets,
+                                         walker_qr=plan.walker_qr)
+        plan.caches[key] = measure
+    return measure
 
 
 def make_walker_plan(ham_data, trial: MpsTrial, sys_, params) -> MpsWalkerPlan:
@@ -570,6 +636,14 @@ def make_walker_plan(ham_data, trial: MpsTrial, sys_, params) -> MpsWalkerPlan:
         raise ValueError(
             f"plan_reference must be 'natural' or 'rhf', got {params.plan_reference!r}"
         )
+    if getattr(params, "walker_conversion", "sector") == "dense":
+        if params.walker_channel_chi is None:
+            raise ValueError("a dense walker plan needs walker_channel_chi (its bond)")
+        plans = tuple(make_orbital_plan(R, params.orbital_plan, params.occupation_tolerance) for R in (Ra, Rb))
+        spec = DenseSpec(int(params.walker_channel_chi), params.dense_move, params.dense_charge_gap,
+                         snap=bool(getattr(params, "dense_snap", True)))
+        return make_dense_walker_plan(Ra, Rb, plans, spec, sector_buckets=getattr(params, "sector_buckets", ()),
+                                      walker_qr=getattr(params, "walker_qr", "auto"))
     return make_walker_plan_from_reference(
         Ra,
         Rb,
@@ -612,7 +686,7 @@ def mps_overlap(walker, trial: MpsTrial, plan: MpsWalkerPlan):
     # check_trial(trial, plan)
     # check_walker(walker)
     kernels = engine.kernels_for(plan, trial.charges, energy=None)
-    data = engine.DeviceData(engine.fixed_blocks(trial.tensors, kernels.overlap_plan), (), (), None, None)
+    data = engine.DeviceData(engine.plan_blocks(trial.tensors, kernels.overlap_plan), (), (), None, None)
     return kernels.overlap_one(walker[0], walker[1], data)
 
 

@@ -66,9 +66,11 @@ _MPS_CHOICES = {
     "orbital_plan": ("rank_exact", "adaptive", "maximal"),
     "plan_reference": ("natural", "rhf"),
     "walker_start": ("natural", "rhf"),
-    "energy_kernel": ("blocked", "dense"),
+    "energy_kernel": ("blocked", "dense", "mpo"),
     "walker_qr": ("auto", "cholesky", "native"),
     "dmrg_init": ("auto", "neel", "random"),
+    "walker_conversion": ("sector", "dense"),
+    "dense_move": ("gram", "cans"),
 }
 
 
@@ -90,13 +92,29 @@ class QmcParamsMps(QmcParams):
     plan_reference: determinant that freezes the gate circuit and kept counts, "natural" (most
       occupied natural orbitals of the trial) or "rhf" (free-fermion determinant of h1).
     walker_start: determinant every walker starts from, "natural" (trot's convention) or "rhf".
-    energy_kernel: "blocked" (charge-labelled H|trial>, blocked contraction) or "dense"
-      (d=4 walker MPS against a densely compressed H|trial>; for validation).
+    energy_kernel: "blocked" (charge-labelled H|trial>, blocked contraction), "dense"
+      (d=4 walker MPS against a densely compressed H|trial>; for validation) or "mpo" (no stored H|trial>: the MPO is
+      applied on the fly with dense walker legs at the bond measure_channel_chi, default walker_channel_chi; the memory
+      is the trial plus a few MB instead of H|trial>'s ~19 GB at the doped 6x6's chi_T 512; no szsz).
     walker_qr: walker orthonormalisation, "cholesky" (CholeskyQR2 with a Householder fallback, for
       accelerators), "native" (trot's Householder _qr) or "auto" (cholesky on accelerators, native on CPU).
     sector_buckets: increasing size bounds that split each factorisation's charge sectors into classes padded to
       their own largest member (trot.gmps.engine.compile_circuit): the same factorisations on smaller padded
       matrices. (8, 16) measured 1.19-1.38x faster per step at L=100; () keeps one class per kind.
+    measure_channel_chi: per-channel walker bond of the measurements (local energy, observables), None for the
+      propagation's walker_channel_chi. The walkers propagate at walker_channel_chi; the energy and observables
+      convert them with the same gates at this bond instead (trot.trial.mps.measurement_plan). At the doped 6x6 the
+      local energy of chi-16 walkers is biased by +0.25 (+0.06 at 32, ~0 at 64) while their sampling is not.
+    walker_conversion: "sector" (the walker bonds keep frozen counts per electron-number sector: static shapes) or
+      "dense" (trot.gmps.dense_engine: bonds of the fixed size walker_channel_chi, each walker keeping its own largest
+      Schmidt states; no counts to freeze or retrain, the trial is contracted densely). Dense walkers propagate only:
+      it needs measure_channel_chi, the sector plan the energy and observables use.
+    dense_move: how the dense conversion moves its orthogonality centre, "gram" (polar factor from one eigh) or "cans"
+      (polar factor by a polynomial iteration, ~1.4x slower and more accurate at large bonds).
+    dense_charge_gap: the dense conversion's per-charge eigh shift in units of trace(G); None is 1e-7.
+    dense_snap: zero the off-sector entries of every new isometry of the dense conversion (default). Above bond 16 the
+      gates' eigh no longer keeps the sector blocks' zeros and the charge labels fail without it; with it they are
+      exact at no measurable cost (trot.gmps.dense_conversion.DenseSpec).
     """
 
     trial_chi: int = 64
@@ -109,9 +127,14 @@ class QmcParamsMps(QmcParams):
     walker_cutoff: float = 0.0
     plan_reference: Literal["natural", "rhf"] = "natural"
     walker_start: Literal["natural", "rhf"] = "natural"
-    energy_kernel: Literal["blocked", "dense"] = "blocked"
+    energy_kernel: Literal["blocked", "dense", "mpo"] = "blocked"
     walker_qr: Literal["auto", "cholesky", "native"] = "auto"
     sector_buckets: tuple[int, ...] = (8, 16)
+    measure_channel_chi: int | None = None
+    walker_conversion: Literal["sector", "dense"] = "sector"
+    dense_move: Literal["gram", "cans"] = "gram"
+    dense_charge_gap: float | None = None
+    dense_snap: bool = True
 
     def __post_init__(self) -> None:
         for name, allowed in _MPS_CHOICES.items():
@@ -129,6 +152,19 @@ class QmcParamsMps(QmcParams):
             raise ValueError("walker_channel_chi must be None or positive")
         if self.walker_cutoff < 0:
             raise ValueError("walker_cutoff must be non-negative")
+        if self.measure_channel_chi is not None and self.measure_channel_chi < 1:
+            raise ValueError("measure_channel_chi must be None or positive")
+        if self.energy_kernel == "mpo" and self.walker_channel_chi is None and self.measure_channel_chi is None:
+            raise ValueError("energy_kernel='mpo' contracts dense walker legs: it needs measure_channel_chi or "
+                             "walker_channel_chi (the bond they are converted at)")
+        if self.walker_conversion == "dense":
+            if self.walker_channel_chi is None:
+                raise ValueError("walker_conversion='dense' needs walker_channel_chi (the dense bond)")
+            if self.measure_channel_chi is None and self.energy_kernel != "mpo":
+                raise ValueError("walker_conversion='dense' needs measure_channel_chi: the energy and observables are "
+                                 "measured with a sector plan (or energy_kernel='mpo')")
+            if self.dense_charge_gap is not None and self.dense_charge_gap <= 0:
+                raise ValueError("dense_charge_gap must be None or positive")
 
 
 @dataclass(frozen=True)

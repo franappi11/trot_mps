@@ -27,6 +27,7 @@ Host-side primitives (orbital and bond plans, sector plans, block factorisation)
 from __future__ import annotations
 
 import itertools
+import os
 from functools import partial
 from typing import Callable, NamedTuple
 
@@ -624,6 +625,7 @@ class SitePlan(NamedTuple):
     fixed_cols: np.ndarray  # (T, Pt') columns (fill: its right bond dimension)
     fixed_keys: tuple  # (left label, p, right label) of each transition, for block-form fixed MPS
     fixed_shapes: tuple  # (rows, columns) of each transition's unpadded block
+    walker_shapes: np.ndarray  # (T, 4) unpadded (alpha rows, alpha columns, beta rows, beta columns) of each transition
 
 
 class ContractionPlan(NamedTuple):
@@ -642,18 +644,25 @@ def _index_1d(labels):
     return {q: np.asarray(v, int) for q, v in grouped.items()}
 
 
-def _leg_order(T, start, end):
+def _leg_order(T, start, end, prefer=(0, 1, 2), tolerance=1.25):
     """Cheapest order to contract the alpha, beta and trial legs of a (T, a, b, k)
-    environment block from sizes `start` to `end`; returns (order, FMAs, peak)."""
-    best = None
+    environment block from sizes `start` to `end`; returns (order, FMAs, peak).
+
+    `prefer` (an order, or None) is kept when it costs at most `tolerance` times the cheapest: contracting the
+    legs in the order a, b, k takes the leg that comes first in the block every time, which _legs does as pure
+    batched GEMMs, while any other order costs it a transpose of the whole block (36% of the right environments'
+    time and 24% of the field sweep's in the doped 6x6 profile, one pass over every site's block per leg)."""
+    found = {}
     for order in itertools.permutations(range(3)):
         size, cost, peak = list(start), 0, T * int(np.prod(start))
         for leg in order:
             cost += T * int(np.prod(size)) * end[leg]
             size[leg] = end[leg]
             peak = max(peak, T * int(np.prod(size)))
-        if best is None or cost < best[1]:
-            best = (order, cost, peak)
+        found[order] = (order, cost, peak)
+    best = min(found.values(), key=lambda entry: entry[1])
+    if prefer is not None and found[tuple(prefer)][1] <= tolerance * best[1]:
+        return found[tuple(prefer)]
     return best
 
 
@@ -710,7 +719,7 @@ def _site_plan(site, qa, qb, index, shared_in, shared_out, pads_in, pads_out, ke
     Dla, Dra = len(qa[site]), len(qa[site + 1])
     Dlb, Drb = len(qb[site]), len(qb[site + 1])
     Dlt, Drt = len(fixed_charges[site]), len(fixed_charges[site + 1])
-    src, dst, physical, sign, ga, gb, rows, cols, keys, shapes = [], [], [], [], [], [], [], [], [], []
+    src, dst, physical, sign, ga, gb, rows, cols, keys, shapes, walker = [], [], [], [], [], [], [], [], [], [], []
     for s, c in enumerate(shared_in):
         for p_walker, p_fixed, coefficient, jw in moves:
             na, nb = PHYSICAL[p_walker]
@@ -738,6 +747,7 @@ def _site_plan(site, qa, qb, index, shared_in, shared_out, pads_in, pads_out, ke
             cols.append(k)
             keys.append((key_in(c), p_fixed, key_out(c2)))
             shapes.append((len(rt), len(ct)))
+            walker.append((len(ra), len(ca_), len(rb), len(cb_)))
     T = len(src)
     if T == 0:
         if allow_empty:
@@ -753,7 +763,7 @@ def _site_plan(site, qa, qb, index, shared_in, shared_out, pads_in, pads_out, ke
         into=_table(dst, len(shared_out)), outof=_table(src, len(shared_in)),
         left_order=left_order, right_order=right_order, left_fma=left_fma, right_fma=right_fma,
         peak=max(left_peak, right_peak), fixed_rows=np.stack(rows), fixed_cols=np.stack(cols),
-        fixed_keys=tuple(keys), fixed_shapes=tuple(shapes))
+        fixed_keys=tuple(keys), fixed_shapes=tuple(shapes), walker_shapes=np.asarray(walker, int).reshape(T, 4))
 
 
 def make_factorized_layout(qa, qb, fixed_charges, shift=(0, 0), allow_empty=False) -> ContractionPlan:
@@ -808,12 +818,17 @@ def insertion_site_plan(qa, qb, fixed_charges, layout_in: ContractionPlan, layou
                       _fixed_key(width, layout_out.shift), moves, allow_empty=True)
 
 
-def fixed_blocks(fixed, plan: ContractionPlan, xp=jnp) -> tuple:
+def fixed_blocks(fixed, plan: ContractionPlan, xp=jnp, device=False) -> tuple:
     """The zero-padded (T, Pt, Pt') blocks of a fixed MPS (the trial, or H|trial>) for a factorized layout.
 
     Dense site tensors are gathered; with xp=jnp this also works on traced tensors (trial data inside jit),
     with xp=np it stays on the host. Sites in block form ({(left label, p, right label): block}, trot.gmps.trials
     for 6x6 and larger lattices) are assembled on the host.
+
+    device=True (with xp=np): every site is copied to the device as soon as it is assembled, so the host holds one
+    padded site at a time instead of all of them (the padded H|trial> blocks of the doped 6x6 at chi_T 512 are
+    38 GB, which with the rotated block form ran a 64 GB host out of memory) and the copy of one site overlaps the
+    assembly of the next.
     """
     out = []
     for A, sp in zip(fixed, plan.sites):
@@ -823,10 +838,11 @@ def fixed_blocks(fixed, plan: ContractionPlan, xp=jnp) -> tuple:
                 block = A.get(key)
                 if block is not None:
                     B[t, :n_rows, :n_cols] = block
-            out.append(B if xp is np else jnp.asarray(B))
+            out.append(jnp.asarray(B) if device or xp is not np else B)
         elif xp is np:
             padded = np.pad(np.asarray(A), ((0, 1), (0, 0), (0, 1)))
-            out.append(padded[sp.fixed_rows[:, :, None], sp.physical[:, None, None], sp.fixed_cols[:, None, :]])
+            site = padded[sp.fixed_rows[:, :, None], sp.physical[:, None, None], sp.fixed_cols[:, None, :]]
+            out.append(jnp.asarray(site) if device else site)
         else:
             out.append(jnp.asarray(A).at[sp.fixed_rows[:, :, None], sp.physical[:, None, None],
                                          sp.fixed_cols[:, None, :]].get(mode="fill", fill_value=0.0))
@@ -839,8 +855,252 @@ def make_factorized_plan(qa, qb, fixed_np, fixed_charges) -> ContractionPlan:
     return layout._replace(blocks=fixed_blocks(fixed_np, layout, xp=np))
 
 
-def walker_blocks(alpha, beta, plan: ContractionPlan):
-    """Per-transition (alpha, beta) blocks gathered straight from the channel tensors."""
+# ---------------------------------------------------------------------------------------------
+# Size-bucketed fixed blocks (the energy's H|trial>; the trial's with TROT_OVERLAP_BUCKET_RATIO)
+# ---------------------------------------------------------------------------------------------
+#
+# fixed_blocks pads every transition of a site to the site's largest incoming and outgoing label groups. The groups
+# of the (N_up, N_dn) labels are small, but a trial used as it is (rotated, particle-number labels N) has one group
+# per N that merges several (N_up, N_dn) sectors, and their sizes differ by an order of magnitude along a bond: for
+# the doped 6x6 at chi_T 512 the padded H|trial> blocks are 101 GiB (XLA: "the byte size of input/output
+# arguments exceeds the base limit"), about 5x the blocks' own entries. Here each transition is padded to the
+# largest of its own size class instead (geometric size bounds, one class per pair of row and column bounds), and its
+# walker blocks to the class's largest: the same sums, regrouped, so memory and the FLOPs of the contraction drop by
+# about the padding factor. The environments keep the bond's uniform shape: a class reads the corner of them its
+# blocks span and its sums are padded back (_local, _gathered).
+
+
+class SizeClass(NamedTuple):
+    """The transitions of one site whose fixed blocks have similar sizes. The fields the contractions read have the
+    names of SitePlan's: a site of a uniform plan is its own single class (_parts)."""
+    idx: np.ndarray  # (T_c,) their indices among the site's transitions
+    rows: int  # padded fixed block shape of the class: the largest incoming and outgoing group among its members
+    cols: int
+    src: np.ndarray  # (T_c,) incoming shared-label index
+    dst: np.ndarray  # (T_c,) outgoing shared-label index
+    physical: np.ndarray  # (T_c,) fixed MPS physical index
+    sign: np.ndarray  # (T_c, 1, 1, 1)
+    onehot: np.ndarray  # (T_c, 4)
+    into: np.ndarray  # (n_out, deg) class positions of the transitions feeding each outgoing label (sentinel T_c)
+    outof: np.ndarray  # (n_in, deg) class positions of the transitions leaving each incoming label (sentinel T_c)
+    left_order: tuple  # leg orders of the class's contractions
+    right_order: tuple
+    gather_a: np.ndarray  # (T_c, pa, pa') the site's walker gathers, cut to the class's largest walker blocks
+    gather_b: np.ndarray  # (T_c, pb, pb')
+    fixed_rows: np.ndarray  # (T_c, rows) rows of the fixed MPS's block of each transition (fill: left bond dimension)
+    fixed_cols: np.ndarray  # (T_c, cols)
+    fixed_keys: tuple  # (left label, p, right label) of each transition, for block-form fixed MPS
+    fixed_shapes: tuple  # (rows, columns) of each transition's unpadded block
+    unique: np.ndarray | None = None  # (T_c,) index of each transition's fixed block among the class's distinct ones
+    unique_first: np.ndarray | None = None  # (U_c,) the first transition (class position) of each distinct block
+
+
+class BucketedPlan(NamedTuple):
+    """A ContractionPlan whose fixed blocks are stored per size class (bucket_plan). dedup: the blocks are stored
+    once per distinct (left label, p, right label) of a class (bucketed_blocks) and gathered per transition by
+    left_contract, the only contraction that takes such a plan (the energy's numerator)."""
+    layout: ContractionPlan  # the uniform layout: labels and the environments' shapes (pads)
+    sites: tuple  # per site, a tuple of SizeClass
+    stats: dict  # the layout's, with the fixed blocks' entries (exact, uniformly padded, bucketed, unique) and the FMAs
+    dedup: bool = False
+
+
+def _size_bounds(maximum, ratio, minimum):
+    bounds, b = [], max(int(minimum), 1)
+    while b < maximum:
+        bounds.append(b)
+        b = max(b + 1, int(np.ceil(b * ratio)))
+    bounds.append(int(maximum))
+    return bounds
+
+
+def _distinct(keys):
+    """(index of each key among the distinct keys in order of appearance, the position of each distinct key's first
+    appearance)."""
+    order, index, first = {}, [], []
+    for position, key in enumerate(keys):
+        if key not in order:
+            order[key] = len(order)
+            first.append(position)
+        index.append(order[key])
+    return np.asarray(index, np.int32), np.asarray(first, int)
+
+
+def bucket_plan(layout: ContractionPlan, ratio=1.5, minimum=8, bounds=None, dedup=False) -> BucketedPlan:
+    """The size-bucketed form of a layout's fixed blocks. Block sizes are cut at the geometric bounds minimum,
+    minimum * ratio, ... (or the given increasing `bounds`); a class is a pair (row bound, column bound) and is padded
+    to its members' largest fixed blocks and largest walker blocks, so a fixed block wastes at most about ratio**2 of
+    its entries.
+
+    dedup: store each distinct fixed block of a class once (BucketedPlan.dedup). With particle-number labels every walker
+    label pair (N_alpha, N_beta) with the same N_alpha + N_beta meets the same fixed block, so the transitions repeat
+    the same H|trial> blocks many times (doped 6x6, chi_T 512, walker bond 64: 59 GB of copies of a 5 GB H|trial>);
+    stats["fixed_unique_entries"] counts what dedup stores."""
+    sites, exact, uniform, bucketed, unique_entries, fma, n_classes = [], 0, 0, 0, 0, 0, 0
+    for sp in layout.sites:
+        T = len(sp.src)
+        shapes = np.asarray(sp.fixed_shapes, dtype=int).reshape(T, 2)
+        n_in, n_out = sp.outof.shape[0], sp.into.shape[0]
+        edges = list(bounds) if bounds is not None else _size_bounds(max(sp.fixed_rows.shape[1],
+                                                                          sp.fixed_cols.shape[1]), ratio, minimum)
+        key_r, key_c = np.searchsorted(edges, shapes[:, 0]), np.searchsorted(edges, shapes[:, 1])
+        classes = []
+        for kr, kc in sorted(set(zip(key_r.tolist(), key_c.tolist()))):
+            members = np.flatnonzero((key_r == kr) & (key_c == kc))
+            rows, cols = int(shapes[members, 0].max()), int(shapes[members, 1].max())
+            pa, pa2, pb, pb2 = (int(m) for m in sp.walker_shapes[members].max(axis=0))
+            left_order, cost, _ = _leg_order(len(members), (pa, pb, rows), (pa2, pb2, cols))
+            right_order, _, _ = _leg_order(len(members), (pa2, pb2, cols), (pa, pb, rows))
+            keys = tuple(sp.fixed_keys[t] for t in members)
+            unique, first = _distinct(keys)
+            classes.append(SizeClass(
+                idx=members, rows=rows, cols=cols, src=sp.src[members], dst=sp.dst[members],
+                physical=sp.physical[members], sign=sp.sign[members], onehot=sp.onehot[members],
+                into=_table(sp.dst[members], n_out), outof=_table(sp.src[members], n_in),
+                left_order=left_order, right_order=right_order,
+                gather_a=sp.gather_a[members][:, :pa, :pa2], gather_b=sp.gather_b[members][:, :pb, :pb2],
+                fixed_rows=sp.fixed_rows[members][:, :rows], fixed_cols=sp.fixed_cols[members][:, :cols],
+                fixed_keys=keys, fixed_shapes=tuple(sp.fixed_shapes[t] for t in members),
+                unique=unique, unique_first=first))
+            bucketed += len(members) * rows * cols
+            unique_entries += len(first) * rows * cols
+            fma += cost
+        exact += int(np.sum(shapes[:, 0] * shapes[:, 1]))
+        uniform += T * sp.fixed_rows.shape[1] * sp.fixed_cols.shape[1]
+        n_classes += len(classes)
+        sites.append(tuple(classes))
+    stats = dict(layout.stats, fixed_exact_entries=exact, fixed_uniform_entries=uniform,
+                 fixed_bucketed_entries=bucketed, fixed_unique_entries=unique_entries,
+                 contraction_fma_uniform=layout.stats["contraction_fma"], contraction_fma=fma, classes=n_classes)
+    return BucketedPlan(layout, tuple(sites), stats, bool(dedup))
+
+
+def bucketed_blocks(fixed, plan: BucketedPlan, xp=np, device=False) -> tuple:
+    """The zero-padded blocks of a fixed MPS per site and class, as fixed_blocks: dense site tensors or block-form
+    sites on the host (xp=np; device=True copies every class to the device as it is assembled, so the host holds one
+    padded class at a time), or dense tensors gathered with xp=jnp (also traced, inside jit). For a dedup plan, one
+    block per distinct (left label, p, right label) of each class (SizeClass.unique_first), in the order of
+    SizeClass.unique."""
+    out = []
+    for A, classes in zip(fixed, plan.sites):
+        site = []
+        for c in classes:
+            sel = c.unique_first if plan.dedup else np.arange(len(c.idx))
+            if isinstance(A, dict):
+                B = np.zeros((len(sel), c.rows, c.cols))
+                for j, t in enumerate(sel):
+                    n_rows, n_cols = c.fixed_shapes[t]
+                    block = A.get(c.fixed_keys[t])
+                    if block is not None:
+                        B[j, :n_rows, :n_cols] = block
+                site.append(jnp.asarray(B) if device or xp is not np else B)
+            elif xp is np:
+                padded = np.pad(np.asarray(A), ((0, 1), (0, 0), (0, 1)))
+                B = padded[c.fixed_rows[sel][:, :, None], c.physical[sel][:, None, None], c.fixed_cols[sel][:, None, :]]
+                site.append(jnp.asarray(B) if device else B)
+            else:
+                site.append(jnp.asarray(A).at[c.fixed_rows[sel][:, :, None], c.physical[sel][:, None, None],
+                                              c.fixed_cols[sel][:, None, :]].get(mode="fill", fill_value=0.0))
+        out.append(tuple(site))
+    return tuple(out)
+
+
+class DensePlan(NamedTuple):
+    """The overlap plan of a dense walker plan (MpsWalkerPlan.dense, trot.gmps.dense_engine): the walkers' bonds carry
+    no frozen sectors, so only the trial has a layout. layout None: the trial enters as plain matrices
+    (dense_trial_blocks); a dense_engine.SectorLayout: as blocks between its particle-number sectors
+    (dense_engine.sector_trial_blocks)."""
+    norb: int
+    stats: dict = {}
+    layout: object = None
+
+
+def dense_trial_blocks(fixed, xp=jnp, device=False) -> tuple:
+    """Per site the two matrices the dense contractions multiply, from the trial tensor A (Dl, 4, Dr): A as
+    (Dl, 4 Dr) (rows t, columns (p, t'): the left environments) and its transpose as (Dr, 4 Dl) (rows t', columns
+    (p, t): the right environments). xp and device as fixed_blocks."""
+    out = []
+    for A in fixed:
+        A = xp.asarray(A)
+        forward = A.reshape(A.shape[0], -1)
+        backward = xp.transpose(A, (2, 1, 0)).reshape(A.shape[2], -1)
+        out.append((jnp.asarray(forward), jnp.asarray(backward)) if device else (forward, backward))
+    return tuple(out)
+
+
+def plan_blocks(fixed, plan, xp=jnp, device=False) -> tuple:
+    """The blocks of a fixed MPS for a plan: fixed_blocks for a uniform ContractionPlan, bucketed_blocks (per site
+    and class) for a BucketedPlan, dense_trial_blocks for a DensePlan; xp and device as there."""
+    if isinstance(plan, DensePlan):
+        if plan.layout is not None:
+            from trot.gmps import dense_engine  # imports this module
+
+            return dense_engine.sector_trial_blocks(fixed, plan.layout, xp=xp, device=device)
+        return dense_trial_blocks(fixed, xp=xp, device=device)
+    if isinstance(plan, BucketedPlan):
+        return bucketed_blocks(fixed, plan, xp=xp, device=device)
+    return fixed_blocks(fixed, plan, xp=xp, device=device)
+
+
+def energy_numerator(alpha, beta, htrial, energy_plan):
+    """<H trial|walker channels>: the walker against H|trial> through an energy plan, uniform (ContractionPlan with
+    fixed_blocks) or size-bucketed (BucketedPlan with bucketed_blocks)."""
+    return left_contract(walker_blocks(alpha, beta, energy_plan), htrial, energy_plan)
+
+
+ENERGY_BUCKET_RATIO = float(os.environ.get("TROT_ENERGY_BUCKET_RATIO", 1.5))  # size bounds of the energy's classes
+# TROT_ENERGY_DEDUP=1: the energy plan stores each distinct H|trial> block once (bucket_plan(dedup=True)); off by default
+# until it has replaced the duplicated blocks in production
+ENERGY_DEDUP = os.environ.get("TROT_ENERGY_DEDUP", "0").strip().lower() not in ("", "0", "false", "no")
+
+
+def energy_plan_for(plan, h_charges) -> BucketedPlan:
+    """The size-bucketed energy plan of a walker plan for an H|trial> with these (hashable) bond labels, cached on
+    the plan; the kernels and the context's blocks (meas.mps.build_mps_meas_ctx) both take it from here. A smaller
+    TROT_ENERGY_BUCKET_RATIO means more classes and less padding, a larger one fewer, larger kernels."""
+    if plan.dense is not None:
+        raise ValueError("a dense walker plan has no energy plan: measure with a sector plan (measure_channel_chi)")
+    key = ("energy_plan", h_charges, ENERGY_DEDUP)
+    bucketed = plan.caches.get(key)
+    if bucketed is None:
+        bucketed = bucket_plan(layout_for(plan, h_charges), ratio=ENERGY_BUCKET_RATIO, dedup=ENERGY_DEDUP)
+        plan.caches[key] = bucketed
+    return bucketed
+
+
+# Size classes for the trial's blocks too (the step's right environments and field sweep, the overlaps, the energy's
+# denominator, szsz), off by default (0). At the doped 6x6 the overlap plan is padded 4x (chi_T 256: 1.54M
+# environment entries against 0.39M exact), but its contractions are small batched GEMMs and the classes add kernels.
+OVERLAP_BUCKET_RATIO = float(os.environ.get("TROT_OVERLAP_BUCKET_RATIO", 0))
+
+
+def overlap_plan_for(plan, charges):
+    """The overlap plan of a walker plan for a trial with these (hashable) bond labels: its uniform layout
+    (layout_for), or with TROT_OVERLAP_BUCKET_RATIO > 0 that layout size-bucketed at this ratio, cached on the plan.
+    The kernels and the context's trial blocks (meas.mps.build_mps_meas_ctx, plan_blocks) both take it from here.
+    A dense walker plan (plan.dense) has a DensePlan: the trial's sector layout for these labels, or none
+    (dense_engine.dense_overlap_plan)."""
+    if plan.dense is not None:
+        from trot.gmps import dense_engine  # imports this module
+
+        return dense_engine.dense_overlap_plan(plan, charges)
+    layout = layout_for(plan, charges)
+    if OVERLAP_BUCKET_RATIO <= 0:
+        return layout
+    key = ("overlap_plan", charges, OVERLAP_BUCKET_RATIO)
+    bucketed = plan.caches.get(key)
+    if bucketed is None:
+        bucketed = bucket_plan(layout, ratio=OVERLAP_BUCKET_RATIO)
+        plan.caches[key] = bucketed
+    return bucketed
+
+
+def walker_blocks(alpha, beta, plan):
+    """Per-transition (alpha, beta) blocks gathered straight from the channel tensors: per site for a uniform plan,
+    per site and class for a BucketedPlan (each class's blocks cut to its largest)."""
+    if isinstance(plan, BucketedPlan):
+        return tuple(tuple((_gather_flat(A, c.gather_a, 3), _gather_flat(B, c.gather_b, 3)) for c in classes)
+                     for A, B, classes in zip(alpha, beta, plan.sites))
     return tuple((_gather_flat(A, sp.gather_a, 3), _gather_flat(B, sp.gather_b, 3))
                  for A, B, sp in zip(alpha, beta, plan.sites))
 
@@ -848,13 +1108,22 @@ def walker_blocks(alpha, beta, plan: ContractionPlan):
 def _legs(X, operands, order, forward):
     """Contract the environment block X with the alpha, beta and fixed blocks one
     leg at a time; forward maps lower to upper indices (left environments),
-    backward upper to lower (right environments)."""
-    cur = "abk" if forward else "ABK"
+    backward upper to lower (right environments).
+
+    Every einsum is written in the order of dot_general's output, (t, the legs not yet contracted, the new one),
+    so no transpose sits between the legs, and with the legs taken in the order a, b, k (_leg_order's default)
+    each step contracts the first leg of the block and the block ends in its canonical order (t, A, B, K) or
+    (t, a, b, k) untouched. Any other order costs one transpose at the end (the earlier code transposed after
+    every leg)."""
+    cur, final = ("abk", "ABK") if forward else ("ABK", "abk")
     for leg in order:
         lo, up = _LEGS[leg]
-        nxt = cur.replace(lo, up) if forward else cur.replace(up, lo)
+        old, new = (lo, up) if forward else (up, lo)
+        nxt = cur.replace(old, "") + new
         X = jnp.einsum(f"t{cur},t{lo}{up}->t{nxt}", X, operands[leg])
         cur = nxt
+    if cur != final:
+        X = jnp.einsum(f"t{cur}->t{final}", X)
     return X
 
 
@@ -864,39 +1133,105 @@ def _reduce(Y, table):
     return jnp.sum(Y[table], axis=1)
 
 
-def left_contract(wblocks, fixed_blocks, plan: ContractionPlan):
-    """<fixed|walker channels> streaming left to right; no environment is stored."""
+# The contractions below take a uniform ContractionPlan or a size-bucketed BucketedPlan alike, with the walker blocks
+# (walker_blocks) and fixed blocks (plan_blocks) of that plan: each site is a list of parts, its size classes, or the
+# site itself as one class whose blocks span the whole environment (no cut, no padding: the uniform graph as is).
+
+
+def _layout(plan) -> ContractionPlan:
+    return plan.layout if isinstance(plan, BucketedPlan) else plan
+
+
+def _parts(wblocks, fixed_blocks, plan):
+    """Per site, its parts (class, (Wa, Wb, F)): the SizeClass of a BucketedPlan, the SitePlan of a uniform one."""
+    if isinstance(plan, BucketedPlan) and plan.dedup:
+        raise ValueError("a deduplicated plan's blocks are contracted by left_contract only")
+    if isinstance(plan, BucketedPlan):
+        return [[(c, (Wa, Wb, F)) for (Wa, Wb), F, c in zip(w, b, classes)]
+                for w, b, classes in zip(wblocks, fixed_blocks, plan.sites)]
+    return [[(sp, (Wa, Wb, F))] for (Wa, Wb), F, sp in zip(wblocks, fixed_blocks, plan.sites)]
+
+
+def _cut(X, shape):
+    """The corner (:, :a, :b, :k) of a stack of environment blocks."""
+    shape = tuple(shape)
+    return X if X.shape[1:] == shape else X[:, :shape[0], :shape[1], :shape[2]]
+
+
+def _local(E, part, forward=True):
+    """A part's transitions applied to an environment: to the left one E (forward) they give (T_c, upper legs), to
+    the right one (T_c, lower legs). The part reads the corner of E its blocks span."""
+    c, operands = part
+    axis = 1 if forward else 2
+    X = _cut(E[c.src if forward else c.dst], (W.shape[axis] for W in operands))
+    return _legs(X, operands, c.left_order if forward else c.right_order, forward) * c.sign
+
+
+def _gathered(Ys, parts, table, shape):
+    """The parts' transitions Ys summed into the labels of a bond (table "into": the outgoing labels, "outof": the
+    incoming ones), each padded back to the bond's environment blocks `shape` (Pa, Pb, Pt)."""
+    shape, total = tuple(shape), None
+    for Y, (c, _) in zip(Ys, parts):
+        Z = _reduce(Y, getattr(c, table))
+        if Z.shape[1:] != shape:
+            Z = jnp.pad(Z, ((0, 0),) + tuple((0, int(s) - z) for s, z in zip(shape, Z.shape[1:])))
+        total = Z if total is None else total + Z
+    return total
+
+
+def _total(values):
+    total = values[0]
+    for value in values[1:]:
+        total = total + value
+    return total
+
+
+def left_contract(wblocks, fixed_blocks, plan):
+    """<fixed|walker channels> streaming left to right; no environment is stored.
+
+    With a dedup BucketedPlan (the energy's, TROT_ENERGY_DEDUP) fixed_blocks hold each class's distinct blocks once and
+    every transition gathers its own (SizeClass.unique). A site gathers them only once the previous site's environment
+    exists (an optimization barrier on both): at most one site's gathered blocks are alive at a time, and none is
+    loop-invariant, so none is hoisted out of the measurement's chunk loop and kept."""
+    pads = _layout(plan).pads
     E = jnp.ones((1, 1, 1, 1))
-    for (Wa, Wb), F, sp in zip(wblocks, fixed_blocks, plan.sites):
-        Y = _legs(E[sp.src], (Wa, Wb, F), sp.left_order, True) * sp.sign
-        E = _reduce(Y, sp.into)
+    if isinstance(plan, BucketedPlan) and plan.dedup:
+        for site, (w, unique, classes) in enumerate(zip(wblocks, fixed_blocks, plan.sites)):
+            unique, E = lax.optimization_barrier((unique, E))
+            parts = [(c, (Wa, Wb, U[c.unique])) for (Wa, Wb), U, c in zip(w, unique, classes)]
+            E = _gathered([_local(E, part) for part in parts], parts, "into", pads[site + 1])
+        return E[0, 0, 0, 0]
+    for site, parts in enumerate(_parts(wblocks, fixed_blocks, plan)):
+        E = _gathered([_local(E, part) for part in parts], parts, "into", pads[site + 1])
     return E[0, 0, 0, 0]
 
 
-def right_environments(wblocks, fixed_blocks, plan: ContractionPlan):
+def right_environments(wblocks, fixed_blocks, plan):
+    pads = _layout(plan).pads
+    sites = _parts(wblocks, fixed_blocks, plan)
     right = [jnp.ones((1, 1, 1, 1))]
-    for site in range(len(plan.sites) - 1, -1, -1):
-        sp = plan.sites[site]
-        Wa, Wb = wblocks[site]
-        Y = _legs(right[-1][sp.dst], (Wa, Wb, fixed_blocks[site]), sp.right_order, False) * sp.sign
-        right.append(_reduce(Y, sp.outof))
+    for site in range(len(sites) - 1, -1, -1):
+        parts = sites[site]
+        right.append(_gathered([_local(right[-1], part, forward=False) for part in parts], parts, "outof",
+                               pads[site]))
     return right[::-1]
 
 
 def field_sweep(ca, cb, randoms, wblocks, prefactor, right, overlap_in, *, hs, weight_floor,
-                fixed_blocks, plan: ContractionPlan):
+                fixed_blocks, plan):
     """The diagonal HS sweep of one walker on the factorized environments: at each
     site the four physical marginals give both field proposals, one field is
     sampled, and the left environment absorbs the chosen diagonal factor."""
     diagonal = jnp.stack((jnp.ones(2), hs[:, 0], hs[:, 1], hs[:, 0] * hs[:, 1]), axis=1)
+    pads = _layout(plan).pads
     left = jnp.ones((1, 1, 1, 1))
     overlap, log_weight = overlap_in, jnp.zeros(())
     nodes = jnp.zeros((), jnp.int64)
     fields = []
-    for site, ((Wa, Wb), F, sp) in enumerate(zip(wblocks, fixed_blocks, plan.sites)):
-        local = _legs(left[sp.src], (Wa, Wb, F), sp.left_order, True) * sp.sign
-        by_transition = jnp.sum(local * right[site + 1][sp.dst], axis=(1, 2, 3))
-        marginal = by_transition @ sp.onehot
+    for site, parts in enumerate(_parts(wblocks, fixed_blocks, plan)):
+        local = [_local(left, part) for part in parts]
+        marginal = _total([jnp.sum(Y * _cut(right[site + 1][c.dst], Y.shape[1:]), axis=(1, 2, 3)) @ c.onehot
+                           for Y, (c, _) in zip(local, parts)])
 
         proposed = prefactor * (diagonal @ marginal)
         ratios = constrain_ratio(proposed / overlap, weight_floor)
@@ -907,7 +1242,8 @@ def field_sweep(ca, cb, randoms, wblocks, prefactor, right, overlap_in, *, hs, w
         overlap = proposed[field]
         log_weight += jnp.log(norm)
         fields.append(field)
-        left = _reduce(diagonal[field][sp.physical][:, None, None, None] * local, sp.into)
+        left = _gathered([diagonal[field][c.physical][:, None, None, None] * Y for Y, (c, _) in zip(local, parts)],
+                         parts, "into", pads[site + 1])
     fields = jnp.stack(fields)
     return ca * hs[fields, 0][:, None], cb * hs[fields, 1][:, None], overlap, jnp.exp(log_weight), nodes
 
@@ -929,7 +1265,7 @@ def _symmetric_matrix(diagonal, pairs):
     return C
 
 
-def szsz_contract(wblocks, fixed_blocks, plan: ContractionPlan):
+def szsz_contract(wblocks, fixed_blocks, plan):
     """<fixed|S^z_i S^z_j|walker channels> / <fixed|walker channels> as an (L, L) matrix.
 
     S^z is diagonal in the local basis, so an insertion is the weight SZ_LOCAL[p] on each transition of the
@@ -939,23 +1275,26 @@ def szsz_contract(wblocks, fixed_blocks, plan: ContractionPlan):
     diagonal (k, k) is the double insertion SZ_LOCAL**2. The gauges and det R of the walker cancel in the ratio.
     """
     right = right_environments(wblocks, fixed_blocks, plan)
+    pads = _layout(plan).pads
     sz, sz2 = jnp.asarray(SZ_LOCAL), jnp.asarray(SZ_LOCAL**2)
     left = jnp.ones((1, 1, 1, 1))
     stack = None  # (k, n_shared, Pa, Pb, Pt): left environments holding one S^z at sites 0..k-1
     diagonal, pairs = [], [jnp.zeros(0)]
-    for site, ((Wa, Wb), F, sp) in enumerate(zip(wblocks, fixed_blocks, plan.sites)):
-        step = lambda X: _legs(X[sp.src], (Wa, Wb, F), sp.left_order, True) * sp.sign
-        into = lambda Y: _reduce(Y, sp.into)
-        close = right[site + 1][sp.dst]
-        local = step(left)
-        weight = sz[sp.physical][:, None, None, None]
-        diagonal.append(jnp.sum(sz2[sp.physical][:, None, None, None] * local * close))
+    for site, parts in enumerate(_parts(wblocks, fixed_blocks, plan)):
+        into = lambda Ys: _gathered(Ys, parts, "into", pads[site + 1])
+        local = [_local(left, part) for part in parts]
+        close = [_cut(right[site + 1][c.dst], Y.shape[1:]) for Y, (c, _) in zip(local, parts)]
+        weight = [sz[c.physical][:, None, None, None] for c, _ in parts]
+        diagonal.append(_total([jnp.sum(sz2[c.physical][:, None, None, None] * Y * C)
+                                for Y, C, (c, _) in zip(local, close, parts)]))
+        opened = into([w * Y for w, Y in zip(weight, local)])
         if stack is None:
-            stack = into(weight * local)[None]
+            stack = opened[None]
         else:
-            moved = jax.vmap(step)(stack)
-            pairs.append(jnp.sum(weight[None] * moved * close[None], axis=(1, 2, 3, 4)))
-            stack = jnp.concatenate((jax.vmap(into)(moved), into(weight * local)[None]), axis=0)
+            moved = [jax.vmap(partial(_local, part=part))(stack) for part in parts]
+            pairs.append(_total([jnp.sum(w[None] * M * C[None], axis=(1, 2, 3, 4))
+                                 for w, M, C in zip(weight, moved, close)]))
+            stack = jnp.concatenate((jax.vmap(lambda *Ms: into(list(Ms)))(*moved), opened[None]), axis=0)
         left = into(local)
     overlap = right[0][0, 0, 0, 0]
     return _symmetric_matrix(diagonal, pairs) / overlap
@@ -1360,7 +1699,7 @@ class DeviceData(NamedTuple):
     """Everything large the jitted code reads, passed as arguments (not constants). trot.prop.mps_cpmc assembles it
     from meas_ctx (trial and H|trial> blocks) and prop_ctx (exp(-dt K/2), HS factors); overlaps and energies leave
     the propagation fields None."""
-    trial: tuple  # per-site (T, Pt, Pt') trial blocks of the overlap plan
+    trial: tuple  # trial blocks of the overlap plan (plan_blocks): per site, or per site and size class
     htrial: tuple  # per-site blocks of the energy plan, or dense H|trial> for energy="dense"
     dense_trial: tuple  # dense trial tensors, energy="dense" only
     exp_h1_half: jax.Array | None
@@ -1370,8 +1709,8 @@ class DeviceData(NamedTuple):
 class Kernels(NamedTuple):
     """The batched engine for one walker plan and one trial / H|trial> labelling (make_kernels)."""
     converter: Converter
-    overlap_plan: ContractionPlan  # a layout: its blocks come with the DeviceData
-    energy_plan: ContractionPlan | None
+    overlap_plan: ContractionPlan | BucketedPlan  # the trial's (overlap_plan_for): its blocks come with the DeviceData
+    energy_plan: BucketedPlan | ContractionPlan | None  # the size-bucketed layout of H|trial> (energy_plan_for)
     energy_kind: str
     batch_qr: Callable  # (n, L, N) -> Q, det R
     overlaps: Callable  # (ca, cb, data) -> overlaps of a walker batch
@@ -1383,8 +1722,9 @@ class Kernels(NamedTuple):
     jit_probe: Callable  # jax.jit(probe), compiled once per kernels
 
 
-def make_kernels(converter: Converter, overlap_plan: ContractionPlan, energy_plan: ContractionPlan | None,
-                 energy="blocked", walker_qr="cholesky") -> Kernels:
+def make_kernels(converter: Converter, overlap_plan: ContractionPlan | BucketedPlan,
+                 energy_plan: BucketedPlan | ContractionPlan | None, energy="blocked",
+                 walker_qr="cholesky") -> Kernels:
     """Conversion, overlap, local energy and the half-step kernel against a fixed trial whose blocks (and those of
     H|trial>) arrive in the DeviceData argument. energy_plan: the layout of the charge-labelled H|trial> for
     energy="blocked", None for energy="dense" (the d=4 walker against the dense H|trial>, for validation) and for
@@ -1401,7 +1741,7 @@ def make_kernels(converter: Converter, overlap_plan: ContractionPlan, energy_pla
         if energy == "dense":
             tensors, _ = combine_channels(alpha, qa_labels, beta, qb_labels)
             return contract_real(tensors, data.htrial) / contract_real(tensors, data.dense_trial)
-        numerator = left_contract(walker_blocks(alpha, beta, energy_plan), data.htrial, energy_plan)
+        numerator = energy_numerator(alpha, beta, data.htrial, energy_plan)
         denominator = left_contract(walker_blocks(alpha, beta, overlap_plan), data.trial, overlap_plan)
         return numerator / denominator
 
@@ -1493,6 +1833,8 @@ def resolve_walker_qr(walker_qr="auto") -> str:
 def converter_for(plan) -> Converter:
     """The plan's compiled conversion circuit (batched sector factorisations, both spins in one batch when their
     gate sequences match, the plan's sector buckets)."""
+    if plan.dense is not None:
+        raise ValueError("a dense walker plan has no sector converter (see trot.gmps.dense_engine)")
     converter = plan.caches.get("converter")
     if converter is None:
         (plan_a, plan_b), (bond_a, bond_b) = plan.orbital_plans, plan.bond_plans
@@ -1514,12 +1856,26 @@ def layout_for(plan, charges) -> ContractionPlan:
 
 def kernels_for(plan, trial_charges, h_charges=None, energy="blocked") -> Kernels:
     """The plan's kernels for a trial with these bond labels and an H|trial> with h_charges (energy="blocked"; for
-    "dense" the dense H|trial> comes with the data, for None there is no energy)."""
-    key = ("kernels", trial_charges, h_charges, energy)
+    "dense" the dense H|trial> comes with the data, for None there is no energy). A dense walker plan (plan.dense)
+    gets trot.gmps.dense_engine's kernels: overlaps and the CPMC step, and with energy="mpo" the local energies through
+    the MPO (the MPO's site tensors come with the data as DeviceData.htrial)."""
+    if plan.dense is not None:
+        if energy not in (None, "mpo"):
+            raise ValueError("a dense walker plan measures its energy through the MPO (energy='mpo'), or not at all: "
+                             "the stored-H|trial> kernels need a sector measurement plan")
+        key = ("dense_kernels", trial_charges, energy)
+        kernels = plan.caches.get(key)
+        if kernels is None:
+            from trot.gmps import dense_engine  # imports this module
+
+            kernels = dense_engine.make_dense_kernels(plan, overlap_plan_for(plan, trial_charges), energy)
+            plan.caches[key] = kernels
+        return kernels
+    key = ("kernels", trial_charges, h_charges, energy, OVERLAP_BUCKET_RATIO, ENERGY_DEDUP)
     kernels = plan.caches.get(key)
     if kernels is None:
-        energy_plan = layout_for(plan, h_charges) if energy == "blocked" else None
-        kernels = make_kernels(converter_for(plan), layout_for(plan, trial_charges), energy_plan, energy,
+        energy_plan = energy_plan_for(plan, h_charges) if energy == "blocked" else None
+        kernels = make_kernels(converter_for(plan), overlap_plan_for(plan, trial_charges), energy_plan, energy,
                                resolve_walker_qr(plan.walker_qr))
         plan.caches[key] = kernels
     return kernels
@@ -1599,3 +1955,16 @@ def divisor_at_least(n, k) -> int:
         if n % d == 0:
             return d
     return n
+
+
+MEASURE_CHUNK = int(os.environ.get("TROT_MEASURE_CHUNK", 20))  # walkers per chunk of the energy and observables
+
+
+def measure_chunks(n, n_chunks) -> int:
+    """Chunks for the energy and observable measurements of n walkers: at least n_chunks, and at most MEASURE_CHUNK
+    walkers each (20, or the environment variable TROT_MEASURE_CHUNK). Their cost is linear in the walkers (no gain
+    from batching: the doped 6x6 energy took 1.7 / 3.3 / 6.6 s for 100 / 200 / 400 walkers) while their
+    contraction blocks grow with the chunk: about 13 GB of energy intermediates at 400 walkers, and the szsz
+    observable's stack of environments, which at 100 walkers made XLA report that the block needs 70 GB (it cannot
+    go below 40 GB by rematerialization). The steps, unlike these, gain from larger batches."""
+    return divisor_at_least(n, max(int(n_chunks), -(-n // MEASURE_CHUNK)))

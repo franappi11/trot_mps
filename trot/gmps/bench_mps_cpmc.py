@@ -19,6 +19,12 @@ Throughput must grow by --min-scaling from the smallest to the largest walker co
 fraction). --circuit-only prints each conversion circuit's statistics, padding waste included, for every --bucket-sets
 setting: host work only, any backend.
 
+--stages times every piece of a CPMC block as its own compiled call on the same walkers (one chunk): the one-body
+propagator, the walker QR, the conversion (and the Givens angles inside it), the walker blocks of the overlap plan,
+the right environments, the HS field sweep, and the energy's numerator (H|trial>) and denominator (trial); with
+their share of a --block-steps block. Separate calls cannot fuse across stages, so their sum is somewhat above the
+fused step. With --profile each stage of the largest walker count is traced and summarised too.
+
     python bench_mps_cpmc.py --L 100 --U 8 --trial-chi 8 16 --chi-w 32 --walkers 400 --dmrg-sweeps 30 \\
         --dmrg-init warm --trial-cache trial_cache_warm --steps 5 --out bench_mps_cpmc.jsonl
 """
@@ -67,13 +73,24 @@ def parse_args(argv=None):
     bench.add_argument("--min-scaling", type=float, default=4.0)
     bench.add_argument("--profile", default="", help="directory for a jax.profiler trace of one step call "
                        "(needs cuPTI, which the python/3.12.13 module's CUDA plugin cannot find)")
+    bench.add_argument("--stages", action="store_true",
+                       help="time every piece of a block (conversion, fields, energy, ...) on its own")
+    bench.add_argument("--block-steps", type=int, default=50,
+                       help="with --stages: CPMC steps per block for the stages' share of a block")
     bench.add_argument("--circuit-only", action="store_true",
                        help="only print each conversion circuit's statistics for every --bucket-sets setting")
     bench.add_argument("--bucket-sets", nargs="*", default=[],
                        help="with --circuit-only: bucket settings to compare, e.g. none 16 8,16 4,8,16")
     bench.add_argument("--out", default="bench_mps_cpmc.jsonl")
+    trial.add_argument("--trial-file", default=None,
+                       help="a saved trial (prepare_trial_6x6.py's dmrg_chi*.npz) instead of a DMRG one; its H|trial> "
+                            "cache (prepare_htrial_saved.py) must exist; nelec comes from the file")
+    trial.add_argument("--htrial-cutoff", type=float, default=1.0e-13,
+                       help="with --trial-file: the compression cutoff its H|trial> cache was made with")
     args = parser.parse_args(argv)
     cli.check_lattice_arguments(parser, args)
+    if args.trial_file and len(args.trial_chi) != 1:
+        parser.error("--trial-file takes one --trial-chi (the file's bond)")
     return args
 
 
@@ -215,9 +232,157 @@ def profile_call(compiled, args, path):
     return summary
 
 
+def stage_report(kernels, plan, state, data, args, weight_floor, step_ms, profile_dir=""):
+    """--stages: the pieces of a CPMC block, each compiled and timed on its own on these walkers (one chunk), in
+    the order a half step runs them; each stage's inputs are the previous stages' outputs. Returns the rows."""
+    from functools import partial
+
+    import jax
+    import jax.numpy as jnp
+
+    from trot.gmps import engine
+
+    op, ep = kernels.overlap_plan, kernels.energy_plan
+    plans = tuple(plan.orbital_plans)
+    groups = [((0, 1), plans)] if kernels.converter.spin_batched else [((0,), plans[:1]), ((1,), plans[1:])]
+    S = args.block_steps
+
+    def one_body(wu, wd, data):
+        return data.exp_h1_half @ wu, data.exp_h1_half @ wd
+
+    def walker_qr(ca, cb):
+        qa, da = kernels.batch_qr(ca)
+        qb, db = kernels.batch_qr(cb)
+        return qa, qb, da * db
+
+    def angles(qa, qb):
+        def one(qa1, qb1):
+            C = (qa1, qb1)
+            return [engine.device_channel_angles(jnp.stack([C[s] for s in channels]), list(group))
+                    for channels, group in groups]
+        return jax.vmap(one)(qa, qb)
+
+    def conversion(qa, qb):
+        return jax.vmap(kernels.converter.convert)(qa, qb)
+
+    def overlap_blocks(alpha, beta):
+        return jax.vmap(lambda a, b: engine.walker_blocks(a, b, op))(alpha, beta)
+
+    def right_envs(wb, data):
+        return jax.vmap(lambda w: engine.right_environments(w, data.trial, op))(wb)
+
+    def field_sweep(ca, cb, randoms, wb, prefactor, right, now, data):
+        sweep = partial(engine.field_sweep, hs=data.hs, weight_floor=weight_floor, fixed_blocks=data.trial, plan=op)
+        return jax.vmap(sweep)(ca, cb, randoms, wb, prefactor, right, now)
+
+    def in_chunks(fn, n, *trees):
+        """fn over the walker axis of pytrees (the per-site tensors of the converted walkers) in n chunks."""
+        split = lambda x: x.reshape((n, x.shape[0] // n) + x.shape[1:])
+        out = jax.lax.map(lambda xs: fn(*xs), tuple(jax.tree_util.tree_map(split, t) for t in trees))
+        return jax.tree_util.tree_map(lambda y: y.reshape((-1,) + y.shape[2:]), out)
+
+    def energy_numerator(alpha, beta, data):  # in the chunks the block measures the energy in (engine.measure_chunks)
+        one = lambda a, b: engine.energy_numerator(a, b, data.htrial, ep)
+        return in_chunks(jax.vmap(one), n_measure, alpha, beta)
+
+    def energy_denominator(alpha, beta, data):
+        one = lambda a, b: engine.left_contract(engine.walker_blocks(a, b, op), data.trial, op)
+        return in_chunks(jax.vmap(one), n_measure, alpha, beta)
+
+    rows = []
+
+    def stage(name, fn, inputs, per_block, part_of=None):
+        try:
+            compiled, compile_seconds = compile_timed(fn, inputs)
+            out = jax.block_until_ready(compiled(*inputs))
+            seconds = timed(compiled, inputs, args.repeats)
+        except Exception as error:  # a stage that does not fit leaves a row of NaN; the table still prints
+            if not is_oom(error):
+                raise
+            print(f"         stage {name}: out of device memory", flush=True)
+            rows.append(dict(stage=name, ms=float("nan"), per_block=per_block, part_of=part_of,
+                             compile_seconds=float("nan"), xla_flops=None, gflops_per_s=None))
+            return None
+        flops = flops_of(compiled)
+        rows.append(dict(stage=name, ms=1e3 * seconds, per_block=per_block, part_of=part_of,
+                         compile_seconds=compile_seconds, xla_flops=flops,
+                         gflops_per_s=None if flops is None else flops / seconds / 1e9))
+        if profile_dir:
+            print(f"         stage {name}:", flush=True)
+            rows[-1]["trace"] = profile_call(compiled, inputs, os.path.join(profile_dir, name))
+        return out
+
+    nw, L = state.walkers[0].shape[:2]
+    n_measure = engine.measure_chunks(nw, 1)
+    wu, wd = stage("one_body", one_body, (*state.walkers, data), 2 * S)
+    qa, qb, dets = stage("walker_qr", walker_qr, (wu, wd), 2 * S + 1)  # + the energy's
+    stage("angles", angles, (qa, qb), 2 * S + 1, part_of="conversion")
+    alpha, beta, (ga, gb) = stage("conversion", conversion, (qa, qb), 2 * S + 1)
+    wb = stage("overlap_blocks", overlap_blocks, (alpha, beta), 2 * S)
+    right = stage("right_envs", right_envs, (wb, data), 2 * S)
+    prefactor = dets * ga * gb
+    now = prefactor * right[0][:, 0, 0, 0, 0]
+    randoms = jax.random.uniform(jax.random.PRNGKey(args.seed), (nw, L))
+    stage("field_sweep", field_sweep, (wu, wd, randoms, wb, prefactor, right, now, data), S)
+    del wu, wd, qa, qb, wb, right, prefactor, now, randoms  # the energy stages need only the converted walkers
+    if ep is not None:
+        stage("energy_numerator", energy_numerator, (alpha, beta, data), 1)
+        stage("energy_denominator", energy_denominator, (alpha, beta, data), 1)
+
+    done = [r for r in rows if r["ms"] == r["ms"]]
+    block = sum(r["ms"] * r["per_block"] for r in done if r["part_of"] is None)
+    step = sum(r["ms"] * r["per_block"] for r in done if r["part_of"] is None and r["per_block"] >= S) / S
+    print(f"         stages at {nw} walkers, one chunk ({S}-step block; 'of which' rows are inside the row they name):")
+    print(f"           {'stage':<20} {'ms/call':>9} {'calls':>6} {'s/block':>8} {'share':>6} {'GFLOP/s':>8} "
+          f"{'compile s':>9}")
+    for r in rows:
+        share = "" if r["part_of"] or r["ms"] != r["ms"] else f"{100 * r['ms'] * r['per_block'] / block:5.1f}%"
+        name = r["stage"] if not r["part_of"] else f"  of which {r['stage']}"
+        gf = r["gflops_per_s"]
+        print(f"           {name:<20} {r['ms']:9.2f} {r['per_block']:6d} {r['ms'] * r['per_block'] / 1e3:8.2f} "
+              f"{share:>6} {gf if gf is not None else float('nan'):8.1f} {r['compile_seconds']:9.1f}")
+    print(f"           projected block {block / 1e3:.2f} s; the stages' step {step:.1f} ms against the fused step "
+          f"{step_ms:.1f} ms (x{step / step_ms:.2f})", flush=True)
+    return rows
+
+
 # ---------------------------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------------------------
+
+
+def saved_trial(args, h1):
+    """--trial-file: (nelec, cli.RunTrial) of a saved trial and its cached H|trial>, rotated as the command line says
+    (the as-is rotation only, as run_mps_cpmc.py does with --cache-htrial). H|trial> is never made here."""
+    import numpy as np
+
+    from trot.gmps import trials
+    from trot.gmps.prepare_htrial_saved import read_saved_trial
+
+    path = Path(args.trial_file)
+    h1_file, u, nelec, tensors, charges, energy, rdm1 = read_saved_trial(path)
+    if h1_file.shape != h1.shape or not np.allclose(h1_file, h1) or u != args.U:
+        raise SystemExit(f"{path} was made for another lattice or U (U = {u:g})")
+    if args.trial_rotation and args.rotated_trial != "as_is":
+        raise SystemExit("--trial-file with --trial-rotation needs --rotated-trial as_is")
+    cache = trials.htrial_cache_file(path, args.htrial_cutoff)
+    htrial = None
+    if not args.circuit_only:  # a circuit report needs the trial and its plan, not H|trial>
+        if not cache.exists():
+            raise SystemExit(f"{cache} not found: make it on the CPU with prepare_htrial_saved.py "
+                             f"--cutoff {args.htrial_cutoff:g}")
+        (blocks, labels), hinfo = trials.load_or_make_htrial(path, h1, u, tensors, charges, energy,
+                                                             relative_tolerance=args.htrial_cutoff)
+        if args.trial_rotation:
+            blocks, labels = trials.rotate_htrial_blocks(blocks, labels, args.trial_rotation)
+        htrial = (blocks, labels, hinfo["trial_energy"])
+    trial, info = trials.make_trial(tensors, charges, nelec, rotation=args.trial_rotation,
+                                    rotated_trial=args.rotated_trial, natural_rdm1=args.natural_rdm1, rdm1=rdm1)
+    print(f"trial loaded from {path}: nelec {nelec}, bonds max {max(len(q) for q in charges)}, E {energy:.10f}"
+          + ("" if htrial is None else f"; H|trial> from {cache}")
+          + (f", rotated by {args.trial_rotation:g} deg (as is)" if args.trial_rotation else ""), flush=True)
+    dmrg = trials.DmrgTrialData(tensors, tuple(charges), energy, energy, path, "saved")
+    return nelec, cli.RunTrial(dmrg, trial, info, htrial, cache, {})
 
 
 def make_params(args, chi, chi_w, n_walkers, sweeps):
@@ -238,9 +403,14 @@ def first_walkers(state, n):
                           overlaps=state.overlaps[:n])
 
 
-def circuit_report(args, h1, lattice, nelec, system, ham):
+def circuit_report(args, h1, lattice, nelec, system, ham, saved=None):
     """--circuit-only: the conversion circuits of each (trial chi, walker chi) for every bucket setting, with
-    their padding statistics (engine.padding_stats); host work only (plans, circuit compilation)."""
+    their padding statistics (engine.padding_stats); host work only (plans, circuit compilation). Also the two spin
+    channels' block sizes: both channels share one batched circuit only when these are equal (engine._can_group),
+    and the gates of the finest block sequence they could share (the boundaries both have) say what aligning them
+    would cost."""
+    import numpy as np
+
     from trot.gmps import engine
     from trot.trial.mps import make_walker_plan
 
@@ -249,12 +419,20 @@ def circuit_report(args, h1, lattice, nelec, system, ham):
     keys = ("ops", "qr_calls", "eigh_calls", "eigh_le16", "max_eigh", "eigh_n_median", "eigh_n_p90", "eigh_waste",
             "qr_waste")
     for chi, chi_w in itertools.product(args.trial_chi, args.chi_w):
-        trial = cli.build_trial(args, h1, lattice, nelec, chi).trial
+        trial = (saved or cli.build_trial(args, h1, lattice, nelec, chi)).trial
         params = make_params(args, chi, chi_w, 1, cli.dmrg_sweeps(args, lattice))
         plan = make_walker_plan(ham, trial, system, params)
         (plan_a, plan_b), (bond_a, bond_b) = plan.orbital_plans, plan.bond_plans
         gates = int(plan_a.block_sizes.sum() - len(plan_a.block_sizes))
         print(f"\n=== {lattice.name} U={args.U:g} trial chi={chi} walker chi={chi_w}: gates {gates} ===", flush=True)
+        blocks_a, blocks_b = (np.asarray(p.block_sizes, int) for p in (plan_a, plan_b))
+        edges = lambda blocks: set(np.cumsum(blocks)[:-1].tolist())  # block boundaries between orbitals
+        both = edges(blocks_a) & edges(blocks_b)
+        print(f"  block sizes alpha {blocks_a.tolist()}\n  block sizes beta  {blocks_b.tolist()}")
+        print(f"  gates alpha {int(blocks_a.sum() - len(blocks_a))}, beta {int(blocks_b.sum() - len(blocks_b))}; "
+              f"same block sizes (one batched circuit): {np.array_equal(blocks_a, blocks_b)}; boundaries alpha "
+              f"{len(edges(blocks_a))}, beta {len(edges(blocks_b))}, in both {len(both)}; gates of the finest "
+              f"sequence both could share {int(blocks_a.sum()) - len(both) - 1}", flush=True)
         for buckets in settings:
             converter = engine.make_converter(plan_a, plan_b, bond_a, bond_b, spin_batch=True,
                                            buckets=buckets or None)
@@ -290,6 +468,12 @@ def main(argv=None):
     h1 = cli.make_h1(args)
     lattice = trials.describe_h1(h1)
     nelec, sweeps = cli.electrons(args, lattice), cli.dmrg_sweeps(args, lattice)
+    saved = None
+    if args.trial_file:
+        nelec, saved = saved_trial(args, h1)
+        chi_file = max(len(q) for q in saved.dmrg.charges)
+        if args.trial_chi[0] != chi_file:
+            raise SystemExit(f"--trial-chi {args.trial_chi[0]}, but {args.trial_file} has bond {chi_file}")
     system = System(norb=lattice.n_sites, nelec=nelec, walker_kind="unrestricted")
     ham = HamHubbard(h1=jnp.asarray(h1), u=args.U)
     device, backend = jax.devices()[0], jax.default_backend()
@@ -298,7 +482,7 @@ def main(argv=None):
           f"FP64 peak {peak} TFLOP/s; {lattice.name} ({lattice.kind}, {lattice.n_sites} sites), nelec {nelec}, "
           f"U={args.U:g}")
     if args.circuit_only:
-        circuit_report(args, h1, lattice, nelec, system, ham)
+        circuit_report(args, h1, lattice, nelec, system, ham, saved)
         return
     failures = []
     if dtype != jnp.float64:
@@ -309,7 +493,7 @@ def main(argv=None):
 
     for chi, chi_w in itertools.product(args.trial_chi, args.chi_w):
         print(f"\n=== {lattice.name} U={args.U:g} trial chi={chi} walker chi={chi_w} ===", flush=True)
-        built = cli.build_trial(args, h1, lattice, nelec, chi)
+        built = saved if saved is not None else cli.build_trial(args, h1, lattice, nelec, chi)
         params = make_params(args, chi, chi_w, walkers[-1], sweeps)
         start = time.perf_counter()
         run = driver.prepare_mps_cpmc(sys=system, params=params, ham_data=ham, trial=built.trial, htrial=built.htrial)
@@ -330,7 +514,9 @@ def main(argv=None):
                           dmrg_init=built.dmrg.init, chi_w=chi_w, n_walkers=nw, steps=args.steps, n_chunks=n_chunks,
                           trial_rotation=args.trial_rotation, rotated_trial=args.rotated_trial,
                           natural_rdm1=args.natural_rdm1, sector_buckets=list(args.sector_buckets),
-                          cache_htrial=args.cache_htrial, device=device.device_kind, jax=jax.__version__,
+                          cache_htrial=args.cache_htrial, trial_file=args.trial_file,
+                          htrial_cutoff=args.htrial_cutoff if args.trial_file else None,
+                          device=device.device_kind, jax=jax.__version__,
                           prepare_seconds=prepare_seconds, **info)
             try:
                 half_step = engine.make_half_step(kernels, p, n_chunks)
@@ -349,7 +535,7 @@ def main(argv=None):
                               gflops_per_s=None if flops is None else flops / seconds / 1e9,
                               **compiled_memory(compiled), **hlo_census(compiled))
                 if not args.no_energy:
-                    def measure(ca, cb, data, n_chunks=n_chunks):
+                    def measure(ca, cb, data, n_chunks=engine.measure_chunks(nw, n_chunks)):  # as the block does
                         return engine.chunked(lambda a, b: kernels.energies(a, b, data), n_chunks, ca, cb)
 
                     measured, record["energy_compile_seconds"] = compile_timed(measure, (*state.walkers, data))
@@ -388,6 +574,16 @@ def main(argv=None):
             if nw == walkers[0]:
                 print(f"         custom calls in the step: {record.get('custom_calls')}; while loops "
                       f"{record.get('while_loops')}, conditionals {record.get('conditionals')}")
+            if args.stages:
+                stages_dir = (os.path.join(args.profile, f"{lattice.name}_T{chi}_w{chi_w}_n{nw}_stages")
+                              if args.profile and nw == walkers[-1] else "")
+                try:
+                    record["stages"] = stage_report(kernels, run.ops.plan, state, data, args, p.weight_floor,
+                                                    record["ms_per_step"], stages_dir)
+                except Exception as error:
+                    if not is_oom(error):
+                        raise
+                    print(f"         stages at {nw} walkers: out of device memory")
             with open(args.out, "a") as stream:
                 stream.write(json.dumps(record, default=str) + "\n")
 

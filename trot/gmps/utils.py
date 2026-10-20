@@ -384,11 +384,17 @@ def combined_charges(qa, qb):
     return tuple(charges)
 
 
-def plan_bonds(C, orbital_plan, chi_max=None, cutoff=0.0) -> BondPlan:
+def plan_bonds(C, orbital_plan, chi_max=None, cutoff=0.0, counts=None, spectra=None) -> BondPlan:
     """Freeze per-sector retained ranks using a NumPy dry run on the reference.
 
     Follows channel_mps's centre moves exactly, so the singular values seen here
     are Schmidt values and reference_discarded_weight is the norm actually lost.
+
+    counts: optional per-gate {middle charge: number kept}, gates in this dry run's order (the reversed angles):
+      every sector keeps that many states (at most its rank; a charge not listed keeps none) instead of the top
+      chi_max / cutoff selection. The bond structure depends only on the counts, not on C, so this turns an
+      allocation trained on other determinants (walkers) into a bond plan for any reference.
+    spectra: optional list; each gate appends {middle charge: squared singular values, descending} of C's state.
     """
     #Create product state and its charges
     tensors = [np.eye(2)[int(o)].reshape(1, 2, 1) for o in orbital_plan.occupation]
@@ -412,19 +418,30 @@ def plan_bonds(C, orbital_plan, chi_max=None, cutoff=0.0) -> BondPlan:
             singular_values.append(s)
 
         flat = np.concatenate(singular_values)
-        order = np.argsort(-flat, kind="stable")  # exact ties: earlier sector first, reproducibly
-        count = len(flat) if chi_max is None else min(int(chi_max), len(flat))
-        selected = order[:count]
-        if cutoff:
-            selected = selected[flat[selected] > cutoff * flat[order[0]]]
-        keep_mask = np.zeros(len(flat), bool)
-        keep_mask[selected] = True
+        if counts is not None or spectra is not None:
+            row_charge = (np.asarray(charges[site])[:, None] + np.arange(2)).ravel()
+            sector_charges = [int(row_charge[rows[0]]) for rows, _, _ in full_plan.sectors]
+        if spectra is not None:
+            spectra.append({q: s ** 2 for q, s in zip(sector_charges, singular_values)})
+        if counts is not None:
+            wanted = counts[len(kept_all)]
+            kept = [min(int(wanted.get(q, 0)), len(s)) for q, s in zip(sector_charges, singular_values)]
+            if not any(kept):  # a bond needs a state: the largest one
+                kept[int(np.argmax([s[0] for s in singular_values]))] = 1
+            keep_mask = np.concatenate([np.arange(len(s)) < k for s, k in zip(singular_values, kept)])
+        else:
+            order = np.argsort(-flat, kind="stable")  # exact ties: earlier sector first, reproducibly
+            count = len(flat) if chi_max is None else min(int(chi_max), len(flat))
+            selected = order[:count]
+            if cutoff:
+                selected = selected[flat[selected] > cutoff * flat[order[0]]]
+            keep_mask = np.zeros(len(flat), bool)
+            keep_mask[selected] = True
+            kept, offset = [], 0
+            for s in singular_values:
+                kept.append(int(keep_mask[offset:offset + len(s)].sum()))
+                offset += len(s)
         discarded += float(flat[~keep_mask] @ flat[~keep_mask])
-
-        kept, offset = [], 0
-        for s in singular_values:
-            kept.append(int(keep_mask[offset:offset + len(s)].sum()))
-            offset += len(s)
         kept = tuple(kept)
         kept_all.append(kept)
 
