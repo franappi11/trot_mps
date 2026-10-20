@@ -114,9 +114,13 @@ def physical_charge(width: int) -> np.ndarray:
     raise ValueError(f"bond labels must be (N_up, N_dn) pairs or particle numbers N, got width {width}")
 
 
-def compress_mps_qn(tensors, charges, relative_tolerance=1.0e-13):
+def compress_mps_qn(tensors, charges, relative_tolerance=1.0e-13, max_bond=None):
     """compress_mps that keeps the bond labels: (N_alpha, N_beta) pairs, or particle numbers N
     (labels of width 1, as for a spin-rotated MPS without definite S_z).
+
+    max_bond: optional cap on every bond. The largest singular values above the relative tolerance are kept across
+    all of a bond's sectors together (as plan_bonds does), in the one SVD sweep after the QR sweep, so the cut is the
+    usual single-sweep truncation, not a variational optimum.
 
     The QR sweep and the SVD sweep factor each charge sector separately and the
     rank cut is one relative tolerance per bond applied per sector, so no
@@ -159,7 +163,13 @@ def compress_mps_qn(tensors, charges, relative_tolerance=1.0e-13):
             u, s, vh = np.linalg.svd(M[np.ix_(r, k)], full_matrices=False)
             factors.append((c, r, k, u, s, vh))
         cut = relative_tolerance * max(max(f[4][0] for f in factors), 1e-300)
-        kept = [(c, r, k, u, s, vh, int(np.sum(s > cut))) for c, r, k, u, s, vh in factors]
+        counts = [int(np.sum(f[4] > cut)) for f in factors]
+        if max_bond is not None and sum(counts) > max_bond:  # the largest over the sectors; each keeps a prefix
+            flat = np.concatenate([f[4][:n] for f, n in zip(factors, counts)])
+            owner = np.repeat(np.arange(len(factors)), counts)
+            top = np.argsort(-flat, kind="stable")[:int(max_bond)]
+            counts = np.bincount(owner[top], minlength=len(factors)).tolist()
+        kept = [(c, r, k, u, s, vh, n) for (c, r, k, u, s, vh), n in zip(factors, counts)]
         kept = [f for f in kept if f[-1] > 0]
         new = sum(f[-1] for f in kept)
         preceding = A[i - 1].reshape(-1, Dl)
@@ -173,7 +183,6 @@ def compress_mps_qn(tensors, charges, relative_tolerance=1.0e-13):
         A[i - 1] = left.reshape(A[i - 1].shape[:2] + (new,))
         Q[i] = np.asarray(labels, int).reshape(-1, width)
     return A, tuple(Q)
-
 
 # ---------------------------------------------------------------------------------------------
 # Labels and spin rotations
