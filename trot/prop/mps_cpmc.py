@@ -40,16 +40,19 @@ from trot.walkers import init_walkers
 
 
 def _start_values(meas_ctx: MpsMeasCtx):
-    """Jitted overlaps and local energies of a batch of given starting walkers (cached on the plan)."""
-    key = ("start_values",) + tuple(meas_ctx.key[1:4])
+    """Jitted overlaps (the context's walker plan) and local energies (its measurement plan) of a batch of given
+    walkers, cached on the plan: fn(ca, cb, meas_ctx, n_chunks)."""
+    measure = meas_ctx.measurement
+    key = ("start_values",) + tuple(meas_ctx.key[1:4]) + (None if measure is meas_ctx else measure.plan,)
     fn = meas_ctx.plan.caches.get(key)
     if fn is None:
-        kernels = meas_ctx.kernels
+        kernels, measure_kernels = meas_ctx.kernels, measure.kernels
 
         @partial(jax.jit, static_argnames=("n_chunks",))
-        def fn(ca, cb, data, n_chunks):
+        def fn(ca, cb, ctx, n_chunks):
+            data, measure_data = ctx.data(), ctx.measurement.data()
             overlaps = engine.chunked(lambda a, b: kernels.overlaps(a, b, data), n_chunks, ca, cb)
-            energies = engine.chunked(lambda a, b: kernels.energies(a, b, data), n_chunks, ca, cb)
+            energies = engine.chunked(lambda a, b: measure_kernels.energies(a, b, measure_data), n_chunks, ca, cb)
             return overlaps, energies
 
         meas_ctx.plan.caches[key] = fn
@@ -82,12 +85,14 @@ def init_prop_state(*, sys, ham_data, trial_ops, trial_data, meas_ops, params, m
         initial_walkers = init_walkers(sys=sys, rdm1=rdm1, n_walkers=params.n_walkers)
     ca, cb = (jnp.real(w) for w in initial_walkers)
     n = ca.shape[0]
-    data = meas_ctx.data()
     if given:
-        overlaps, energies = _start_values(meas_ctx)(ca, cb, data, engine.divisor_at_least(n, params.n_chunks))
+        overlaps, energies = _start_values(meas_ctx)(ca, cb, meas_ctx, engine.divisor_at_least(n, params.n_chunks))
     else:
-        values = meas_ctx.kernels.jit_probe(ca[0], cb[0], data)
+        values = meas_ctx.kernels.jit_probe(ca[0], cb[0], meas_ctx.data())
         overlaps = jnp.full((n,), values["overlap"], dtype=jnp.result_type(float))
+        measure = meas_ctx.measurement  # the local energy with the measurement plan's conversion, if any
+        if measure is not meas_ctx:
+            values = measure.kernels.jit_probe(ca[0], cb[0], measure.data())
         energies = values["energy"]
     e_est = jnp.mean(energies) if initial_e_estimate is None else jnp.asarray(initial_e_estimate)
     e_est = e_est.astype(jnp.result_type(float))
@@ -155,7 +160,12 @@ def make_block(record: Callable | None = None):
         qd, dd = kernels.batch_qr(state.walkers[1])
         overlaps = state.overlaps / (du * dd)
 
-        e_samples = engine.chunked(lambda a, b: kernels.energies(a, b, data), n_chunks, qu, qd)
+        # the energy and observables in chunks of <= MEASURE_CHUNK walkers, converted with the measurement plan if any
+        # (QmcParamsMps.measure_channel_chi); the overlaps, the comb and the propagation keep the walker plan
+        measure = meas_ctx.measurement
+        m_kernels, m_data = (kernels, data) if measure is meas_ctx else (measure.kernels, measure.data())
+        n_measure = engine.measure_chunks(n, n_chunks)
+        e_samples = engine.chunked(lambda a, b: m_kernels.energies(a, b, m_data), n_measure, qu, qd)
         thresh = jnp.sqrt(2.0 / jnp.asarray(params.dt))
         e_ref = state.e_estimate
         is_nan = ~jnp.isfinite(e_samples)
@@ -170,7 +180,7 @@ def make_block(record: Callable | None = None):
 
         observables = {}
         for name in observable_names:  # the weighted mean over the pre-comb walkers, as blocks.block
-            samples = engine.chunked(lambda a, b: BATCHED_OBSERVABLES[name](meas_ctx)(a, b, data), n_chunks, qu, qd)
+            samples = engine.chunked(lambda a, b: BATCHED_OBSERVABLES[name](measure)(a, b, m_data), n_measure, qu, qd)
             w_shape = (n,) + (1,) * (samples.ndim - 1)
             samples = jnp.where(weights.reshape(w_shape) == 0.0, 0.0, samples)  # a dead walker's NaN must not leak (0 * NaN)
             mean = jnp.sum(weights.reshape(w_shape) * samples, axis=0) / w_sum_safe

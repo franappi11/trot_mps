@@ -76,7 +76,8 @@ def add_trial_arguments(group):
     group.add_argument("--dmrg-tol", type=float, default=None, help="default: none on a chain, 1e-6 otherwise")
     group.add_argument("--trial-cache", default=str(HERE / "trial_cache"))
     group.add_argument("--cache-htrial", action="store_true",
-                       help="block-form H|trial>, made once and cached next to the trial (6x6 and larger)")
+                       help="block-form H|trial>, made once and cached next to the trial (6x6 and larger); with "
+                            "--trial-rotation only for --rotated-trial as_is (the cache is rotated on loading)")
     group.add_argument("--trial-rotation", type=float, default=0.0,
                        help="rotate the trial by exp(-i beta S^y), degrees (90: one-node spin projection)")
     group.add_argument("--rotated-trial", default="projected", choices=["projected", "as_is"])
@@ -108,6 +109,17 @@ def parse_args(argv=None):
 
     walkers = parser.add_argument_group("walkers and CPMC")
     walkers.add_argument("--chi-w", type=int, default=32, help="walker bond per spin channel (0: exact)")
+    walkers.add_argument("--measure-chi", type=int, default=None,
+                         help="walker bond of the energy and observables (default: --chi-w): the walkers propagate at "
+                              "--chi-w and are converted at this bond (a sector plan) to be measured")
+    walkers.add_argument("--dense", action="store_true",
+                         help="dense walker legs (trot.gmps.dense_engine): bond --chi-w, each walker keeping its own "
+                              "states, no frozen sector counts; needs --measure-chi")
+    walkers.add_argument("--dense-move", default="gram", choices=["gram", "cans"],
+                         help="how the dense conversion moves its orthogonality centre")
+    walkers.add_argument("--dense-gap", type=float, default=None,
+                         help="the dense gate eigh's per-charge shift in units of trace(G) (default 1e-7; dense walkers "
+                              "are validated at --chi-w <= 16 only)")
     add_walker_plan_arguments(walkers)
     walkers.add_argument("--walkers", type=int, default=400)
     walkers.add_argument("--eql", type=int, default=60)
@@ -169,10 +181,20 @@ class RunTrial(NamedTuple):
 
 
 def build_trial(args, h1, lattice, nelec, chi, *, rotate=True, say=print) -> RunTrial:
-    """The trial of a run: the DMRG trial (cached), with --cache-htrial the block-form H|trial> (cached), and the
-    spin rotation; rotate=False stops before trials.make_trial (--prepare-only)."""
+    """The trial of a run: the DMRG trial (cached), with --cache-htrial the block-form H|trial> (cached, made for the
+    unrotated trial and rotated here for --rotated-trial as_is), and the spin rotation; rotate=False stops before
+    trials.make_trial (--prepare-only)."""
     from trot.gmps import trials
 
+    if args.cache_htrial:  # refuse before the DMRG, not after it
+        if args.energy != "blocked":
+            raise SystemExit("--cache-htrial needs --energy blocked")
+        if args.trial_rotation and args.rotated_trial != "as_is":
+            raise SystemExit("--cache-htrial with --trial-rotation needs --rotated-trial as_is: the cached H|trial> is "
+                             "relabelled and rotated for the as-is rotated trial only")
+        if args.trial_rotation and getattr(args, "save_walkers", False):
+            raise SystemExit("--save-walkers exports the trial with its H|trial> file, which holds the unrotated "
+                             "H|trial>: not together with --cache-htrial and --trial-rotation")
     clock, seconds = time.perf_counter, {}
     start = clock()
     dmrg = trials.load_or_make_dmrg_trial(h1, args.U, nelec, chi=chi, sweeps=dmrg_sweeps(args, lattice),
@@ -182,8 +204,6 @@ def build_trial(args, h1, lattice, nelec, chi, *, rotate=True, say=print) -> Run
     seconds["trial"] = clock() - start
     htrial, gamma, htrial_file = None, None, None
     if args.cache_htrial:
-        if args.trial_rotation or args.energy != "blocked":
-            raise SystemExit("--cache-htrial needs an unrotated trial and --energy blocked")
         start = clock()
         (blocks, labels), hinfo = trials.load_or_make_htrial(dmrg.path, h1, args.U, dmrg.tensors, dmrg.charges,
                                                              dmrg.variational_energy, say=say)
@@ -201,6 +221,14 @@ def build_trial(args, h1, lattice, nelec, chi, *, rotate=True, say=print) -> Run
                else "and used as it is (particle-number labels)")
             + f"; natural orbitals from the trial's rdm1 {args.natural_rdm1} the rotation", flush=True)
     seconds["make_trial"] = clock() - start
+    if htrial is not None and args.trial_rotation:
+        # H commutes with the rotation: the rotated trial's H|trial> is the cached one, relabelled and rotated
+        start = clock()
+        blocks, labels = trials.rotate_htrial_blocks(htrial[0], htrial[1], args.trial_rotation)
+        htrial = (blocks, labels, htrial[2])
+        seconds["rotate_htrial"] = clock() - start
+        say(f"cached H|trial> rotated by {args.trial_rotation:g} deg: "
+            f"{sum(X.nbytes for site in blocks for X in site.values()) / 1e9:.2f} GB in blocks", flush=True)
     return RunTrial(dmrg, trial, info, htrial, htrial_file, seconds)
 
 
@@ -212,6 +240,8 @@ def run_tag(args, lattice) -> tuple[str, str]:
     tag += "_NOplan" if args.plan_reference == "natural" else ""
     tag += "_NOstart" if args.walker_start == "natural" else ""
     tag += "" if args.orbital_plan == "adaptive" else f"_{args.orbital_plan}"
+    tag += f"_dense{'' if args.dense_move == 'gram' else args.dense_move}" if args.dense else ""
+    tag += f"_m{args.measure_chi}" if args.measure_chi else ""
     rot = ""
     if args.trial_rotation:
         rot = f"_rot{args.trial_rotation:g}" + ("_asis" if args.rotated_trial == "as_is" else "")
@@ -341,7 +371,9 @@ def _run(args, h1, lattice, tag, rot, out):
         auto_n_chunks=args.n_chunks <= 0, trial_chi=args.trial_chi, dmrg_sweeps=sweeps, dmrg_seed=args.dmrg_seed,
         orbital_plan=args.orbital_plan, walker_channel_chi=args.chi_w if args.chi_w > 0 else None,
         plan_reference=args.plan_reference, walker_start=args.walker_start, energy_kernel=args.energy,
-        walker_qr=args.walker_qr, sector_buckets=tuple(args.sector_buckets))
+        walker_qr=args.walker_qr, sector_buckets=tuple(args.sector_buckets), measure_channel_chi=args.measure_chi,
+        walker_conversion="dense" if args.dense else "sector", dense_move=args.dense_move,
+        dense_charge_gap=args.dense_gap)
     ham = HamHubbard(h1=jnp.asarray(h1), u=args.U)
     system = System(norb=n, nelec=nelec, walker_kind="unrestricted")
     start = clock()
@@ -349,7 +381,7 @@ def _run(args, h1, lattice, tag, rot, out):
     setup["prepare"] = clock() - start
     setup.update(run.info.get("setup_seconds", {}))  # its stages: walker_plan, meas_ctx, walker_start
     kernels = run.meas_ctx.kernels
-    if not args.no_self_check:
+    if not args.no_self_check and not args.dense:  # the dense conversion is checked by tests/test_dense_conversion.py
         probe = kernels.jit_probe(run.state.walkers[0][0], run.state.walkers[1][0], run.meas_ctx.data())
         errors = engine.conversion_self_check(kernels, run.ops.plan.orbital_plans, run.ops.plan.bond_plans, probe)
         print(f"self-check vs NumPy channel_mps: relative error alpha {errors[0]:.1e}, beta {errors[1]:.1e}",

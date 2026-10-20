@@ -673,6 +673,30 @@ def test_compress_mps_qn_keeps_the_state_and_the_labels(lattice, name):
         assert sum(map(len, out_charges)) < sum(map(len, charges))
 
 
+@pytest.mark.parametrize("name", ["projected_sd", "rotated_sd"])
+def test_compress_mps_qn_max_bond_caps_every_bond(lattice, name):
+    """max_bond keeps the largest singular values of each bond over all its sectors: every bond ends at or below the
+    cap and the labels still hold; the weight lost lies between the largest single-bond Schmidt bound (no state of that
+    bond can do better) and twice their sum (one sweep); a cap at the compressed bonds changes nothing."""
+    trial = lattice.trials[name]
+    W = hubbard_mpo_from_h1(lattice.h1, U)
+    tensors, charges = trial_times_h(W, [np.asarray(A) for A in trial.tensors], trial.charge_arrays())
+    full, full_charges = compress_mps_qn(tensors, charges)
+    psi = hf.mps_full_vector(full).ravel()
+    psi = psi / np.linalg.norm(psi)
+    cap = max(2, max(map(len, full_charges)) // 2)
+    bounds = [float(np.sum(np.linalg.svd(psi.reshape(4**k, -1), compute_uv=False)[cap:] ** 2)) for k in range(1, L)]
+    assert max(bounds) > 1e-8  # the cap truncates
+    out, out_charges = compress_mps_qn(tensors, charges, max_bond=cap)
+    assert max(map(len, out_charges)) <= cap
+    _assert_labels_respected(out, out_charges, NELEC)
+    phi = hf.mps_full_vector(out).ravel()
+    lost = 1.0 - float(psi @ phi) ** 2 / float(phi @ phi)
+    assert max(bounds) - 1e-12 <= lost <= 2.0 * sum(bounds) + 1e-12
+    same, _ = compress_mps_qn(tensors, charges, max_bond=max(map(len, full_charges)))
+    _assert_close(hf.mps_full_vector(same), hf.mps_full_vector(full), 1e-11)
+
+
 # ---------------------------------------------------------------------------------------------
 # 16-17: pyblock3 optional / pyblock3 DMRG trials
 # ---------------------------------------------------------------------------------------------

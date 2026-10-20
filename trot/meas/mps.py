@@ -8,8 +8,12 @@ of any real symmetric h1 plus on-site U (hubbard_mpo_from_h1). Two kernels:
   forming the d=4 walker MPS.
 - "dense": the d=4 walker MPS is formed (combine_channels) and contracted with the densely compressed H|trial>
   (compress_mps); for validation.
+- "mpo": no H|trial> at all. The MPO is applied on the fly in the contraction of a dense walker plan
+  (trot.gmps.dense_engine.mpo_numerator): the memory is the trial and a few MB of MPO instead of H|trial>'s blocks
+  (18.9 GB at the doped 6x6's chi_T 512, ~76 GB at 1024). It needs a dense walker plan (QmcParamsMps.walker_conversion
+  "dense" or the dense measurement plan make_mps_cpmc_ops builds for it) and offers no szsz.
 
-Both give the same number up to rounding. build_meas_ctx (make_mps_meas_ops_hubbard) gathers the padded trial and
+All give the same number up to rounding (and the walker conversion's truncation). build_meas_ctx (make_mps_meas_ops_hubbard) gathers the padded trial and
 H|trial> blocks of the plan's engine (trot.gmps.engine) once; the propagation step reads the trial blocks from the
 same context. A precomputed H|trial> (trot.gmps.trials: block form for 6x6 and larger lattices) can be passed in.
 
@@ -23,7 +27,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import partial
-from typing import Callable, NamedTuple
+from typing import Any, Callable, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -44,7 +48,7 @@ from trot.trial.mps import (
 )
 from trot.walkers import _qr as qr_with_det
 
-ENERGY_KERNELS = ("blocked", "dense")
+ENERGY_KERNELS = ("blocked", "dense", "mpo")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -239,6 +243,9 @@ class MpsMeasCtx:
       trace time.
     pairing: trot.meas.mps_pairing.PairingData (the dense trial and the bra terms' maps) when the context was built
       with a pairing spec, else the empty tuple (no leaves).
+    measure: None, or the context of a separate measurement plan (QmcParamsMps.measure_channel_chi): this context
+      then serves the propagation only (the trial's blocks for its plan; no H|trial>, kernel None) and the energy and
+      observables use `measurement`, which holds the trial and H|trial> blocks (and pairing data) of that plan.
     """
 
     trial_blocks: tuple
@@ -246,6 +253,12 @@ class MpsMeasCtx:
     dense_trial: tuple
     key: tuple
     pairing: tuple = ()
+    measure: Any = None
+
+    @property
+    def measurement(self) -> "MpsMeasCtx":
+        """The context the local energy and the observables are measured with: measure, or this one."""
+        return self if self.measure is None else self.measure
 
     @property
     def plan(self) -> MpsWalkerPlan:
@@ -289,12 +302,13 @@ class MpsMeasCtx:
                               None if prop_ctx is None else prop_ctx.hs_constant)
 
     def tree_flatten(self):
-        return (self.trial_blocks, self.h_blocks, self.dense_trial, self.pairing), self.key
+        return (self.trial_blocks, self.h_blocks, self.dense_trial, self.pairing, self.measure), self.key
 
     @classmethod
     def tree_unflatten(cls, key, children):
-        trial_blocks, h_blocks, dense_trial, pairing = children
-        return cls(trial_blocks=trial_blocks, h_blocks=h_blocks, dense_trial=dense_trial, key=key, pairing=pairing)
+        trial_blocks, h_blocks, dense_trial, pairing, measure = children
+        return cls(trial_blocks=trial_blocks, h_blocks=h_blocks, dense_trial=dense_trial, key=key, pairing=pairing,
+                   measure=measure)
 
 
 def _dense_overlap(a, b) -> float:
@@ -304,25 +318,54 @@ def _dense_overlap(a, b) -> float:
     return float(env.reshape(()))
 
 
-def _device(blocks) -> tuple:
-    return tuple(jnp.asarray(b) for b in blocks)
-
-
 def build_mps_meas_ctx(ham_data, trial_data, *, plan: MpsWalkerPlan, kernel: str, htrial=None,
-                       pairing=None) -> MpsMeasCtx:
+                       pairing=None, measure_plan: MpsWalkerPlan | None = None,
+                       measure_ctx: MpsMeasCtx | None = None) -> MpsMeasCtx:
     """Host-side precomputation (called eagerly by trot's drivers): H|trial> and the padded blocks.
 
     htrial: optional precomputed (tensors, labels, trial_energy) of the compressed, labelled H|trial> ("blocked"
     only); the tensors may be in block form (trot.gmps.trials, 6x6 and larger lattices).
     pairing: optional trot.meas.mps_pairing.PairingSpec: builds the data of the pairing observable.
+    measure_plan: optional walker plan of the measurements (trot.trial.mps.measurement_plan). The context then holds
+    the trial's blocks for `plan` only (what the propagation reads; no H|trial>, kernel None) and, as its measure, the
+    full context of measure_plan (trial and H|trial> blocks, pairing data) for the energy and the observables.
+    measure_ctx: an already built context of measure_plan to nest instead of building it again, e.g. when the walker
+    plan changes during a run (trot.gmps.driver.make_retrain_hook) and the measurement plan does not: its device
+    blocks (H|trial> at the measurement bond, tens of GB) are shared, not copied.
     """
     if kernel not in ENERGY_KERNELS:
         raise ValueError(f"energy_kernel must be one of {ENERGY_KERNELS}, got {kernel!r}")
     check_trial(trial_data, plan)
     trial_np = [np.asarray(A) for A in trial_data.tensors]
-    # padded on the host and copied once (a device gather per site would compile one kernel per block shape)
-    trial_blocks = _device(engine.fixed_blocks(trial_np, engine.layout_for(plan, trial_data.charges), xp=np))
+    # padded on the host and copied once (a device gather per site would compile one kernel per block shape), site by
+    # site: the host never holds all the padded sites (38 GB for H|trial> at chi_T 512); per size class if the
+    # overlap plan is bucketed (TROT_OVERLAP_BUCKET_RATIO)
+    trial_blocks = engine.plan_blocks(trial_np, engine.overlap_plan_for(plan, trial_data.charges), xp=np, device=True)
+    if kernel == "mpo" and plan.dense is None and (measure_plan is None or measure_plan is plan):
+        raise ValueError('energy_kernel="mpo" needs a dense walker plan (walker_conversion="dense", or the dense '
+                         "measurement plan of make_mps_cpmc_ops)")
+    if measure_plan is not None and measure_plan is not plan:
+        if measure_ctx is not None:
+            if measure_ctx.plan is not measure_plan or measure_ctx.kernel != kernel:
+                raise ValueError("measure_ctx was built for another measurement plan or kernel")
+            measure = measure_ctx
+        else:
+            measure = build_mps_meas_ctx(ham_data, trial_data, plan=measure_plan, kernel=kernel, htrial=htrial,
+                                         pairing=pairing)
+        key = (plan, trial_data.charges, None, None, measure.trial_energy, ())
+        return MpsMeasCtx(trial_blocks=trial_blocks, h_blocks=(), dense_trial=(), key=key, measure=measure)
     dense_trial: tuple = ()
+    if kernel == "mpo":
+        from trot.gmps import dense_engine
+
+        mpo = dense_engine.mpo_site_tensors(hubbard_mpo_from_h1(hubbard_h1(ham_data), float(ham_data.u)))
+        h_blocks = tuple(jnp.asarray(W) for W in mpo)
+        energy = dense_engine.mpo_trial_energy(mpo, trial_np)
+        bonds = tuple(int(W.shape[0]) for W in mpo) + (int(mpo[-1].shape[-1]),)
+        key = (plan, trial_data.charges, None, kernel, float(energy), bonds)
+        if pairing is not None:
+            raise ValueError('the pairing observable needs a sector plan (energy_kernel="blocked")')
+        return MpsMeasCtx(trial_blocks=trial_blocks, h_blocks=h_blocks, dense_trial=(), key=key)
     if htrial is not None:
         if kernel != "blocked":
             raise ValueError('a precomputed H|trial> needs energy_kernel="blocked"')
@@ -336,7 +379,8 @@ def build_mps_meas_ctx(ham_data, trial_data, *, plan: MpsWalkerPlan, kernel: str
         energy = _dense_overlap(h_np, trial_np) / _dense_overlap(trial_np, trial_np)
     if kernel == "blocked":
         h_charges = _hashable_charges(h_q)
-        h_blocks = _device(engine.fixed_blocks(h_np, engine.layout_for(plan, h_charges), xp=np))
+        # size-bucketed (engine.bucket_plan): every transition is padded to its own size class, not to the largest
+        h_blocks = engine.bucketed_blocks(h_np, engine.energy_plan_for(plan, h_charges), device=True)
         bonds = tuple(len(label_array(q)) for q in h_q)
     else:
         h_charges = None
@@ -366,15 +410,16 @@ def check_meas_ctx(meas_ctx, plan: MpsWalkerPlan, trial_data, kernel: str | None
         raise ValueError("meas_ctx was built for a different walker plan")
     if meas_ctx.trial_charges != trial_data.charges:
         raise ValueError("meas_ctx was built for a different trial (bond labels differ)")
-    if kernel is not None and meas_ctx.kernel != kernel:
-        raise ValueError(f"meas_ctx holds the {meas_ctx.kernel!r} kernel, not {kernel!r}")
+    if kernel is not None and meas_ctx.measurement.kernel != kernel:
+        raise ValueError(f"meas_ctx holds the {meas_ctx.measurement.kernel!r} kernel, not {kernel!r}")
 
 
 def mps_energy(walker, ham_data, meas_ctx: MpsMeasCtx, trial_data, plan: MpsWalkerPlan):
-    """<H trial|walker> / <trial|walker> for one SD walker."""
+    """<H trial|walker> / <trial|walker> for one SD walker (with the measurement plan's conversion, if any)."""
     check_meas_ctx(meas_ctx, plan, trial_data)
     check_walker(walker)
-    return meas_ctx.kernels.energy_one(walker[0], walker[1], meas_ctx.data())
+    measure = meas_ctx.measurement
+    return measure.kernels.energy_one(walker[0], walker[1], measure.data())
 
 
 def mps_energy_fn(plan: MpsWalkerPlan):
@@ -398,6 +443,9 @@ def szsz_fns(meas_ctx: MpsMeasCtx) -> SzszFns:
     ("blocked", engine.szsz_contract) or as the d=4 MPS against the dense trial ("dense", engine.szsz_dense).
     """
     plan, kernels = meas_ctx.plan, meas_ctx.kernels
+    if plan.dense is not None:
+        raise NotImplementedError("the szsz observable needs a sector measurement plan: it is not implemented for "
+                                  "dense walker legs (energy_kernel='mpo'); measure it offline from the saved walkers")
     key = ("szsz", meas_ctx.trial_charges, meas_ctx.kernel)
     fns = plan.caches.get(key)
     if fns is None:
@@ -426,10 +474,11 @@ def szsz_fns(meas_ctx: MpsMeasCtx) -> SzszFns:
 
 
 def mps_szsz(walker, ham_data, meas_ctx: MpsMeasCtx, trial_data, plan: MpsWalkerPlan):
-    """<trial|S^z_i S^z_j|walker> / <trial|walker> (L, L) for one SD walker."""
+    """<trial|S^z_i S^z_j|walker> / <trial|walker> (L, L) for one SD walker (measurement plan, if any)."""
     check_meas_ctx(meas_ctx, plan, trial_data)
     check_walker(walker)
-    return szsz_fns(meas_ctx).one(walker[0], walker[1], meas_ctx.data())
+    measure = meas_ctx.measurement
+    return szsz_fns(measure).one(walker[0], walker[1], measure.data())
 
 
 def mps_szsz_fn(plan: MpsWalkerPlan):
@@ -446,11 +495,12 @@ def mps_pairing_fn(plan: MpsWalkerPlan):
     def pairing(walker, ham_data, meas_ctx: MpsMeasCtx, trial_data):
         check_meas_ctx(meas_ctx, plan, trial_data)
         check_walker(walker)
-        if meas_ctx.pairing_key is None:
+        measure = meas_ctx.measurement
+        if measure.pairing_key is None:
             raise ValueError("the context has no pairing data: build the meas ops with pairing=PairingSpec(...)")
         from trot.meas.mps_pairing import pairing_fns
 
-        return pairing_fns(meas_ctx).one(walker[0], walker[1], meas_ctx.data())
+        return pairing_fns(measure).one(walker[0], walker[1], measure.data())
 
     return jax.jit(pairing)
 
@@ -468,18 +518,21 @@ BATCHED_OBSERVABLES = {o_szsz: lambda meas_ctx: szsz_fns(meas_ctx).batch, o_pair
 
 
 def make_mps_meas_ops_hubbard(plan: MpsWalkerPlan, *, energy_kernel: str = "blocked", htrial=None,
-                              pairing=None) -> MeasOps:
+                              pairing=None, measure_plan: MpsWalkerPlan | None = None) -> MeasOps:
     """MeasOps for an MpsTrial and a HamHubbard: overlap, build_meas_ctx, the energy kernel and the szsz observable.
 
     htrial: optional precomputed H|trial> for build_meas_ctx (see build_mps_meas_ctx).
     pairing: optional PairingSpec: build_meas_ctx then holds the data of the "pairing" observable, the mixed pair
     correlations of trot.meas.mps_pairing, (2, n_rows, L).
+    measure_plan: optional walker plan of the energy and observables (trot.trial.mps.measurement_plan); the overlap
+    and the propagation keep plan.
     """
     if energy_kernel not in ENERGY_KERNELS:
         raise ValueError(f"energy_kernel must be one of {ENERGY_KERNELS}, got {energy_kernel!r}")
     return MeasOps(
         overlap=mps_overlap_fn(plan),
-        build_meas_ctx=partial(build_mps_meas_ctx, plan=plan, kernel=energy_kernel, htrial=htrial, pairing=pairing),
+        build_meas_ctx=partial(build_mps_meas_ctx, plan=plan, kernel=energy_kernel, htrial=htrial, pairing=pairing,
+                               measure_plan=measure_plan),
         kernels={k_energy: mps_energy_fn(plan)},
         observables={o_szsz: mps_szsz_fn(plan)} | ({o_pairing: mps_pairing_fn(plan)} if pairing is not None else {}),
     )

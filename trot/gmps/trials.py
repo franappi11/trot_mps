@@ -14,6 +14,7 @@ other step is the same code for a chain, a square lattice or any other h1:
 * export_trial(...): the trial in the notebooks' npz format.
 * Block-form H|trial> (to_blocks ... load_or_make_htrial): the compressed, charge-labelled H|trial> without dense
   tensors, for 6x6 and larger lattices whose dense H|trial> does not fit in memory, cached next to the trial.
+  rotate_htrial_blocks turns it into the H|trial> of the as-is spin-rotated trial, so rotated runs use the cache too.
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ from trot.trial.mps import (
     make_mps_trial,
     one_rdm,
     rotate_spin,
+    spin_rotation_unitary,
     spin_rotation_y,
 )
 from trot.trial.mps_rotation import rotate_mps_trial, rotated_rdm1
@@ -417,10 +419,14 @@ def trial_times_h_blocks(W, trial_blocks, trial_charges):
     return tensors, charges
 
 
-def compress_blocks_qn(tensors, charges, relative_tolerance=1.0e-13, consume=False):
+def compress_blocks_qn(tensors, charges, relative_tolerance=1.0e-13, consume=False, discarded=None):
     """compress_mps_qn in block form. Every sector matrix is assembled with its rows and columns in compress_mps_qn's
     order (zero rows and columns included), so the QR, the SVD and the rank cut are the same. consume=True replaces
-    the input list's entries as the sweeps go, so the uncompressed tensors are freed site by site."""
+    the input list's entries as the sweeps go, so the uncompressed tensors are freed site by site.
+
+    The rank cut keeps the singular values above relative_tolerance times the bond's largest one (all sectors).
+    discarded: an optional dict that gets, for every bond i, the discarded weight sum(s^2 below the cut) / sum(s^2):
+    the squared relative norm error of the state that bond's cut makes."""
     A = tensors if consume else [dict(site) for site in tensors]
     Q = [np.asarray(q, int).reshape(-1, 2) for q in charges]
     d = len(PHYSICAL_CHARGE)
@@ -473,6 +479,9 @@ def compress_blocks_qn(tensors, charges, relative_tolerance=1.0e-13, consume=Fal
             u, s, vh = np.linalg.svd(M, full_matrices=False)
             factors.append((c, parts, u, s, vh))
         cut = relative_tolerance * max(max(f[3][0] for f in factors), 1e-300)
+        if discarded is not None:
+            below = sum(float(np.sum(f[3][f[3] <= cut] ** 2)) for f in factors)
+            discarded[i] = below / max(sum(float(np.sum(f[3] ** 2)) for f in factors), 1e-300)
         site, before, labels = {}, {}, []
         for c, parts, u, s, vh in factors:
             n = int(np.sum(s > cut))
@@ -504,9 +513,11 @@ def energy_plan_bytes(charges):
     return 8 * total
 
 
-def htrial_cache_file(trial_path) -> Path:
+def htrial_cache_file(trial_path, relative_tolerance=1.0e-13) -> Path:
+    """<trial file>_htrial.npz; another compression tolerance has its own file, <trial file>_htrial_tol<tolerance>.npz."""
     path = Path(trial_path)
-    return path.with_name(f"{path.stem}_htrial.npz")
+    tag = "" if relative_tolerance == 1.0e-13 else f"_tol{relative_tolerance:g}"
+    return path.with_name(f"{path.stem}_htrial{tag}.npz")
 
 
 def _pack_blocks(blocks, charges):
@@ -541,25 +552,36 @@ def _unpack_blocks(data, n):
     return blocks, charges
 
 
-def load_or_make_htrial(trial_path, h1, u, trial_np, trial_charges, mps_energy, say=print):
+def load_or_make_htrial(trial_path, h1, u, trial_np, trial_charges, mps_energy, say=print, relative_tolerance=1.0e-13):
     """The compressed, charge-labelled H|trial> in block form (tensors, labels) and a dict with <trial|H|trial>, the
-    uncompressed bonds and the trial's rdm1 (gamma).
+    uncompressed bonds, the trial's rdm1 (gamma), the compression's relative_tolerance and its discarded weight per
+    bond (None for a cache file made before it was recorded).
 
-    With trial_path (the trial's cache file) they are read from, or written to, <trial file>_htrial.npz: made once on
-    the CPU (run_mps_cpmc.py --prepare-only) for every GPU run of that trial. A file made for another h1 or another
-    trial (its pyblock3 energy differs) is refused. Without a cache file the product is made and not saved."""
+    With trial_path (the trial's cache file) they are read from, or written to, <trial file>_htrial.npz (a tolerance
+    other than 1e-13 has its own file, see htrial_cache_file): made once on the CPU (run_mps_cpmc.py --prepare-only)
+    for every GPU run of that trial. A file made for another h1 or another trial (its pyblock3 energy differs) or with
+    another tolerance is refused. Without a cache file the product is made and not saved.
+
+    relative_tolerance: the rank cut of the compression (compress_blocks_qn). The default keeps H|trial> to roundoff;
+    a larger one gives smaller bonds, an approximate H|trial> whose error the log reports (the discarded weight and
+    <trial|H|trial> against pyblock3's energy, which must agree to 1e-8 or nothing is saved)."""
     h1 = np.asarray(h1, dtype=float)
     n = len(h1)
-    path = htrial_cache_file(trial_path) if trial_path is not None else None
+    path = htrial_cache_file(trial_path, relative_tolerance) if trial_path is not None else None
     if path is not None and path.exists():
         with np.load(path) as data:
             same_trial = mps_energy is None or float(data["trial_mps_energy"]) == mps_energy
             if not _same(np.asarray(data["h1"]), h1) or not same_trial:
                 raise ValueError(f"{path} was made for another trial")
+            if float(data["relative_tolerance"]) != relative_tolerance:
+                raise ValueError(f"{path} was made with relative tolerance {float(data['relative_tolerance']):g}, "
+                                 f"not {relative_tolerance:g}")
             blocks, charges = _unpack_blocks(data, n)
             info = dict(trial_energy=float(data["trial_energy"]),
                         uncompressed_bonds=[int(x) for x in data["uncompressed_bonds"]],
-                        gamma=np.stack([np.asarray(data["gamma_a"]), np.asarray(data["gamma_b"])]))
+                        gamma=np.stack([np.asarray(data["gamma_a"]), np.asarray(data["gamma_b"])]),
+                        relative_tolerance=relative_tolerance,
+                        discarded=np.asarray(data["discarded_weight"]) if "discarded_weight" in data.files else None)
         say(f"H|trial> loaded from {path}", flush=True)
         return (blocks, charges), info
 
@@ -573,13 +595,19 @@ def load_or_make_htrial(trial_path, h1, u, trial_np, trial_charges, mps_energy, 
     exact = trial_times_h_blocks(W, trial_blocks, trial_charges)
     seconds["product"] = clock() - start
     start = clock()
-    blocks, charges = compress_blocks_qn(*exact, consume=True)
+    discarded = {}
+    blocks, charges = compress_blocks_qn(*exact, relative_tolerance=relative_tolerance, consume=True,
+                                         discarded=discarded)
     del exact
     seconds["compress"] = clock() - start
     stored = sum(X.nbytes for site in blocks for X in site.values())
     energy = overlap_blocks(trial_blocks, blocks) / overlap_blocks(trial_blocks, trial_blocks)
     say(f"H|trial> compressed bonds {[len(q) for q in charges]}: {stored / 1e9:.2f} GB in blocks; "
         f"device energy-plan blocks at most {energy_plan_bytes(charges) / 1e9:.1f} GB", flush=True)
+    weights = np.asarray([discarded[i] for i in sorted(discarded)])
+    say(f"H|trial> compression at relative tolerance {relative_tolerance:g}: discarded weight per bond at most "
+        f"{weights.max():.1e}, summed {weights.sum():.1e} (a relative norm error of about {weights.sum() ** 0.5:.1e})",
+        flush=True)
     if mps_energy is not None:
         say(f"<trial|H|trial> {energy:.12f}, pyblock3 {mps_energy:.12f}, difference {energy - mps_energy:.1e}",
             flush=True)
@@ -593,9 +621,48 @@ def load_or_make_htrial(trial_path, h1, u, trial_np, trial_charges, mps_energy, 
     if path is not None:
         tmp = path.with_name(f"{path.stem}.{os.getpid()}.tmp.npz")
         header = dict(h1=h1, trial_mps_energy=np.nan if mps_energy is None else mps_energy, trial_energy=energy,
-                      relative_tolerance=1.0e-13, uncompressed_bonds=np.asarray(exact_bonds),
-                      gamma_a=gamma[0], gamma_b=gamma[1])
+                      relative_tolerance=relative_tolerance, discarded_weight=weights,
+                      uncompressed_bonds=np.asarray(exact_bonds), gamma_a=gamma[0], gamma_b=gamma[1])
         _save_npz(tmp, itertools.chain(header.items(), _pack_blocks(blocks, charges)))
         os.replace(tmp, path)
         say(f"H|trial> saved to {path}", flush=True)
-    return (blocks, charges), dict(trial_energy=energy, uncompressed_bonds=exact_bonds, gamma=gamma)
+    return (blocks, charges), dict(trial_energy=energy, uncompressed_bonds=exact_bonds, gamma=gamma,
+                                   relative_tolerance=relative_tolerance, discarded=weights)
+
+
+def rotate_htrial_blocks(blocks, charges, rotation):
+    """Block-form H|trial> of the spin-rotated trial, from the one of the unrotated trial (rotation in degrees).
+
+    H commutes with every spin rotation, so H (R|trial>) = R (H|trial>). The bonds are relabelled by the particle
+    number N, as the rotated trial has no definite (N_up, N_dn), and the site rotation spin_rotation_unitary(R) of
+    trot.trial.mps.rotate_spin is applied to the physical leg of every block: no dense tensors, and the cost is one
+    pass over the blocks. The labels are the N labels of make_mps_trial(rotate_spin(...)), i.e. of a trial made with
+    rotated_trial="as_is" (the projected trial's H|trial> is not a relabelling of this one).
+
+    Returns (blocks, labels) like load_or_make_htrial; the trial energy and gamma are unchanged by the rotation.
+    """
+    M = spin_rotation_unitary(spin_rotation_y(rotation))
+    old = [np.asarray(q) for q in charges]
+    new = [q.sum(axis=1, keepdims=True) for q in old]
+    # per bond: an (N_up, N_dn) sector's positions within the bond indices of the same N, and that N's size
+    place = []
+    for q_old, q_new in zip(old, new, strict=True):
+        sectors = {}
+        for q in set(map(tuple, q_old)):
+            rows = np.flatnonzero(np.all(q_old == q, axis=1))
+            group = np.flatnonzero(q_new[:, 0] == sum(q))
+            sectors[q] = (np.searchsorted(group, rows), len(group))
+        place.append(sectors)
+    rotated = []
+    for site, sectors_l, sectors_r in zip(blocks, place[:-1], place[1:], strict=True):
+        target = {}
+        for (ql, p, qr), block in site.items():
+            rows, n_left = sectors_l[tuple(ql)]
+            cols, n_right = sectors_r[tuple(qr)]
+            for pp in np.flatnonzero(M[:, p]):
+                key = ((int(sum(ql)),), int(pp), (int(sum(qr)),))
+                if key not in target:
+                    target[key] = np.zeros((n_left, n_right))
+                target[key][np.ix_(rows, cols)] += M[pp, p] * block
+        rotated.append(target)
+    return rotated, tuple(new)

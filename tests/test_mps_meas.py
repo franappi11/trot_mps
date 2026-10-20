@@ -360,7 +360,10 @@ def test_meas_ctx_is_pytree_holding_one_kernel(ed_2x3, kernel):
     else:  # the dense H|T> tensors and the trial tensors
         assert ctx.h_charges is None and len(ctx.dense_trial) == L
     leaves, treedef = jax.tree_util.tree_flatten(ctx)
-    n_leaves = (2 if kernel == "blocked" else 3) * L
+    # one block per site, or one per size class of a site for size-bucketed blocks (engine.bucket_plan: the blocked
+    # H|T> always, the trial with TROT_OVERLAP_BUCKET_RATIO)
+    n_blocks = lambda blocks: sum(len(b) if isinstance(b, tuple) else 1 for b in blocks)
+    n_leaves = n_blocks(ctx.trial_blocks) + n_blocks(ctx.h_blocks) + len(ctx.dense_trial)
     assert len(leaves) == n_leaves and all(isinstance(x, jax.Array) for x in leaves)
     rebuilt = jax.tree_util.tree_unflatten(treedef, leaves)
     assert isinstance(rebuilt, MpsMeasCtx) and rebuilt.key == ctx.key
@@ -373,7 +376,7 @@ def test_meas_ctx_is_pytree_holding_one_kernel(ed_2x3, kernel):
     kernels = ctx.kernels
     assert kernels is engine.kernels_for(plan, ctx.trial_charges, ctx.h_charges, kernel)
     assert kernels.energy_kind == kernel
-    assert kernels.overlap_plan is engine.layout_for(plan, ctx.trial_charges)
+    assert kernels.overlap_plan is engine.overlap_plan_for(plan, ctx.trial_charges)
     assert (kernels.energy_plan is None) == (kernel == "dense")
     prop_ctx = _build_prop_ctx(ed_2x3.ham, 0.05)
     for data, propagation in ((ctx.data(), None), (ctx.data(prop_ctx), prop_ctx)):
