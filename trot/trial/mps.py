@@ -185,7 +185,6 @@ def compress_mps_qn(tensors, charges, relative_tolerance=1.0e-13, max_bond=None)
         Q[i] = np.asarray(labels, int).reshape(-1, width)
     return A, tuple(Q)
 
-
 # ---------------------------------------------------------------------------------------------
 # Labels and spin rotations
 # ---------------------------------------------------------------------------------------------
