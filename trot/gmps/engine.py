@@ -1898,11 +1898,11 @@ def conversion_self_check(ops, plans, bonds, probe):
 # ============================================================================
 
 def chunked(fn, n_chunks, *args):
-    """fn over the leading (walker) axis in n_chunks sequential pieces (lax.map)."""
+    """fn over the leading (walker) axis in n_chunks sequential pieces (lax.map); args may be pytrees of arrays."""
     if n_chunks == 1:
         return fn(*args)
     split = lambda x: x.reshape((n_chunks, x.shape[0] // n_chunks) + x.shape[1:])
-    out = lax.map(lambda xs: fn(*xs), tuple(split(a) for a in args))
+    out = lax.map(lambda xs: fn(*xs), tuple(jax.tree_util.tree_map(split, a) for a in args))
     return jax.tree_util.tree_map(lambda y: y.reshape((-1,) + y.shape[2:]), out)
 
 
@@ -1968,3 +1968,18 @@ def measure_chunks(n, n_chunks) -> int:
     observable's stack of environments, which at 100 walkers made XLA report that the block needs 70 GB (it cannot
     go below 40 GB by rematerialization). The steps, unlike these, gain from larger batches."""
     return divisor_at_least(n, max(int(n_chunks), -(-n // MEASURE_CHUNK)))
+
+
+# walkers per conversion chunk of a fused measurement before its measurement chunks (0: each measurement chunk
+# converts its own walkers), and an optimization barrier between conversion and measurement (trot.meas.mps.FusedMeasurement).
+# Both on by default since 2026-10-29, from the 8x8 chi_T 2048 A/B of 200 walkers in chunks of 2 (jobs 7364939-41): the
+# barrier 955 -> 929 s with bitwise the same values, converting first in chunks of 200 929 -> 764 s with local energies
+# within 1.2e-6 relative of the per-chunk conversion (worst walker; median 1.6e-11), which the user accepted.
+MEASURE_CONVERT_CHUNK = int(os.environ.get("TROT_MEASURE_CONVERT_CHUNK", 200))
+MEASURE_BARRIER = os.environ.get("TROT_MEASURE_BARRIER", "1") == "1"
+
+
+def convert_chunks(n) -> int:
+    """Chunks of the walker conversion of a fused measurement of n walkers: at most MEASURE_CONVERT_CHUNK walkers each
+    (200, or the environment variable TROT_MEASURE_CONVERT_CHUNK; it must be positive)."""
+    return divisor_at_least(n, -(-n // MEASURE_CONVERT_CHUNK))

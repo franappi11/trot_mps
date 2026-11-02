@@ -84,8 +84,10 @@ class QmcParamsMps(QmcParams):
     trial_chi, dmrg_sweeps, dmrg_seed: pyblock3 DMRG, used when run_qmc_mps builds the trial.
     dmrg_init: DMRG initial state (trot.gmps.dmrg.make_dmrg_trial): "auto" (Neel product state where
       defined, else random), "neel" or "random" (random MPS with a warm-up at a larger bond).
-    orbital_plan: gate plan of the walker conversion. "rank_exact" and "maximal" are exact for
-      every walker before truncation; "adaptive" is cheaper but exact only for the reference.
+    orbital_plan: gate plan of the walker conversion (default "rank_exact"). "rank_exact" and "maximal" are exact
+      for every walker before truncation (rank counting guarantees an exactly empty or occupied mode in every block, so
+      the plan loss is zero); "adaptive" has smaller blocks and about as many gates on the doped 6x6, but is exact only
+      for the reference (plan loss ~1e-9 on the 6x6 walkers, 1e-5 for a poor reference).
     occupation_tolerance: purity threshold of the "adaptive" plan.
     walker_channel_chi, walker_cutoff: per-spin-channel walker bond cap and relative singular
       value cutoff (None and 0.0 keep the conversion exact).
@@ -115,13 +117,16 @@ class QmcParamsMps(QmcParams):
     dense_snap: zero the off-sector entries of every new isometry of the dense conversion (default). Above bond 16 the
       gates' eigh no longer keeps the sector blocks' zeros and the charge labels fail without it; with it they are
       exact at no measurable cost (trot.gmps.dense_conversion.DenseSpec).
+    dense_eigh: the dense conversion's eigh, "default" (XLA's choice: Jacobi up to 32 x 32 on GPUs, cuSOLVER's
+      batched syevd above) or "jacobi" (Jacobi at every size; GPU only). Same states up to rounding and the gauge of
+      degenerate eigenvectors; the speed is what differs.
     """
 
     trial_chi: int = 64
     dmrg_sweeps: int = 14
     dmrg_seed: int = 0
     dmrg_init: Literal["auto", "neel", "random"] = "auto"
-    orbital_plan: Literal["rank_exact", "adaptive", "maximal"] = "adaptive"
+    orbital_plan: Literal["rank_exact", "adaptive", "maximal"] = "rank_exact"
     occupation_tolerance: float = 1.0e-10
     walker_channel_chi: int | None = 4
     walker_cutoff: float = 0.0
@@ -135,6 +140,7 @@ class QmcParamsMps(QmcParams):
     dense_move: Literal["gram", "cans"] = "gram"
     dense_charge_gap: float | None = None
     dense_snap: bool = True
+    dense_eigh: Literal["default", "jacobi"] = "default"
 
     def __post_init__(self) -> None:
         for name, allowed in _MPS_CHOICES.items():

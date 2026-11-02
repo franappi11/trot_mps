@@ -30,7 +30,7 @@ from jax import lax
 
 from trot import walkers as wk
 from trot.gmps import engine
-from trot.meas.mps import BATCHED_OBSERVABLES, MpsMeasCtx, check_meas_ctx
+from trot.meas.mps import BATCHED_OBSERVABLES, MpsMeasCtx, check_meas_ctx, fused_measurement
 from trot.prop.blocks import BlockObs
 from trot.prop.hubbard_cpmc_ops import _build_prop_ctx
 from trot.prop.types import PropOps, PropState
@@ -41,7 +41,8 @@ from trot.walkers import init_walkers
 
 def _start_values(meas_ctx: MpsMeasCtx):
     """Jitted overlaps (the context's walker plan) and local energies (its measurement plan) of a batch of given
-    walkers, cached on the plan: fn(ca, cb, meas_ctx, n_chunks)."""
+    walkers, cached on the plan: fn(ca, cb, meas_ctx, n_chunks). The energies go in the block's measurement chunks
+    (engine.measure_chunks): at production bonds 400 walkers in one chunk would not fit the card."""
     measure = meas_ctx.measurement
     key = ("start_values",) + tuple(meas_ctx.key[1:4]) + (None if measure is meas_ctx else measure.plan,)
     fn = meas_ctx.plan.caches.get(key)
@@ -52,7 +53,8 @@ def _start_values(meas_ctx: MpsMeasCtx):
         def fn(ca, cb, ctx, n_chunks):
             data, measure_data = ctx.data(), ctx.measurement.data()
             overlaps = engine.chunked(lambda a, b: kernels.overlaps(a, b, data), n_chunks, ca, cb)
-            energies = engine.chunked(lambda a, b: measure_kernels.energies(a, b, measure_data), n_chunks, ca, cb)
+            energies = engine.chunked(lambda a, b: measure_kernels.energies(a, b, measure_data),
+                                      engine.measure_chunks(ca.shape[0], n_chunks), ca, cb)
             return overlaps, energies
 
         meas_ctx.plan.caches[key] = fn
@@ -125,7 +127,7 @@ def make_prop_ops(ham_data, sys, plan: MpsWalkerPlan) -> PropOps:
 # ---------------------------------------------------------------------------------------------
 
 
-def make_block(record: Callable | None = None):
+def make_block(record: Callable | None = None, record_samples: Callable | None = None):
     """trot.prop.blocks.block for MPS trials, with 2 n + 1 walker conversions per block of n steps.
 
     observable_names (of mps_block) selects trot.meas.mps.BATCHED_OBSERVABLES, averaged over the walkers with the
@@ -139,6 +141,12 @@ def make_block(record: Callable | None = None):
 
     record: optional host callable(up, dn, pre_comb_weights, comb_index, energy, weight, e_estimate, node_encounters)
       called after every block with the new walkers and the comb's input (trot.gmps.driver.WalkerSnapshots).
+    record_samples: optional host callable(local_energy, e_ref, weights, comb_index, *observables) called after every
+      block, before `record`, with the walkers' own measurements at the block's end (before the comb, so indexed like
+      pre_comb_weights): local_energy (n,) as measured, before the outlier rule replaces any by e_ref (so a NaN or a
+      spurious value is visible; the block average uses the replaced ones), e_ref the estimate that rule compares with,
+      weights (n,) as the averages use them (zero for a walker with a NaN energy), comb_index as in `record`, and one
+      (n, ...) array per observable_names entry, as measured (a zero-weight walker's may be NaN). Must return an int32.
     """
     record_spec = jax.ShapeDtypeStruct((), jnp.int32)
 
@@ -165,7 +173,13 @@ def make_block(record: Callable | None = None):
         measure = meas_ctx.measurement
         m_kernels, m_data = (kernels, data) if measure is meas_ctx else (measure.kernels, measure.data())
         n_measure = engine.measure_chunks(n, n_chunks)
-        e_samples = engine.chunked(lambda a, b: m_kernels.energies(a, b, m_data), n_measure, qu, qd)
+        fused = fused_measurement(measure, observable_names, m_data)  # one conversion per walker for all, if available
+        fused_samples = ()
+        if fused is None:
+            e_samples = engine.chunked(lambda a, b: m_kernels.energies(a, b, m_data), n_measure, qu, qd)
+        else:
+            e_samples, *fused_samples = fused.chunked(qu, qd, m_data, n_measure)
+        e_measured = e_samples
         thresh = jnp.sqrt(2.0 / jnp.asarray(params.dt))
         e_ref = state.e_estimate
         is_nan = ~jnp.isfinite(e_samples)
@@ -178,9 +192,11 @@ def make_block(record: Callable | None = None):
         alpha = jnp.asarray(params.shift_ema, dtype=jnp.result_type(e_block))
         e_estimate = (1.0 - alpha) * state.e_estimate + alpha * e_block
 
-        observables = {}
-        for name in observable_names:  # the weighted mean over the pre-comb walkers, as blocks.block
-            samples = engine.chunked(lambda a, b: BATCHED_OBSERVABLES[name](measure)(a, b, m_data), n_measure, qu, qd)
+        observables, measured = {}, []
+        for k, name in enumerate(observable_names):  # the weighted mean over the pre-comb walkers, as blocks.block
+            samples = fused_samples[k] if fused_samples else engine.chunked(
+                lambda a, b: BATCHED_OBSERVABLES[name](measure)(a, b, m_data), n_measure, qu, qd)
+            measured.append(samples)
             w_shape = (n,) + (1,) * (samples.ndim - 1)
             samples = jnp.where(weights.reshape(w_shape) == 0.0, 0.0, samples)  # a dead walker's NaN must not leak (0 * NaN)
             mean = jnp.sum(weights.reshape(w_shape) * samples, axis=0) / w_sum_safe
@@ -199,6 +215,9 @@ def make_block(record: Callable | None = None):
             new_overlaps = engine.chunked(lambda a, b: kernels.overlaps(a, b, data), n_chunks, *walkers)
         state = PropState(walkers, new_weights, new_overlaps, key, state.pop_control_ene_shift, e_estimate,
                           state.node_encounters)
+        if record_samples is not None:
+            jax.experimental.io_callback(record_samples, record_spec, e_measured, e_ref, weights,
+                                         idx.astype(jnp.int32), *measured, ordered=True)
         if record is not None:
             jax.experimental.io_callback(record, record_spec, walkers[0], walkers[1], weights, idx.astype(jnp.int32),
                                          e_block, w_sum, e_estimate, state.node_encounters, ordered=True)

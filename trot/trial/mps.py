@@ -596,12 +596,14 @@ def measurement_plan(plan: MpsWalkerPlan, chi) -> MpsWalkerPlan:
 def dense_measurement_plan(plan: MpsWalkerPlan, chi, params) -> MpsWalkerPlan:
     """The walker plan of an MPO energy (QmcParamsMps.energy_kernel "mpo"): plan's reference and orbital plans with dense
     walker legs of bond chi (each walker keeping its own states), settings from params (dense_move, dense_charge_gap,
-    dense_snap), cached on plan. The MPO kernel contracts H on the fly, so no H|trial> exists for it."""
-    key = ("dense_measurement_plan", int(chi), params.dense_move, params.dense_charge_gap, params.dense_snap)
+    dense_snap, dense_eigh), cached on plan. The MPO kernel contracts H on the fly, so no H|trial> exists for it."""
+    eigh = getattr(params, "dense_eigh", "default")
+    key = ("dense_measurement_plan", int(chi), params.dense_move, params.dense_charge_gap, params.dense_snap, eigh)
     measure = plan.caches.get(key)
     if measure is None:
         (Ra, Rb), orbital_plans = plan.reference, plan.orbital_plans
-        spec = DenseSpec(int(chi), params.dense_move, params.dense_charge_gap, snap=bool(params.dense_snap))
+        spec = DenseSpec(int(chi), params.dense_move, params.dense_charge_gap, snap=bool(params.dense_snap),
+                         eigh=eigh)
         measure = make_dense_walker_plan(Ra, Rb, orbital_plans, spec, sector_buckets=plan.sector_buckets,
                                          walker_qr=plan.walker_qr)
         plan.caches[key] = measure
@@ -642,7 +644,7 @@ def make_walker_plan(ham_data, trial: MpsTrial, sys_, params) -> MpsWalkerPlan:
             raise ValueError("a dense walker plan needs walker_channel_chi (its bond)")
         plans = tuple(make_orbital_plan(R, params.orbital_plan, params.occupation_tolerance) for R in (Ra, Rb))
         spec = DenseSpec(int(params.walker_channel_chi), params.dense_move, params.dense_charge_gap,
-                         snap=bool(getattr(params, "dense_snap", True)))
+                         snap=bool(getattr(params, "dense_snap", True)), eigh=getattr(params, "dense_eigh", "default"))
         return make_dense_walker_plan(Ra, Rb, plans, spec, sector_buckets=getattr(params, "sector_buckets", ()),
                                       walker_qr=getattr(params, "walker_qr", "auto"))
     return make_walker_plan_from_reference(
