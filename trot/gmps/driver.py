@@ -96,7 +96,13 @@ def make_mps_cpmc_ops(ham_data, trial_data: MpsTrial, sys, params, htrial=None, 
 
 
 def run_qmc_chunk_sizes(params) -> set[int]:
-    """Distinct block-batch sizes trot.driver.run_qmc compiles (one jitted block scan each)."""
+    """Distinct block-batch sizes trot.driver.run_qmc compiles (one jitted block scan each); with TROT_BLOCKS_PER_CALL
+    set (trot.driver.BLOCKS_PER_CALL) only that one, whatever the block counts (the last call can be shorter)."""
+    from trot import driver as trot_driver
+
+    if trot_driver.BLOCKS_PER_CALL > 0:
+        k = trot_driver.BLOCKS_PER_CALL
+        return {k} | {n % k for n in (params.n_eql_blocks, params.n_blocks) if n % k}
     sizes = set()
     for n, divisor in ((params.n_eql_blocks, 5), (params.n_blocks, 10)):
         chunk = n // divisor if n >= divisor else 1
@@ -109,15 +115,20 @@ def _plan_fidelity(S, plan) -> float:
     _, rows = channel_angles(np.asarray(S), plan, xp=np)
     return float(np.linalg.det(np.stack([rows[i] for i in np.flatnonzero(plan.occupation)]))) ** 2
 
-def mps_diagnostics(ham_data, trial, ops: MpsCpmcOps, params, meas_ctx, state=None) -> dict:
+def mps_diagnostics(ham_data, trial, ops: MpsCpmcOps, params, meas_ctx, state=None, start=None) -> dict:
     """The run's static diagnostics (trial, H|trial>, walker plan, start determinant, engine layout), as a dict for
-    the result record; print_diagnostics prints it."""
+    the result record; print_diagnostics prints it. start: (description, Sa, Sb) of the walkers' start when it is not
+    params.walker_start's determinant (prepare_mps_cpmc's start_rdm1 or initial_walkers: Sa, Sb of walker 0)."""
     plan = ops.plan
     plan_a, plan_b = plan.orbital_plans
     gates = lambda p: int(p.block_sizes.sum() - len(p.block_sizes))
-    if params.walker_start == "rhf":
+    if start is not None:
+        walker_start, Sa, Sb = start
+    elif params.walker_start == "rhf":
+        walker_start = "the rhf determinant"
         Sa, Sb = rhf_orbitals(ham_data, trial.nelec)
     else:
+        walker_start = "the natural determinant"
         rdm1 = np.asarray(trial.rdm1)
         Sa, Sb = (natural_orbitals(rdm1[s], trial.nelec[s])[0] for s in range(2))
     kernels = meas_ctx.kernels
@@ -135,6 +146,7 @@ def mps_diagnostics(ham_data, trial, ops: MpsCpmcOps, params, meas_ctx, state=No
         walker_bonds_max=int(plan.dense.chi) ** 2 if plan.dense is not None else int(max(map(len, plan.walker_charges))),
         reference_discarded_weight=[None if b is None else float(b.reference_discarded_weight)
                                     for b in plan.bond_plans],
+        walker_start=walker_start,
         plan_infidelity=[1 - _plan_fidelity(Sa, plan_a), 1 - _plan_fidelity(Sb, plan_b)],
     )
     if state is not None:
@@ -194,7 +206,8 @@ def print_diagnostics(info: dict, params, dmrg=None) -> None:
         weights = ", ".join(f"{w:.3e}" for w in info["measure_reference_discarded_weight"])
         print(f"measurement plan (energy, observables): channel bond {params.measure_channel_chi}, walker bonds max "
               f"{info['measure_bonds_max']}; reference discarded weight {weights}")
-    print(f"  walkers start from the {params.walker_start} determinant; orbital-plan infidelity "
+    start = info.get("walker_start", f"the {params.walker_start} determinant")
+    print(f"  walkers start from {start}; orbital-plan infidelity "
           f"{info['plan_infidelity'][0]:.1e}, {info['plan_infidelity'][1]:.1e}")
     if "initial_e_estimate" in info:
         print(f"  start: overlap {info['initial_overlap']:.6e}, local energy {info['initial_e_estimate']:.10f}")
@@ -360,7 +373,8 @@ class MpsCpmcRun(NamedTuple):
 
 
 def prepare_mps_cpmc(*, sys, params, ham_data, trial, htrial=None, pairing=None, state=None, mesh=None, dmrg=None,
-                     verbose=True, plan=None, measure_plan=None, recompute_overlaps=False) -> MpsCpmcRun:
+                     verbose=True, plan=None, measure_plan=None, recompute_overlaps=False, initial_walkers=None,
+                     start_rdm1=None) -> MpsCpmcRun:
     """Ops, contexts, the walkers' start and the diagnostics for an MpsTrial.
 
     htrial: optional precomputed H|trial> (tensors or block form, labels, trial_energy), energy_kernel="blocked".
@@ -371,12 +385,30 @@ def prepare_mps_cpmc(*, sys, params, ham_data, trial, htrial=None, pairing=None,
     that continues another one's walkers on a new plan (e.g. counts trained on them, run_warmup) needs it: every overlap
     ratio of the next steps divides by the stored overlap, which must come from the same conversion. The weights, RNG
     key, energy estimate and population-control shift carry over.
+    initial_walkers: (up, dn) of shape (n_walkers, n_sites, N_sigma) to start from instead of params.walker_start's
+    determinant, e.g. another run's saved walkers: their overlaps and local energies come from this run's plans
+    (trot.prop.mps_cpmc.init_prop_state). start_rdm1: a (2, n_sites, n_sites) rdm1 whose natural-orbital determinant
+    every walker starts from, e.g. a UHF determinant's [Ca Ca^T, Cb Cb^T]. Neither goes with state, nor with the other.
     """
     if sys.walker_kind.lower() != "unrestricted":
         raise ValueError("MPS-CPMC needs walker_kind='unrestricted'")
     for name in ("orbital_plan", "walker_channel_chi", "energy_kernel", "plan_reference"):
         if not hasattr(params, name):
             raise TypeError("params must be a QmcParamsMps (trot.prop.types)")
+    if sum(x is not None for x in (state, initial_walkers, start_rdm1)) > 1:
+        raise ValueError("pass at most one of state, initial_walkers and start_rdm1")
+    walker_start = None  # (description, Sa, Sb) for the diagnostics when the start is not params.walker_start's
+    if initial_walkers is not None:
+        initial_walkers = tuple(jnp.asarray(w) for w in initial_walkers)
+        if initial_walkers[0].shape[0] != params.n_walkers:
+            raise ValueError(f"{initial_walkers[0].shape[0]} initial walkers for params.n_walkers {params.n_walkers}")
+        walker_start = (f"{params.n_walkers} given walkers (the infidelity of walker 0)",
+                        *(np.linalg.qr(np.asarray(w[0]))[0] for w in initial_walkers))
+    elif start_rdm1 is not None:
+        start_rdm1 = jnp.asarray(start_rdm1)
+        rdm1 = np.asarray(start_rdm1)
+        walker_start = ("the natural determinant of the given rdm1",
+                        *(natural_orbitals(rdm1[s], trial.nelec[s])[0] for s in range(2)))
     clock, seconds = time.perf_counter, {}
     start = clock()
     # walker plan (orbital and bond plans, circuit)
@@ -393,10 +425,11 @@ def prepare_mps_cpmc(*, sys, params, ham_data, trial, htrial=None, pairing=None,
     if state is None:
         start = clock()
         state = ops.prop_ops.init_prop_state(sys=sys, ham_data=ham_data, trial_ops=ops.trial_ops, trial_data=trial,
-                                             meas_ops=ops.meas_ops, params=params, meas_ctx=meas_ctx, mesh=mesh)
+                                             meas_ops=ops.meas_ops, params=params, meas_ctx=meas_ctx,
+                                             initial_walkers=initial_walkers, rdm1=start_rdm1, mesh=mesh)
         jax.block_until_ready(state)
         seconds["walker_start"] = clock() - start  # compile included
-    info = mps_diagnostics(ham_data, trial, ops, params, meas_ctx, state)
+    info = mps_diagnostics(ham_data, trial, ops, params, meas_ctx, state, start=walker_start)
     info["setup_seconds"] = {k: round(v, 1) for k, v in seconds.items()}
     if verbose:
         print_diagnostics(info, params, dmrg)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 import math
 import time
 from functools import partial
@@ -413,9 +414,18 @@ def make_run_blocks(
     return run_blocks
 
 
+# TROT_BLOCKS_PER_CALL=k: run_qmc's progress loops call the jitted block scan k blocks at a time (printing every call)
+# instead of n_eql_blocks // 5 and n_blocks // 10. The compiled program (a scan of k blocks) then does not depend on the
+# run's block counts, so the persistent compilation cache serves a production run from a short test's compile with the
+# same settings. 0 (default): the batches above.
+BLOCKS_PER_CALL = int(os.environ.get("TROT_BLOCKS_PER_CALL", 0))
+
+
 def _auto_chunk_probe_n_blocks(params: QmcParams) -> int:
     """Largest static block batch used by the standard progress loops."""
 
+    if BLOCKS_PER_CALL > 0:
+        return BLOCKS_PER_CALL
     eql_chunk = params.n_eql_blocks // 5 if params.n_eql_blocks >= 5 else 1
     sampling_chunk = params.n_blocks // 10 if params.n_blocks >= 10 else 1
     return max(1, eql_chunk, sampling_chunk)
@@ -976,7 +986,7 @@ def run_qmc(
         f"{int(state.node_encounters):10d}  "
         f"{0.0:8.1f}"
     )
-    chunk = print_every if print_every > 0 else 1
+    chunk = BLOCKS_PER_CALL or (print_every if print_every > 0 else 1)
     for start in range(0, params.n_eql_blocks, chunk):
         n = min(chunk, params.n_eql_blocks - start)
         state, scalars_chunk, obs_chunk = run_blocks(
@@ -1106,7 +1116,7 @@ def run_qmc(
             f"{'W':>12s}    {'nodes':>10s}  {'dt[s/bl]':>10s}  {'t[s]':>7s}"
         )
 
-    chunk = print_every if print_every > 0 else 1
+    chunk = BLOCKS_PER_CALL or (print_every if print_every > 0 else 1)
     for start in range(0, params.n_blocks, chunk):
         n = min(chunk, params.n_blocks - start)
         state, scalars_chunk, obs_chunk = run_blocks(

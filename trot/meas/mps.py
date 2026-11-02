@@ -9,7 +9,8 @@ of any real symmetric h1 plus on-site U (hubbard_mpo_from_h1). Two kernels:
 - "dense": the d=4 walker MPS is formed (combine_channels) and contracted with the densely compressed H|trial>
   (compress_mps); for validation.
 - "mpo": no H|trial> at all. The MPO is applied on the fly in the contraction of a dense walker plan
-  (trot.gmps.dense_engine.mpo_numerator): the memory is the trial and a few MB of MPO instead of H|trial>'s blocks
+  (trot.gmps.dense_engine.mpo_contract: its nonzero terms as gathers; mpo_numerator, a dense einsum, with
+  TROT_MPO_KERNEL=einsum): the memory is the trial and a few MB of MPO instead of H|trial>'s blocks
   (18.9 GB at the doped 6x6's chi_T 512, ~76 GB at 1024). It needs a dense walker plan (QmcParamsMps.walker_conversion
   "dense" or the dense measurement plan make_mps_cpmc_ops builds for it) and offers no szsz.
 
@@ -359,7 +360,7 @@ def build_mps_meas_ctx(ham_data, trial_data, *, plan: MpsWalkerPlan, kernel: str
         from trot.gmps import dense_engine
 
         mpo = dense_engine.mpo_site_tensors(hubbard_mpo_from_h1(hubbard_h1(ham_data), float(ham_data.u)))
-        h_blocks = tuple(jnp.asarray(W) for W in mpo)
+        h_blocks = dense_engine.mpo_device_blocks(mpo)  # the MPO's gathers (TROT_MPO_KERNEL=einsum: its tensors)
         energy = dense_engine.mpo_trial_energy(mpo, trial_np)
         bonds = tuple(int(W.shape[0]) for W in mpo) + (int(mpo[-1].shape[-1]),)
         key = (plan, trial_data.charges, None, kernel, float(energy), bonds)
@@ -440,14 +441,43 @@ def szsz_fns(meas_ctx: MpsMeasCtx) -> SzszFns:
     """The <trial|S^z_i S^z_j|walker> / <trial|walker> kernels of a context, cached on the plan.
 
     Like the energy: the walker is QR-orthonormalised and converted, then contracted against the trial blocks
-    ("blocked", engine.szsz_contract) or as the d=4 MPS against the dense trial ("dense", engine.szsz_dense).
+    ("blocked", engine.szsz_contract), as the d=4 MPS against the dense trial ("dense", engine.szsz_dense), or, for a
+    dense walker plan (energy_kernel "mpo"), on its dense legs against the trial's sector blocks
+    (trot.gmps.dense_engine.szsz_contract; it needs no H|trial> and no MPO, only the overlap layout's trial blocks).
     """
     plan, kernels = meas_ctx.plan, meas_ctx.kernels
     if plan.dense is not None:
-        raise NotImplementedError("the szsz observable needs a sector measurement plan: it is not implemented for "
-                                  "dense walker legs (energy_kernel='mpo'); measure it offline from the saved walkers")
-    key = ("szsz", meas_ctx.trial_charges, meas_ctx.kernel)
+        from trot.gmps import dense_engine
+    key = ("szsz", meas_ctx.trial_charges, meas_ctx.kernel, None if plan.dense is None else dense_engine.SZSZ_KERNEL)
     fns = plan.caches.get(key)
+    if fns is None and plan.dense is not None:
+        layout = kernels.overlap_plan.layout
+        if dense_engine.SZSZ_KERNEL == "einsum":
+            convert = dense_engine.dense_converter(plan)
+
+            def value(qa, qb, data):
+                alpha, dressed, _ = convert(qa, qb)
+                return dense_engine.szsz_contract(alpha, dressed, data.trial, layout)
+        elif dense_engine.SZSZ_KERNEL == "gemm":
+            convert = dense_engine.dense_converter(plan, labelled=True)
+
+            def value(qa, qb, data):
+                alpha, beta, signs, _, labels = convert(qa, qb)
+                return dense_engine.szsz_gemm(alpha, beta, signs, data.trial, layout, labels=labels)
+        else:
+            raise ValueError(f"TROT_SZSZ_KERNEL must be 'gemm' or 'einsum', not {dense_engine.SZSZ_KERNEL!r}")
+
+        def batch(ca, cb, data):
+            qa, _ = kernels.batch_qr(ca)
+            qb, _ = kernels.batch_qr(cb)
+            return jax.vmap(lambda a, b: value(a, b, data))(qa, qb)
+
+        def one(ca, cb, data):
+            qa, _ = qr_with_det(ca)
+            qb, _ = qr_with_det(cb)
+            return value(qa, qb, data)
+
+        fns = plan.caches[key] = SzszFns(batch, one)
     if fns is None:
         qa_labels, qb_labels = kernels.converter.charges
 
@@ -515,6 +545,81 @@ def _pairing_batch(meas_ctx):
 
 # observables the MPS block (trot.prop.mps_cpmc) measures for the whole walker batch: name -> meas_ctx -> batch fn
 BATCHED_OBSERVABLES = {o_szsz: lambda meas_ctx: szsz_fns(meas_ctx).batch, o_pairing: _pairing_batch}
+
+
+@dataclass(frozen=True, eq=False)
+class FusedMeasurement:
+    """The energy and observables of walkers converted once for all of them (fused_measurement). convert(ca, cb) ->
+    (alpha, beta, signs, labels): the measurement plan's tensors of a batch of walkers and their bond labels
+    (dense_converter(plan, labelled=True); the labels feed the grouped trial GEMMs, TROT_TRIAL_GEMM=grouped),
+    measure(alpha, beta, signs, labels, data) -> (local energies, *observables) of converted walkers;
+    fused(ca, cb, data) does both on one batch, chunked(...) on all walkers in measurement chunks. Not a NamedTuple:
+    jax.jit(fused) keeps a weak reference to the function, which a tuple does not allow (the 8 test failures of job
+    7364921)."""
+    convert: Callable
+    measure: Callable
+
+    def __call__(self, ca, cb, data):
+        """With engine.MEASURE_BARRIER (the default; TROT_MEASURE_BARRIER=0 removes it) an optimization barrier between
+        the conversion and the measurement: it stops XLA's dot merger from joining a conversion GEMM and the energy's
+        alpha GEMM, which read the same alpha tensor, into one Triton GEMM plus a slice copy of its output (job
+        7363725, 8x8 chi_T 2048 bond 64: ~100 s of a 2400 s block)."""
+        converted = self.convert(ca, cb)
+        if engine.MEASURE_BARRIER:
+            converted = jax.lax.optimization_barrier(converted)
+        return self.measure(*converted, data)
+
+    def chunked(self, ca, cb, data, n_chunks):
+        """(local energies, *observables) of all walkers in n_chunks measurement chunks (engine.chunked). With
+        engine.MEASURE_CONVERT_CHUNK = K > 0 (200 by default, TROT_MEASURE_CONVERT_CHUNK; 0 converts in each
+        measurement chunk) the walkers are first converted in chunks of up to K (engine.convert_chunks) and then
+        measured: every factorisation of the conversion is then one batched eigh of K matrices instead of a chunk's
+        few (8x8 chi_T 2048, 200 walkers in chunks of 2: 929 -> 764 s, jobs 7364940-41). cuSOLVER's batched syevd costs about the same per call up to hundreds of matrices: 238 us for
+        2 128 x 128 matrices in job 7363725, 4.0 ms for 400 in bench_eigh_blocks.py (7284570). The converted tensors
+        of all walkers stay on the device meanwhile (~8 MB per walker at bond 64 on the 8x8)."""
+        if engine.MEASURE_CONVERT_CHUNK <= 0:
+            return engine.chunked(lambda a, b: self(a, b, data), n_chunks, ca, cb)
+        converted = engine.chunked(self.convert, engine.convert_chunks(ca.shape[0]), ca, cb)
+        return engine.chunked(lambda *walkers: self.measure(*walkers, data), n_chunks, *converted)
+
+
+def fused_measurement(meas_ctx: MpsMeasCtx, observable_names, data) -> FusedMeasurement | None:
+    """The FusedMeasurement of (local energies, *observables) that converts each walker once for all of them, or None
+    where that is not available: a dense walker plan whose energy runs through the MPO's gathers (DeviceData.htrial
+    of MpoGather or WalkerMpoGather) and observables {szsz} measured with szsz_gemm (TROT_SZSZ_KERNEL=gemm); without
+    observables the energy alone keeps kernels.energies. The values are those of kernels.energies and
+    BATCHED_OBSERVABLES, which convert the walkers again for every quantity. An optimization barrier starts szsz once
+    the chunk's energies are done, and szsz runs one walker at a time (lax.map): its environments stored per walker
+    (szsz_gemm's Rsz, Lsz and the two stacks, ~15 GB at the 8x8's chi_T 2048 and bond 64) for two walkers at once took
+    the block from 57 to 82 GB (job 7339347), while one walker gains nothing from batching."""
+    plan = meas_ctx.plan
+    if plan.dense is None or meas_ctx.kernel != "mpo" or tuple(observable_names) != (o_szsz,):
+        return None
+    from trot.gmps import dense_engine
+
+    if not (data.htrial and dense_engine.is_mpo_gather(data.htrial[0])) or dense_engine.SZSZ_KERNEL != "gemm":
+        return None
+    kernels = meas_ctx.kernels
+    convert_one, layout = dense_engine.dense_converter(plan, labelled=True), kernels.overlap_plan.layout
+
+    def energy(alpha, beta, signs, labels, data):
+        overlap, numerator = dense_engine.mpo_contract(alpha, beta, signs, data.trial, data.htrial, layout, labels)
+        return numerator / overlap
+
+    def convert(ca, cb):
+        qa, _ = kernels.batch_qr(ca)
+        qb, _ = kernels.batch_qr(cb)
+        alpha, beta, signs, _, labels = jax.vmap(convert_one)(qa, qb)
+        return alpha, beta, signs, labels
+
+    def measure(alpha, beta, signs, labels, data):
+        energies = jax.vmap(lambda a, b, s, n: energy(a, b, s, n, data))(alpha, beta, signs, labels)
+        energies, alpha, beta, signs, labels = jax.lax.optimization_barrier((energies, alpha, beta, signs, labels))
+        szsz = jax.lax.map(lambda w: dense_engine.szsz_gemm(*w[:3], data.trial, layout, labels=w[3]),
+                           (alpha, beta, signs, labels))
+        return energies, szsz
+
+    return FusedMeasurement(convert, measure)
 
 
 def make_mps_meas_ops_hubbard(plan: MpsWalkerPlan, *, energy_kernel: str = "blocked", htrial=None,

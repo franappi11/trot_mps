@@ -25,6 +25,11 @@ from __future__ import annotations
 
 from typing import Any, NamedTuple
 
+import contextlib
+import io
+import re
+import sys
+
 import numpy as np
 
 from trot.meas.mps import hubbard_h1
@@ -210,6 +215,61 @@ def resolve_init(init, h1, nelec):
             raise ValueError(f"no Neel product state for this h1 and nelec={tuple(nelec)}")
         return "random", None
     return "neel", states
+
+
+class DmrgDiagnostics(NamedTuple):
+    """Per-sweep convergence record of one dmrg_with_diagnostics call, parsed from pyblock3's own log line (it keeps
+    neither as an attribute of the returned DMRG object, only result.energies)."""
+    sweep_time_s: np.ndarray  # wall time of each sweep ("Time elapsed", cumulative within this call)
+    de: np.ndarray  # |E(sweep) - E(sweep - 1)|; 0.0 for a call's first sweep
+    mdw: np.ndarray  # largest two-site discarded weight of the sweep: chi itself is still the limit while this stays
+    # large, whatever de does (a flat energy with a large mdw is not converged, just stuck; see the module docstring)
+
+
+_SWEEP_SUMMARY = re.compile(r"Time elapsed = *([\d.]+) \| E = *[-\d.]+ \| DE = *([\d.eE+-]+) \| MDW = *([\d.eE+-]+)")
+
+
+class _Tee(io.TextIOBase):
+    """A write-only stream that copies everything to every given stream (stdout, so the log still shows every sweep
+    as it runs, and a buffer, so dmrg_with_diagnostics can parse it after the call)."""
+
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, s):
+        for stream in self._streams:
+            stream.write(s)
+        return len(s)
+
+    def flush(self):
+        for stream in self._streams:
+            stream.flush()
+
+
+def dmrg_with_diagnostics(mpe, *, bdims, noises, dav_thrds, n_sweeps, iprint=0, **kwargs):
+    """mpe.dmrg(bdims=, noises=, dav_thrds=, n_sweeps=, iprint=iprint, **kwargs) (pyblock3.algebra.mpe.MPE), with its
+    per-sweep summary line (iprint >= 0: "Time elapsed = ... | E = ... | DE = ... | MDW = ...") printed as usual, into
+    the Slurm log, and also parsed into a DmrgDiagnostics to save next to the sweep energies. Before 2026-10-21 every
+    6x6/8x8 trial here ran with iprint=-1, which prints nothing at all: whether a saved trial was actually converged
+    (both the energy settled, de small, and the bond large enough, mdw small) could only be guessed from the rounded
+    sweep_energies array after the fact (see dense-conversion-bench / walker-conversion-errors notes, where that
+    guessing showed chi 256/512/1024 still moving by 1e-3 to 6e-3 at sweep 20).
+
+    Returns (result, DmrgDiagnostics); result is mpe.dmrg's own return value (its .energies is the existing
+    sweep_energies). iprint must stay >= 0 (the default already used by the 4x4 production scripts) for this to have
+    anything to parse; the per-site iprint=2 line (one per site per sweep) is not needed and not parsed.
+    """
+    if iprint < 0:
+        raise ValueError("iprint must be >= 0 so pyblock3 prints the per-sweep summary line this parses")
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(_Tee(sys.stdout, buffer)):
+        result = mpe.dmrg(bdims=bdims, noises=noises, dav_thrds=dav_thrds, iprint=iprint, n_sweeps=n_sweeps, **kwargs)
+    rows = [(float(t), float(de), float(mdw)) for t, de, mdw in _SWEEP_SUMMARY.findall(buffer.getvalue())]
+    if not rows or len(rows) > n_sweeps:
+        raise AssertionError(f"parsed {len(rows)} per-sweep summaries for {n_sweeps} sweeps: pyblock3's log format "
+                             "may have changed")  # fewer than n_sweeps is fine: pyblock3's own early-stop on tol
+    sweep_time_s, de, mdw = (np.asarray(x) for x in zip(*rows))
+    return result, DmrgDiagnostics(sweep_time_s, de, mdw)
 
 
 def dmrg_core(hamiltonian, mpo, *, chi, n_sweeps, initial=None):

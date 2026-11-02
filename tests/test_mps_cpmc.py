@@ -344,7 +344,7 @@ def test_qmc_params_mps_defaults_and_validation():
     p = QmcParamsMps(seed=1)
     assert isinstance(p, QmcParams)
     assert (p.trial_chi, p.dmrg_sweeps, p.dmrg_seed) == (64, 14, 0)
-    assert (p.orbital_plan, p.occupation_tolerance) == ("adaptive", 1.0e-10)
+    assert (p.orbital_plan, p.occupation_tolerance) == ("rank_exact", 1.0e-10)
     assert (p.walker_channel_chi, p.walker_cutoff) == (4, 0.0)
     assert (p.plan_reference, p.walker_start, p.energy_kernel) == ("natural", "natural", "blocked")
     assert (p.walker_qr, p.sector_buckets, p.measure_channel_chi) == ("auto", (8, 16), None)
@@ -556,6 +556,72 @@ def test_a_run_continues_on_a_new_plan_after_warm_up_blocks(lattice_model):
     assert np.all(np.isfinite(np.asarray(run_prepared(other).block_energies)))
 
 
+def test_prepare_mps_cpmc_starts_from_given_walkers_or_rdm1(lattice_model, monkeypatch):
+    """prepare_mps_cpmc(initial_walkers=) and (start_rdm1=), the starts of ex_6x6_doped_diag.py --walker-start: the
+    default start's determinant given as walkers reproduces that start (its local energies measured in chunks of the
+    measurement plan) and its run block by block; an rdm1 starts every walker on its determinant; a batch of
+    different walkers is kept as given; the diagnostics name the start; the starts exclude each other."""
+    monkeypatch.setattr(engine, "MEASURE_CHUNK", 3)  # the given walkers' energies in 5 chunks of 2
+    m = lattice_model
+    trial = _noisy_trial(m.trial, m.nelec, seed=5)
+    params = _params(orbital_plan="adaptive", walker_channel_chi=2, measure_channel_chi=64, n_eql_blocks=2,
+                     n_blocks=2, n_prop_steps=2)
+    prepare = partial(prepare_mps_cpmc, sys=m.sys, ham_data=m.ham, trial=trial, params=params, verbose=False)
+
+    default = prepare()
+    assert default.info["walker_start"] == "the natural determinant"
+    overlap = jax.vmap(default.ops.trial_ops.overlap, in_axes=(0, None))
+    given = prepare(initial_walkers=tuple(np.asarray(w) for w in default.state.walkers))
+    assert given.info["walker_start"].startswith(f"{params.n_walkers} given walkers")
+    np.testing.assert_allclose(np.asarray(given.state.overlaps), np.asarray(default.state.overlaps), rtol=1e-10)
+    np.testing.assert_allclose(float(given.state.e_estimate), float(default.state.e_estimate), rtol=1e-10)
+    np.testing.assert_allclose(np.asarray(run_prepared(given).block_energies),
+                               np.asarray(run_prepared(default).block_energies), rtol=1e-9)
+
+    rng = np.random.default_rng(7)
+    C = [np.linalg.qr(rng.standard_normal((len(m.h1), n)))[0] for n in m.nelec]
+    from_rdm1 = prepare(start_rdm1=np.stack([c @ c.T for c in C]))
+    assert from_rdm1.info["walker_start"] == "the natural determinant of the given rdm1"
+    for walkers, c in zip(from_rdm1.state.walkers, C):
+        for w in np.asarray(walkers):
+            np.testing.assert_allclose(_projector(w), _projector(c), rtol=0, atol=1e-12)
+    np.testing.assert_allclose(np.asarray(from_rdm1.state.overlaps),
+                               np.asarray(overlap(from_rdm1.state.walkers, trial)), rtol=1e-10)
+
+    walkers = hf.random_field_walkers(m.h1, U, 0.1, *C, n=params.n_walkers, steps=10, seed=2)
+    stack = tuple(np.stack([w[s] for w in walkers]) for s in range(2))
+    varied = prepare(initial_walkers=stack)
+    for kept, want in zip(varied.state.walkers, stack):
+        np.testing.assert_array_equal(np.asarray(kept), want)
+    np.testing.assert_allclose(np.asarray(varied.state.overlaps), np.asarray(overlap(stack, trial)), rtol=1e-10)
+
+    with pytest.raises(ValueError, match="at most one"):
+        prepare(initial_walkers=stack, start_rdm1=np.stack([c @ c.T for c in C]))
+    with pytest.raises(ValueError, match="initial walkers"):
+        prepare(initial_walkers=tuple(s[:3] for s in stack))
+
+
+def test_blocks_per_call_runs_the_same_blocks_one_compiled_call_at_a_time(lattice_model, monkeypatch):
+    """TROT_BLOCKS_PER_CALL (trot.driver.BLOCKS_PER_CALL) = 1: run_qmc calls the jitted block scan one block at a time
+    instead of n_eql_blocks // 5 and n_blocks // 10 at a time, so the compiled program does not depend on the block
+    counts (run_qmc_chunk_sizes is {1} whatever they are). The same blocks run in the same order from the same state:
+    the block energies and weights are those of the default batches."""
+    from trot import driver as trot_driver
+
+    m = lattice_model
+    trial = _noisy_trial(m.trial, m.nelec, seed=5)
+    params = _params(orbital_plan="adaptive", walker_channel_chi=2, n_eql_blocks=10, n_blocks=20, n_prop_steps=2)
+    prepare = partial(prepare_mps_cpmc, sys=m.sys, ham_data=m.ham, trial=trial, verbose=False)
+    assert run_qmc_chunk_sizes(params) == {2}
+    want = run_prepared(prepare(params=params))
+    monkeypatch.setattr(trot_driver, "BLOCKS_PER_CALL", 1)
+    assert run_qmc_chunk_sizes(params) == {1}
+    assert run_qmc_chunk_sizes(dataclasses.replace(params, n_eql_blocks=7, n_blocks=33)) == {1}
+    got = run_prepared(prepare(params=params))
+    np.testing.assert_allclose(np.asarray(got.block_energies), np.asarray(want.block_energies), rtol=1e-8)
+    np.testing.assert_allclose(np.asarray(got.block_weights), np.asarray(want.block_weights), rtol=1e-8)
+
+
 def test_run_qmc_chunk_hook_changes_the_walker_plan_within_one_run(lattice_model):
     """trot.driver.run_qmc's chunk_hook through driver.make_retrain_hook, all within one run_qmc call:
     - a check that keeps the plan changes nothing;
@@ -758,6 +824,78 @@ def test_mpo_energy_kernel_reproduces_the_blocked_run_when_nothing_is_truncated(
             np.testing.assert_allclose(np.asarray(x), np.asarray(y), rtol=1e-7, atol=1e-9)
     with pytest.raises(ValueError, match="needs measure_channel_chi"):
         _params(walker_channel_chi=4, walker_conversion="dense")  # no energy kernel without a measurement plan
+
+
+@pytest.mark.parametrize("variant", ["blocked", "sector-mpo", "dense-mpo", "dense-mpo-other-kernels"])
+def test_record_samples_hands_over_the_walkers_own_measurements(lattice_model, monkeypatch, variant):
+    """make_block(record_samples=...): once per block, before the comb, the walkers' own local energies (as measured,
+    before the outlier rule), e_ref, the weights the averages use, the comb index and their szsz, indexed like
+    pre_comb_weights; the block's energy and szsz are their weighted means (the rule applied), whether the walkers are
+    measured by the sector kernel, by a dense plan nested in a sector run (energy_kernel "mpo") or by the dense
+    propagation plan itself (the default kernels: right environments walker-first, the MPO's trial-side gathers, all
+    walkers converted first behind a barrier), also with the other kernels (TROT_RIGHT_ENVS=trial,
+    TROT_MPO_KERNEL=walker, the fused measurement's walkers converted in chunks of 4 without the barrier:
+    TROT_MEASURE_CONVERT_CHUNK=4, TROT_MEASURE_BARRIER=0)."""
+    m = lattice_model
+    trial = _noisy_trial(m.trial, m.nelec, seed=5)
+    if variant == "dense-mpo-other-kernels":
+        from trot.gmps import dense_engine
+
+        monkeypatch.setattr(dense_engine, "RIGHT_ENVS", "trial")
+        monkeypatch.setattr(dense_engine, "MPO_KERNEL", "walker")
+        monkeypatch.setattr(engine, "MEASURE_CONVERT_CHUNK", 4)
+        monkeypatch.setattr(engine, "MEASURE_BARRIER", False)
+    extra = {"blocked": {}, "sector-mpo": dict(energy_kernel="mpo"),
+             "dense-mpo": dict(energy_kernel="mpo", walker_conversion="dense"),
+             "dense-mpo-other-kernels": dict(energy_kernel="mpo", walker_conversion="dense")}[variant]
+    params = _params(walker_channel_chi=64, measure_channel_chi=64, n_prop_steps=2, **extra)
+    rng = np.random.default_rng(3)
+    walkers = [
+        (hf.nonorthonormal(a, rng), hf.nonorthonormal(b, rng))
+        for a, b in hf.random_field_walkers(
+            m.h1, U, 0.1, *_determinant("uhf", m.h1, m.nelec), n=params.n_walkers, steps=40, seed=3
+        )
+    ]
+    stack = tuple(jnp.asarray(np.stack([w[s] for w in walkers])) for s in range(2))
+    ops = make_mps_cpmc_ops(m.ham, trial, m.sys, params)
+    ctx = ops.meas_ops.build_meas_ctx(m.ham, trial)
+    state = ops.prop_ops.init_prop_state(sys=m.sys, ham_data=m.ham, trial_ops=ops.trial_ops, trial_data=trial,
+                                         meas_ops=ops.meas_ops, params=params, meas_ctx=ctx, initial_walkers=stack)
+    prop_ctx = ops.prop_ops.build_prop_ctx(m.ham, None, params)
+    kwargs = dict(sys=m.sys, params=params, ham_data=m.ham, trial_data=trial, trial_ops=ops.trial_ops,
+                  meas_ops=ops.meas_ops, meas_ctx=ctx, prop_ops=ops.prop_ops, prop_ctx=prop_ctx)
+
+    seen = []
+
+    def capture(local_energy, e_ref, weights, comb_index, szsz):
+        seen.append([np.asarray(x) for x in (local_energy, e_ref, weights, comb_index, szsz)])
+        return np.int32(0)
+
+    block = mps_cpmc.make_block(record_samples=capture)
+    new, obs = jax.jit(lambda s: block(s, observable_names=("szsz",), **kwargs))(state)
+    jax.block_until_ready(new)
+    jax.effects_barrier()
+    assert len(seen) == 1
+    local_energy, e_ref, weights, comb_index, szsz = seen[0]
+    n, sites = params.n_walkers, m.h1.shape[0]
+    assert local_energy.shape == weights.shape == comb_index.shape == (n,) and szsz.shape == (n, sites, sites)
+    assert comb_index.dtype == np.int32 and comb_index.min() >= 0 and comb_index.max() < n
+
+    # the walkers as the block measured them: the half steps of the same state, then the measurement context's kernels
+    half, data = engine.make_half_step(ctx.kernels, params, 1), ctx.data(prop_ctx)
+    moved = jax.lax.scan(lambda s, i: (half(s, i, data), None), state, jnp.arange(2 * params.n_prop_steps))[0]
+    measure = ctx.measurement
+    np.testing.assert_allclose(weights, np.asarray(moved.weights), rtol=1e-12)
+    assert float(e_ref) == pytest.approx(float(state.e_estimate), rel=1e-12)
+    np.testing.assert_allclose(local_energy, np.asarray(measure.kernels.energies(*moved.walkers, measure.data())),
+                               rtol=1e-9)
+    np.testing.assert_allclose(szsz, np.asarray(szsz_fns(measure).batch(*moved.walkers, measure.data())),
+                               rtol=1e-8, atol=1e-10)
+    # and the block's means are theirs
+    clipped = np.where(np.abs(local_energy - float(e_ref)) > np.sqrt(2.0 / params.dt), float(e_ref), local_energy)
+    np.testing.assert_allclose(float(obs.scalars["energy"]), np.sum(weights * clipped) / np.sum(weights), rtol=1e-9)
+    np.testing.assert_allclose(np.asarray(obs.observables["szsz"]), np.tensordot(weights, szsz, 1) / np.sum(weights),
+                               rtol=1e-9, atol=1e-12)
 
 
 # ---------------------------------------------------------------------------------------------

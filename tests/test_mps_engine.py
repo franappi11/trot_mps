@@ -41,11 +41,12 @@ from jax import lax
 from tests.helpers import hubbard_fock as hf
 from trot.core.system import System
 from trot.gmps import dense_conversion as dc
-from trot.gmps import engine
+from trot.gmps import dense_engine, engine
+from trot.gmps import grouped_gemm
 from trot.gmps import trials
 from trot.gmps import utils as gmps_utils
 from trot.ham.hubbard import HamHubbard, hopping_matrix, square_hopping_matrix
-from trot.meas.mps import build_mps_meas_ctx, hubbard_mpo_from_h1, szsz_fns, trial_times_h
+from trot.meas.mps import build_mps_meas_ctx, fused_measurement, hubbard_mpo_from_h1, szsz_fns, trial_times_h
 from trot.prop.hubbard_cpmc_ops import _build_prop_ctx
 from trot.prop.types import PropState, QmcParams, QmcParamsMps
 from trot.trial.mps import (
@@ -1437,19 +1438,672 @@ def test_mpo_truncated_energies_equal_the_contraction_with_the_stored_h_trial(mo
     assert np.max(np.abs(got / exact - 1.0)) > 1e-8  # the cap truncates these walkers
 
 
-def test_mpo_kernel_needs_a_dense_plan_and_no_szsz(model):
-    """energy_kernel="mpo" on a sector plan has nothing to contract with; on a dense plan the szsz observable is not
-    available; the stored-H|trial> kernels are not offered by a dense plan."""
+def _site_tensors(model):
+    return dense_engine.mpo_site_tensors(hubbard_mpo_from_h1(model.h1, U))
+
+
+def test_mpo_gathers_hold_every_term_of_the_site_tensors(model):
+    """mpo_gathers: every nonzero W[w, p, q, v] is one term (coefficients and their count; the last site adds the
+    identity channel's four), every bond keeps its channels (the last one is (overlap, finished term)), the
+    finished-term channel collects several terms, and an MPO whose channel 0 is not the identity is refused."""
+    mpo = _site_tensors(model)
+    gathers = dense_engine.mpo_gathers(mpo, device=False)
+    for k, (W, g) in enumerate(zip(mpo, gathers)):
+        got = np.concatenate([g.single_coef[g.single_coef != 0], g.multi_coef[g.multi_coef != 0]])
+        want = np.concatenate([W[W != 0], np.ones(4 if k == len(mpo) - 1 else 0)])
+        np.testing.assert_array_equal(np.sort(got), np.sort(want))
+        assert g.single_src.shape[-1] + g.multi_src.shape[-1] == (2 if k == len(mpo) - 1 else W.shape[-1])
+        assert g.single_src.dtype == g.multi_src.dtype == np.int32
+        assert np.all((0 <= g.single_src) & (g.single_src < 4 * W.shape[0]))
+    assert all(g.multi_src.shape[-1] == 1 for g in gathers[1:])
+    bad = [np.array(W) for W in mpo]
+    bad[1][1, 0, 0, 0] = 1.0  # a second row feeding channel 0
+    with pytest.raises(ValueError, match="identity channel"):
+        dense_engine.mpo_gathers(bad)
+
+
+@pytest.mark.parametrize("layout", ["sector", "dense"])
+@pytest.mark.parametrize("trial_kind", ["sz", "number", "sd"])
+def test_mpo_gather_contraction_equals_the_einsum_one(model, trial_kind, layout):
+    """The MPO's gathers (the default DeviceData.htrial) against its site tensors (TROT_MPO_KERNEL=einsum) on truncated
+    dense walkers: the local energies through the kernels, and per walker mpo_contract's overlap and numerator against
+    left_contract and mpo_numerator, for the trial in sector blocks or as full matrices."""
+    plan = make_dense_walker_plan(*model.reference, model.plans["exact"].orbital_plans,
+                                  dc.DenseSpec(CHI_TRUNC, trial=layout), walker_qr="native")
+    ctx = build_mps_meas_ctx(model.ham, model.trials[trial_kind], plan=plan, kernel="mpo")
+    data = ctx.data()
+    assert all(isinstance(g, dense_engine.MpoGather) for g in data.htrial)
+    tensors = data._replace(htrial=tuple(jnp.asarray(W) for W in _site_tensors(model)))
+    ca, cb = _batch(model)
+    energies = jax.jit(ctx.kernels.energies)
+    np.testing.assert_allclose(np.asarray(energies(ca, cb, data)), np.asarray(energies(ca, cb, tensors)), rtol=1e-9)
+    convert, layout = dense_engine.dense_converter(plan, signed=True), ctx.kernels.overlap_plan.layout
+
+    @jax.jit
+    def both(a, b, data, tensors):
+        alpha, beta, signs, _ = convert(qr_with_det(a)[0], qr_with_det(b)[0])
+        dressed = [dense_engine._dressed(B, s) for B, s in zip(beta, signs)]
+        return (dense_engine.mpo_contract(alpha, beta, signs, data.trial, data.htrial, layout),
+                (dense_engine.left_contract(alpha, dressed, data.trial, layout),
+                 dense_engine.mpo_numerator(alpha, dressed, data.trial, tensors.htrial, layout)))
+
+    pairs = [both(a, b, data, tensors) for a, b in zip(ca, cb)]  # ((overlap, numerator), (references))
+    got, want = (np.array([[float(x) for x in pair[k]] for pair in pairs]).T for k in (0, 1))
+    _assert_trees_close(list(got), list(want), rtol=1e-10)
+
+
+def test_mpo_kernel_switch(model, monkeypatch):
+    """TROT_MPO_KERNEL=einsum (dense_engine.MPO_KERNEL) puts the site tensors in the context, with the same energies;
+    another value is refused."""
+    plan = make_dense_walker_plan(*model.reference, model.plans["exact"].orbital_plans, dc.DenseSpec(CHI_TRUNC),
+                                  walker_qr="native")
+    trial = model.trials["number"]
+    ca, cb = _batch(model)
+    gathered = build_mps_meas_ctx(model.ham, trial, plan=plan, kernel="mpo")
+    monkeypatch.setattr(dense_engine, "MPO_KERNEL", "einsum")
+    einsum = build_mps_meas_ctx(model.ham, trial, plan=plan, kernel="mpo")
+    assert [W.shape for W in einsum.h_blocks] == [W.shape for W in _site_tensors(model)]
+    energies = jax.jit(gathered.kernels.energies)
+    want = np.asarray(energies(ca, cb, einsum.data()))
+    np.testing.assert_allclose(np.asarray(energies(ca, cb, gathered.data())), want, rtol=1e-9)
+    monkeypatch.setattr(dense_engine, "MPO_KERNEL", "dense")
+    with pytest.raises(ValueError, match="TROT_MPO_KERNEL"):
+        build_mps_meas_ctx(model.ham, trial, plan=plan, kernel="mpo")
+
+
+def test_mpo_kernel_needs_a_dense_plan(model):
+    """energy_kernel="mpo" on a sector plan has nothing to contract with; the stored-H|trial> kernels are not offered
+    by a dense plan."""
     trial = model.trials["sz"]
     with pytest.raises(ValueError, match="dense walker plan"):
         build_mps_meas_ctx(model.ham, trial, plan=model.plans["exact"], kernel="mpo")
     plan = make_dense_walker_plan(*model.reference, model.plans["exact"].orbital_plans, dc.DenseSpec(8),
                                   walker_qr="native")
-    ctx = build_mps_meas_ctx(model.ham, trial, plan=plan, kernel="mpo")
-    with pytest.raises(NotImplementedError, match="sector measurement plan"):
-        szsz_fns(ctx)
     with pytest.raises(ValueError, match="measures its energy through the MPO"):
         engine.kernels_for(plan, trial.charges, energy="blocked")
+
+
+@pytest.mark.parametrize("trial_kind", ["sz", "number"])
+def test_dense_szsz_equals_the_sector_engines_at_an_exact_bond(model, trial_kind):
+    """szsz_fns on a dense walker plan (dense_engine.szsz_contract: a stack of environments on the dense legs, the trial
+    as sector blocks or as full matrices) equals the sector engine's szsz on the exact plan, through the batch and
+    the one-walker kernels. Every walker has definite N_up and N_dn, so the sum over all pairs is
+    <S^z_total^2> = ((N_up - N_dn) / 2)^2 = 0, whatever the trial."""
+    ca, cb = _batch(model)
+    sector = _ctx(model, "exact", trial_kind)
+    want = np.asarray(jax.jit(szsz_fns(sector).batch)(ca, cb, sector.data()))
+    trial = model.trials[trial_kind]
+    for layout in ("sector", "dense"):
+        plan = make_dense_walker_plan(*model.reference, model.plans["exact"].orbital_plans,
+                                      dc.DenseSpec(64, trial=layout), walker_qr="native")
+        ctx = build_mps_meas_ctx(model.ham, trial, plan=plan, kernel="mpo")
+        fns = szsz_fns(ctx)
+        got = np.asarray(jax.jit(fns.batch)(ca, cb, ctx.data()))
+        assert got.shape == want.shape == (len(ca), L, L)
+        np.testing.assert_allclose(got, want, rtol=1e-8, atol=1e-10)
+        np.testing.assert_allclose(got, np.swapaxes(got, 1, 2), rtol=0, atol=1e-12)
+        np.testing.assert_allclose(got.sum(axis=(1, 2)), 0.0, atol=1e-9 * np.abs(got).max())
+        one = jax.jit(fns.one)
+        np.testing.assert_allclose(np.asarray(one(ca[0], cb[0], ctx.data())), got[0], rtol=1e-9, atol=1e-12)
+
+
+@pytest.mark.parametrize("group", [1, 2])
+def test_dense_szsz_moving_the_stack_in_groups_equals_all_at_once(model, group):
+    """szsz_contract's `group` (the stack members one site step moves at a time, a lax.map over the groups plus a
+    remainder) bounds the intermediates only: the same matrices as moving each whole stack at once. On 8 sites the left
+    and the right stacks meet at bond 4 and each moves 1..3 members, so group 1 is all lax.map and group 2 gives a
+    remainder alone (1 member), one group (2) and a group with a remainder (3), in both directions."""
+    plan = make_dense_walker_plan(*model.reference, model.plans["exact"].orbital_plans, dc.DenseSpec(CHI_TRUNC),
+                                  walker_qr="native")
+    ctx = build_mps_meas_ctx(model.ham, model.trials["number"], plan=plan, kernel="mpo")
+    ca, cb = _batch(model)
+    qa, _ = ctx.kernels.batch_qr(jnp.asarray(ca))
+    qb, _ = ctx.kernels.batch_qr(jnp.asarray(cb))
+    convert, layout = dense_engine.dense_converter(plan), ctx.kernels.overlap_plan.layout
+    trial_blocks = ctx.data().trial
+
+    def matrices(g):
+        def one(a, b):
+            alpha, dressed, _ = convert(a, b)
+            return dense_engine.szsz_contract(alpha, dressed, trial_blocks, layout, group=g)
+        return np.asarray(jax.jit(jax.vmap(one))(qa, qb))
+
+    whole = matrices(L)
+    assert np.abs(whole).max() > 1e-3  # not a vacuous comparison
+    np.testing.assert_allclose(matrices(group), whole, rtol=1e-11, atol=1e-13)
+
+
+@pytest.mark.parametrize("trial_kind", ["sz", "number", "sd"])
+def test_dense_szsz_with_a_capped_bond_equals_the_explicit_contraction(model, trial_kind):
+    """With the bond capped, the dense szsz is that of the converted walkers: the d=4 MPS of the dense converter
+    (combine_channels, its labels) against the dense trial through engine.szsz_dense, independent of the stack on the
+    dense legs and of the sector layout. The converted walkers keep definite (N_up, N_dn), so the sum rule holds too."""
+    plan = make_dense_walker_plan(*model.reference, model.plans["exact"].orbital_plans, dc.DenseSpec(CHI_TRUNC),
+                                  walker_qr="native")
+    trial = model.trials[trial_kind]
+    ctx = build_mps_meas_ctx(model.ham, trial, plan=plan, kernel="mpo")
+    ca, cb = _batch(model)
+    got = np.asarray(jax.jit(szsz_fns(ctx).batch)(ca, cb, ctx.data()))
+    trial_np = [jnp.asarray(A) for A in trial.tensors]
+    converters = [jax.jit(dc.make_dense_converter(p, CHI_TRUNC, "gram", snap=True).convert)
+                  for p in plan.orbital_plans]
+    label = lambda charges: [np.round(np.asarray(q)).astype(int) for q in charges]
+    for w, (a, b) in enumerate(zip(ca, cb)):
+        qa, _ = qr_with_det(jnp.asarray(a))
+        qb, _ = qr_with_det(jnp.asarray(b))
+        alpha, charges_a, _ = converters[0](qa)
+        beta, charges_b, _ = converters[1](qb)
+        tensors, _ = gmps_utils.combine_channels(alpha, label(charges_a), beta, label(charges_b))
+        np.testing.assert_allclose(got[w], np.asarray(engine.szsz_dense(tensors, trial_np)), rtol=1e-9, atol=1e-12)
+    np.testing.assert_allclose(got.sum(axis=(1, 2)), 0.0, atol=1e-8 * np.abs(got).max())
+
+
+def _signed_walker(model, layout, trial_kind="number", chi=CHI_TRUNC):
+    """(plan, context, the signed converter, the trial layout) of a dense plan with the MPO energy."""
+    plan = make_dense_walker_plan(*model.reference, model.plans["exact"].orbital_plans,
+                                  dc.DenseSpec(chi, trial=layout), walker_qr="native")
+    ctx = build_mps_meas_ctx(model.ham, model.trials[trial_kind], plan=plan, kernel="mpo")
+    return plan, ctx, dense_engine.dense_converter(plan, signed=True), ctx.kernels.overlap_plan.layout
+
+
+@pytest.mark.parametrize("layout", ["sector", "dense"])
+def test_szsz_transfers_equal_the_p_resolved_steps(model, layout):
+    """_left_transfer / _right_transfer (the sign on the intermediate, the physical index summed with weights, a member
+    axis) against _forward / _backward (the dressed beta tensor, the physical index kept) on random environments at
+    every site, with szsz_gemm's weights 1, S^z, (S^z)^2."""
+    _, ctx, convert, trial_layout = _signed_walker(model, layout)
+    ca, cb = _batch(model)
+    alpha, beta, signs, _ = convert(qr_with_det(jnp.asarray(ca[1]))[0], qr_with_det(jnp.asarray(cb[1]))[0])
+    trial, weights = ctx.data().trial, jnp.asarray(dense_engine.SZ_WEIGHTS)
+    rng = np.random.default_rng(5)
+    for A, B, s, T, site in zip(alpha, beta, signs, trial, dense_engine._sites(trial_layout, L)):
+        Bs = dense_engine._dressed(B, s)
+        if site is None:  # the full matrices (Dl, 4 Dr)
+            dl, dr = T[0].shape[0], T[0].shape[1] // 4
+        else:
+            dl, dr = sum(site.left_widths), sum(site.right_widths)
+        E = jnp.asarray(rng.standard_normal((A.shape[0], B.shape[0], 2, dl)))
+        R = jnp.asarray(rng.standard_normal((B.shape[2], A.shape[2], 2, dr)))  # (b', a', k, t'): beta first
+        got_left = dense_engine._left_transfer(E, T, A, B, s, weights, site)  # (a', b', 2 x 3, t')
+        got_right = dense_engine._right_transfer(R, T, A, B, s, weights, site)  # (b, a, 2 x 3, t)
+        want_left, want_right = [], []
+        for m in range(2):
+            Y = dense_engine._forward(E[:, :, m], T, A, Bs, site)  # (a', b', p, t')
+            X = dense_engine._backward(R[:, :, m].transpose(1, 0, 2), T, A, Bs, site)  # (a, b, p, t)
+            want_left += [jnp.einsum("cdpt,p->cdt", Y, weights[w]) for w in range(3)]
+            want_right += [jnp.einsum("abpt,p->bat", X, weights[w]) for w in range(3)]
+        _assert_trees_close([got_left[:, :, j] for j in range(6)], want_left, rtol=1e-12)
+        _assert_trees_close([got_right[:, :, j] for j in range(6)], want_right, rtol=1e-12)
+
+
+@pytest.mark.parametrize("layout", ["sector", "dense"])
+@pytest.mark.parametrize("trial_kind", ["sz", "number", "sd"])
+def test_szsz_gemm_equals_szsz_contract(model, trial_kind, layout):
+    """szsz_gemm (the stacks moved without the physical index, the S^z of a pair's second site in a per-site
+    environment) equals szsz_contract on the same converted walkers: (N_up, N_dn) labels, particle-number labels and a
+    determinant, the trial in sector blocks or as full matrices, the bond capped."""
+    _, ctx, convert, trial_layout = _signed_walker(model, layout, trial_kind)
+    ca, cb = _batch(model)
+    qa, _ = ctx.kernels.batch_qr(jnp.asarray(ca))
+    qb, _ = ctx.kernels.batch_qr(jnp.asarray(cb))
+    trial = ctx.data().trial
+
+    def both(a, b):
+        alpha, beta, signs, _ = convert(a, b)
+        dressed = [dense_engine._dressed(B, s) for B, s in zip(beta, signs)]
+        return (dense_engine.szsz_gemm(alpha, beta, signs, trial, trial_layout),
+                dense_engine.szsz_contract(alpha, dressed, trial, trial_layout))
+
+    got, want = (np.asarray(x) for x in jax.jit(jax.vmap(both))(qa, qb))
+    assert np.abs(want).max() > 1e-3  # not a vacuous comparison
+    np.testing.assert_allclose(got, want, rtol=1e-10, atol=1e-12 * np.abs(want).max())
+
+
+@pytest.mark.parametrize("group", [1, 2])
+def test_szsz_gemm_moving_the_stack_in_groups_equals_all_at_once(model, group):
+    """szsz_gemm's `group` (_move_members: a lax.map over the groups plus a remainder) bounds the intermediates only,
+    as for szsz_contract: on 8 sites each stack moves 1..3 members, so group 1 is all lax.map and group 2 covers a
+    remainder alone, one group and a group with a remainder, in both directions."""
+    _, ctx, convert, trial_layout = _signed_walker(model, "sector")
+    ca, cb = _batch(model)
+    qa, _ = ctx.kernels.batch_qr(jnp.asarray(ca))
+    qb, _ = ctx.kernels.batch_qr(jnp.asarray(cb))
+    trial = ctx.data().trial
+
+    def matrices(g):
+        def one(a, b):
+            alpha, beta, signs, _ = convert(a, b)
+            return dense_engine.szsz_gemm(alpha, beta, signs, trial, trial_layout, group=g)
+        return np.asarray(jax.jit(jax.vmap(one))(qa, qb))
+
+    whole = matrices(L)
+    assert np.abs(whole).max() > 1e-3
+    np.testing.assert_allclose(matrices(group), whole, rtol=1e-11, atol=1e-13)
+
+
+def test_fused_measurement_equals_the_separate_kernels(model, monkeypatch):
+    """fused_measurement (one conversion per walker for the energy and szsz) gives kernels.energies and szsz_fns' batch;
+    it is not offered without observables, for the MPO's site tensors (TROT_MPO_KERNEL=einsum), for szsz_contract
+    (TROT_SZSZ_KERNEL=einsum) or for a sector plan."""
+    _, ctx, _, _ = _signed_walker(model, "sector")
+    data = ctx.data()
+    ca, cb = _batch(model)
+    fused = fused_measurement(ctx, ("szsz",), data)
+    energies, szsz = (np.asarray(x) for x in jax.jit(fused)(ca, cb, data))
+    np.testing.assert_allclose(energies, np.asarray(jax.jit(ctx.kernels.energies)(ca, cb, data)), rtol=1e-12)
+    want = np.asarray(jax.jit(szsz_fns(ctx).batch)(ca, cb, data))
+    np.testing.assert_allclose(szsz, want, rtol=1e-12, atol=1e-14 * np.abs(want).max())
+    assert fused_measurement(ctx, (), data) is None
+    tensors = data._replace(htrial=tuple(jnp.asarray(W) for W in _site_tensors(model)))
+    assert fused_measurement(ctx, ("szsz",), tensors) is None
+    sector = _ctx(model, "exact", "sz")
+    assert fused_measurement(sector, ("szsz",), sector.data()) is None
+    monkeypatch.setattr(dense_engine, "SZSZ_KERNEL", "einsum")
+    assert fused_measurement(ctx, ("szsz",), data) is None
+
+
+@pytest.mark.parametrize("convert_chunk, barrier", [(0, True), (2, False), (4, True)])
+def test_fused_measurement_converting_first_in_chunks_or_behind_a_barrier(model, monkeypatch, convert_chunk, barrier):
+    """FusedMeasurement.chunked in 3 measurement chunks, with the walkers converted first in 3 or 2 chunks
+    (TROT_MEASURE_CONVERT_CHUNK 2, 4) or in each measurement chunk behind the barrier (TROT_MEASURE_BARRIER), gives the
+    fused measurement of all walkers at once."""
+    _, ctx, _, _ = _signed_walker(model, "sector")
+    data = ctx.data()
+    ca, cb = _batch(model)
+    fused = fused_measurement(ctx, ("szsz",), data)
+    want = jax.jit(fused)(ca, cb, data)
+    monkeypatch.setattr(engine, "MEASURE_CONVERT_CHUNK", convert_chunk)
+    monkeypatch.setattr(engine, "MEASURE_BARRIER", barrier)
+    if convert_chunk:
+        assert engine.convert_chunks(len(ca)) == -(-len(ca) // convert_chunk)
+    got = jax.jit(lambda a, b, d: fused.chunked(a, b, d, 3))(ca, cb, data)
+    assert np.abs(np.asarray(want[1])).max() > 1e-3
+    _assert_trees_close(got, want, rtol=1e-12)
+
+
+def _require_cublas_on_gpu():
+    """TROT_TRIAL_GEMM=cublas runs its products through the custom call on a GPU (which needs the built library) and
+    through XLA's GEMMs elsewhere."""
+    if jax.default_backend() == "gpu" and not grouped_gemm.cublas_available():
+        pytest.skip(f"needs the cuBLAS library {grouped_gemm.CUBLAS_LIB} (sbatch trot/gmps/cublas_ext/build.sh)")
+
+
+@pytest.mark.parametrize("mode", ["fused", "blocked", "cublas"])
+@pytest.mark.parametrize("trial_kind", ["number", "sd"])
+def test_fused_site_steps_equal_the_dense_ones(model, monkeypatch, trial_kind, mode):
+    """grouped_gemm.fused_trial_apply inside the site steps (TROT_TRIAL_GEMM=fused: the MPO gather or szsz's weights,
+    the sign and the walker GEMMs' layout done by the trial GEMM's kernel; blocked: also the walker GEMMs on label
+    blocks, contract_left / contract_right, the intermediates never zero-filled; cublas: blocked with the trial GEMM's
+    products from sector_products and the rest from products_fused_apply) gives the dense steps' outputs at every site
+    of a truncated converted walker: _forward_mpo_gather on the MPO environments, _left_transfer on two-member stacks
+    of the overlap's left environments and _right_transfer on two-member stacks of szsz's right environments, with the
+    weights 1, S^z, (S^z)^2."""
+    if mode == "cublas":
+        _require_cublas_on_gpu()
+        monkeypatch.setattr(dense_engine, "TRIAL_GEMM", "cublas")  # the fused kernel's GEMM, chosen when traced
+    plan = make_dense_walker_plan(*model.reference, model.plans["exact"].orbital_plans,
+                                  dc.DenseSpec(CHI_TRUNC, trial="sector"), walker_qr="native")
+    ctx = build_mps_meas_ctx(model.ham, model.trials[trial_kind], plan=plan, kernel="mpo")
+    data, layout = ctx.data(), ctx.kernels.overlap_plan.layout
+    ca, cb = _batch(model, mix=False)
+    convert = dense_engine.dense_converter(plan, labelled=True)
+    alpha, beta, signs, _, (qa, qb) = convert(qr_with_det(jnp.asarray(ca[1]))[0], qr_with_det(jnp.asarray(cb[1]))[0])
+    dressed = [dense_engine._dressed(B, s) for B, s in zip(beta, signs)]
+    forward = grouped_gemm.layout_specs(layout, "forward", fused=True)
+    backward = grouped_gemm.layout_specs(layout, "backward", fused=True)
+    offsets = grouped_gemm.mpo_channel_offsets(data.htrial)
+    weights, n = jnp.asarray(dense_engine.SZ_WEIGHTS), len(layout.sites)
+
+    def close(got, want):
+        want = np.asarray(want)
+        np.testing.assert_allclose(np.asarray(got), want, rtol=1e-12, atol=1e-12 * np.abs(want).max(initial=0.0))
+
+    def rows(first, second, spec, channels, next_rows):  # the site functions' grouped argument
+        return (first, second, spec, channels, 2 * n + 1) + (tuple(next_rows) if mode != "fused" else ())
+
+    E_mpo, E_overlap = jnp.ones((1, 1, 1, 1)), jnp.ones((1, 1, 1))
+    for i, site in enumerate(layout.sites):
+        T, G = data.trial[i], data.htrial[i]
+        close(dense_engine._forward_mpo_gather(E_mpo, T, alpha[i], beta[i], signs[i], G, site,
+                                               grouped=rows(qa[i], qb[i], forward[i], offsets[i],
+                                                            (qa[i + 1], qb[i + 1]))),
+              dense_engine._forward_mpo_gather(E_mpo, T, alpha[i], beta[i], signs[i], G, site))
+        stack = jnp.stack([E_overlap, 0.5 * E_overlap], axis=2)  # (a, b, member, t)
+        close(dense_engine._left_transfer(stack, T, alpha[i], beta[i], signs[i], weights, site,
+                                          rows(qa[i], qb[i], forward[i], None, (qa[i + 1], qb[i + 1]))),
+              dense_engine._left_transfer(stack, T, alpha[i], beta[i], signs[i], weights, site))
+        E_mpo = dense_engine._forward_mpo_gather(E_mpo, T, alpha[i], beta[i], signs[i], G, site)
+        E_overlap = dense_engine._forward(E_overlap, T, alpha[i], dressed[i], site).sum(axis=2)
+    right = jnp.ones((1, 1, 1, 1))  # (b, a, member, t), as szsz_gemm keeps them
+    for i in reversed(range(n)):
+        site, T = layout.sites[i], data.trial[i]
+        stack = jnp.concatenate([right, 0.5 * right], axis=2)
+        close(dense_engine._right_transfer(stack, T, alpha[i], beta[i], signs[i], weights, site,
+                                           rows(qb[i + 1], qa[i + 1], backward[i], None, (qb[i], qa[i]))),
+              dense_engine._right_transfer(stack, T, alpha[i], beta[i], signs[i], weights, site))
+        right = dense_engine._right_transfer(right, T, alpha[i], beta[i], signs[i], weights[:1], site)
+
+
+@pytest.mark.parametrize("trial_kind", ["number", "sd"])
+def test_cublas_fused_apply_equals_the_fused_kernel(model, trial_kind):
+    """grouped_gemm.cublas_fused_apply (the rows sorted by sector, their products with their sectors' blocks by
+    sector_products, then products_fused_apply) returns fused_trial_apply's whole zero-filled output at every site of a
+    converted walker: the MPO energy's terms with the sign and the channel offsets in and out (layout left), szsz's
+    weights on two-member left stacks (left, signed) and on right stacks (layout right, unsigned). On a GPU the
+    products come from the cuBLAS custom call (skipped without its library), elsewhere from XLA's GEMMs."""
+    _require_cublas_on_gpu()
+    plan = make_dense_walker_plan(*model.reference, model.plans["exact"].orbital_plans,
+                                  dc.DenseSpec(CHI_TRUNC, trial="sector"), walker_qr="native")
+    ctx = build_mps_meas_ctx(model.ham, model.trials[trial_kind], plan=plan, kernel="mpo")
+    data, layout = ctx.data(), ctx.kernels.overlap_plan.layout
+    ca, cb = _batch(model, mix=False)
+    convert = dense_engine.dense_converter(plan, labelled=True)
+    alpha, beta, signs, _, (qa, qb) = convert(qr_with_det(jnp.asarray(ca[1]))[0], qr_with_det(jnp.asarray(cb[1]))[0])
+    dressed = [dense_engine._dressed(B, s) for B, s in zip(beta, signs)]
+    forward = grouped_gemm.layout_specs(layout, "forward", fused=True)
+    backward = grouped_gemm.layout_specs(layout, "backward", fused=True)
+    offsets = grouped_gemm.mpo_channel_offsets(data.htrial)
+    weights, n = jnp.asarray(dense_engine.SZ_WEIGHTS), len(layout.sites)
+    members = grouped_gemm.weight_terms(2, weights)
+
+    def check(X, *args, **kwargs):
+        want = np.asarray(grouped_gemm.fused_trial_apply(X.reshape(-1, X.shape[-1]), *args, **kwargs))
+        got = np.asarray(grouped_gemm.cublas_fused_apply(X.reshape(-1, X.shape[-1]), *args, **kwargs))
+        np.testing.assert_allclose(got, want, rtol=1e-12, atol=1e-12 * np.abs(want).max(initial=0.0))
+
+    E_mpo, E_overlap = jnp.ones((1, 1, 1, 1)), jnp.ones((1, 1, 1))
+    for i, site in enumerate(layout.sites):
+        T, G = data.trial[i], data.htrial[i]
+        packed = grouped_gemm.pack_blocks(T[0])
+        check(E_mpo, qa[i], qb[i], offsets[i], grouped_gemm.mpo_terms(G), signs[i], forward[i], packed,
+              n_groups=2 * n + 1, layout="left", offsets_out=grouped_gemm.channel_offsets(G, offsets[i]))
+        check(jnp.stack([E_overlap, 0.5 * E_overlap], axis=2), qa[i], qb[i], None, members, signs[i], forward[i],
+              packed, n_groups=2 * n + 1, layout="left")
+        E_mpo = dense_engine._forward_mpo_gather(E_mpo, T, alpha[i], beta[i], signs[i], G, site)
+        E_overlap = dense_engine._forward(E_overlap, T, alpha[i], dressed[i], site).sum(axis=2)
+    right = jnp.ones((1, 1, 1, 1))  # (b, a, member, t)
+    for i in reversed(range(n)):
+        site, T = layout.sites[i], data.trial[i]
+        check(jnp.concatenate([right, 0.5 * right], axis=2), qb[i + 1], qa[i + 1], None, members, None, backward[i],
+              grouped_gemm.pack_blocks(T[1]), n_groups=2 * n + 1, layout="right")
+        right = dense_engine._right_transfer(right, T, alpha[i], beta[i], signs[i], weights[:1], site)
+
+
+@pytest.mark.parametrize("trial_kind", ["number", "sd"])
+def test_blocked_propagation_sites_equal_the_dense_ones(model, trial_kind):
+    """The propagation's site steps with TROT_PROP_GEMM=blocked's arguments (the unit fused kernel and the walker
+    einsums on label blocks) give _forward's and _backward's dense outputs at every site of a converted walker: the
+    left environments of the overlap sweep and the right environments of right_environments."""
+    plan, kernels, data = _dense_kernels(model, CHI_TRUNC, trial_kind)
+    layout, n = kernels.overlap_plan.layout, L
+    ca, cb = _batch(model, mix=False)
+    alpha, beta, signs, _, labels = dense_engine.dense_converter(plan, labelled=True)(
+        qr_with_det(jnp.asarray(ca[1]))[0], qr_with_det(jnp.asarray(cb[1]))[0])
+    dressed = [dense_engine._dressed(B, s) for B, s in zip(beta, signs)]
+    forward = grouped_gemm.layout_specs(layout, "forward", fused=True)
+    backward = grouped_gemm.layout_specs(layout, "backward", fused=True)
+
+    def close(got, want):
+        want = np.asarray(want)
+        np.testing.assert_allclose(np.asarray(got), want, rtol=1e-12, atol=1e-12 * np.abs(want).max(initial=0.0))
+
+    left = jnp.ones((1, 1, 1))
+    for i, site in enumerate(layout.sites):
+        T = data.trial[i]
+        want = dense_engine._forward(left, T, alpha[i], dressed[i], site)
+        close(dense_engine._forward(left, T, alpha[i], dressed[i], site,
+                                    (labels[0][i], labels[1][i], forward[i], labels[0][i + 1], labels[1][i + 1],
+                                     2 * n + 1)), want)
+        left = want.sum(axis=2)
+    right = jnp.ones((1, 1, 1))
+    for i in reversed(range(n)):
+        site, T = layout.sites[i], data.trial[i]
+        want = dense_engine._backward(right, T, alpha[i], dressed[i], site)
+        close(dense_engine._backward(right, T, alpha[i], dressed[i], site,
+                                     (labels[0][i + 1], labels[1][i + 1], backward[i], labels[0][i], labels[1][i],
+                                      2 * n + 1)), want)
+        right = want.sum(axis=2)
+
+
+@pytest.mark.parametrize("trial_kind", ["number", "sd"])
+def test_grouped_walker_first_right_environments_equal_the_dense_ones(model, trial_kind):
+    """_backward_summed with the grouped argument (the labels of the left bond's (a, b) and the site's SummedSpec:
+    summed_trial_apply, each row through the left sector of n_a + n_b, X read in place) gives the dense walker-first
+    step at every site of a converted walker's right environments, and under vmap over walkers (pooled) each walker's
+    own environments."""
+    plan, kernels, data = _dense_kernels(model, CHI_TRUNC, trial_kind)
+    layout = kernels.overlap_plan.layout
+    summed = grouped_gemm.layout_specs(layout, "summed")
+    convert = dense_engine.dense_converter(plan, labelled=True)
+    ca, cb = _batch(model, mix=False)
+
+    def environments(qa, qb, grouped):
+        alpha, beta, signs, _, labels = convert(qa, qb)
+        dressed = [dense_engine._dressed(B, s) for B, s in zip(beta, signs)]
+        right = [jnp.ones((1, 1, 1))]
+        for i in reversed(range(L)):
+            rows = (labels[0][i], labels[1][i], summed[i]) if grouped else None
+            right.append(dense_engine._backward_summed(right[-1], data.trial[i], alpha[i], dressed[i],
+                                                       layout.sites[i], rows))
+        return right[::-1]
+
+    qa = jnp.stack([qr_with_det(jnp.asarray(c))[0] for c in ca])
+    qb = jnp.stack([qr_with_det(jnp.asarray(c))[0] for c in cb])
+    _assert_trees_close(environments(qa[1], qb[1], True), environments(qa[1], qb[1], False), rtol=1e-12)
+    _assert_trees_close(jax.vmap(lambda a, b: environments(a, b, True))(qa, qb),
+                        jax.vmap(lambda a, b: environments(a, b, False))(qa, qb), rtol=1e-12)
+
+
+PROP_CASES = [("grouped", "walker"), ("grouped", "trial"), ("envs", "walker"), ("envs", "trial"), ("blocked", "walker")]
+
+
+@pytest.mark.parametrize("mode, right_envs", PROP_CASES, ids=[f"{m}-{r}" for m, r in PROP_CASES])
+@pytest.mark.parametrize("trial_kind", ["number", "sd"])
+def test_grouped_propagation_gives_the_dense_steps(model, monkeypatch, trial_kind, mode, right_envs):
+    """TROT_PROP_GEMM=grouped (the right environments, walker-first through summed_trial_apply or trial-first per
+    TROT_RIGHT_ENVS, and the field sweep, their trial GEMMs on the rows that can be nonzero, the walkers pooled), envs
+    (the right environments only) and blocked (also the walker einsums on label blocks, the intermediates never
+    zero-filled) give the dense step's walkers, overlaps before and after the fields, weight factors and nodes, with
+    the HS sweep and without, against the dense step with the same TROT_RIGHT_ENVS; each flag on its own plan, so
+    nothing traced with the other is reused. Another value of the flag is refused."""
+    monkeypatch.setattr(dense_engine, "RIGHT_ENVS", right_envs)
+    ca, cb = _batch(model)
+    randoms = jax.random.uniform(jax.random.PRNGKey(3), (len(ca), L))
+    _, kernels, data = _dense_kernels(model, CHI_TRUNC, trial_kind)
+    step = jax.jit(kernels.step_batch, static_argnums=(3,))
+    want = {sweep: step(ca, cb, randoms, sweep, data, 1e-8) for sweep in (True, False)}
+    monkeypatch.setattr(dense_engine, "PROP_GEMM", mode)
+    _, grouped, data = _dense_kernels(model, CHI_TRUNC, trial_kind)
+    step = jax.jit(grouped.step_batch, static_argnums=(3,))
+    for sweep in (True, False):
+        _assert_trees_close(step(ca, cb, randoms, sweep, data, 1e-8), want[sweep], rtol=1e-12)
+    monkeypatch.setattr(dense_engine, "PROP_GEMM", "other")
+    _, other, data = _dense_kernels(model, CHI_TRUNC, trial_kind)
+    with pytest.raises(ValueError, match="TROT_PROP_GEMM"):
+        other.step_batch(ca, cb, randoms, True, data, 1e-8)
+
+
+@pytest.mark.parametrize("mode", ["grouped", "fused", "blocked", "cublas"])
+def test_grouped_trial_gemms_give_the_dense_measurement(model, monkeypatch, mode):
+    """TROT_TRIAL_GEMM=grouped (the energy's and szsz's trial GEMMs on the rows that can be nonzero, grouped_gemm),
+    fused (those GEMMs fused with what follows them), blocked (the walker GEMMs on label blocks too; the energy's
+    environments not zero-filled but at the last site) and cublas (blocked with the trial GEMM's products by sector,
+    sector_products) give the dense path's local energies, szsz and fused measurement; each flag on its own plan, so
+    nothing traced with another is reused. The traced channel offsets equal mpo_channel_offsets', and another value of
+    the flag is refused."""
+    if mode == "cublas":
+        _require_cublas_on_gpu()
+    _, ctx, _, _ = _signed_walker(model, "sector")
+    data = ctx.data()
+    ca, cb = _batch(model)
+    want_energies = np.asarray(jax.jit(ctx.kernels.energies)(ca, cb, data))
+    want_szsz = np.asarray(jax.jit(szsz_fns(ctx).batch)(ca, cb, data))
+    want_fused = jax.jit(fused_measurement(ctx, ("szsz",), data))(ca, cb, data)
+    monkeypatch.setattr(dense_engine, "TRIAL_GEMM", mode)
+    _, grouped, _, _ = _signed_walker(model, "sector")
+    data = grouped.data()
+    np.testing.assert_allclose(np.asarray(jax.jit(grouped.kernels.energies)(ca, cb, data)), want_energies, rtol=1e-12)
+    np.testing.assert_allclose(np.asarray(jax.jit(szsz_fns(grouped).batch)(ca, cb, data)), want_szsz, rtol=1e-12,
+                               atol=1e-14 * np.abs(want_szsz).max())
+    _assert_trees_close(jax.jit(fused_measurement(grouped, ("szsz",), data))(ca, cb, data), want_fused, rtol=1e-12)
+    traced = [jnp.zeros(1, jnp.int32)]
+    for gather in data.htrial:
+        traced.append(grouped_gemm.channel_offsets(gather, traced[-1]))
+    want_offsets = grouped_gemm.mpo_channel_offsets(data.htrial)
+    assert [np.asarray(x).tolist() for x in traced] == [x.tolist() for x in want_offsets]
+    monkeypatch.setattr(dense_engine, "TRIAL_GEMM", "other")
+    _, other, _, _ = _signed_walker(model, "sector")
+    with pytest.raises(ValueError, match="TROT_TRIAL_GEMM"):
+        other.kernels.energies(ca, cb, other.data())
+
+
+@pytest.mark.parametrize("layout", ["sector", "dense"])
+@pytest.mark.parametrize("trial_kind", ["sz", "number", "sd"])
+def test_walker_first_right_environments_equal_the_trial_first_ones(model, monkeypatch, trial_kind, layout):
+    """_backward_summed (TROT_RIGHT_ENVS=walker: the walker tensors first, the sum over p inside the trial GEMM) equals
+    _backward summed over p on random environments at every site, and the dense step (right environments, overlap,
+    field sweep with the floor removing proposals) is the same with it, for the trial in sector blocks or as full
+    matrices; another value of the flag is refused."""
+    _, ctx, convert, trial_layout = _signed_walker(model, layout, trial_kind)
+    ca, cb = _batch(model)
+    alpha, beta, signs, _ = convert(qr_with_det(jnp.asarray(ca[1]))[0], qr_with_det(jnp.asarray(cb[1]))[0])
+    rng = np.random.default_rng(7)
+    for A, B, s, T, site in zip(alpha, beta, signs, ctx.data().trial, dense_engine._sites(trial_layout, L)):
+        Bs = dense_engine._dressed(B, s)
+        dr = T[0].shape[1] // 4 if site is None else sum(site.right_widths)
+        R = jnp.asarray(rng.standard_normal((A.shape[2], B.shape[2], dr)))
+        _assert_trees_close([dense_engine._backward_summed(R, T, A, Bs, site)],
+                            [dense_engine._backward(R, T, A, Bs, site).sum(axis=2)], rtol=1e-12)
+    randoms = np.random.default_rng(2).random((len(ca), L))
+    _, kernels, data = _dense_kernels(model, CHI_TRUNC, trial_kind, trial=layout)
+
+    def step():
+        return jax.jit(lambda a, b, r, d: kernels.step_batch(a, b, r, True, d, 0.5))(ca, cb, randoms, data)
+
+    monkeypatch.setattr(dense_engine, "RIGHT_ENVS", "trial")
+    want = step()
+    monkeypatch.setattr(dense_engine, "RIGHT_ENVS", "walker")
+    _assert_trees_close(step(), want, rtol=1e-10)
+    monkeypatch.setattr(dense_engine, "RIGHT_ENVS", "both")
+    with pytest.raises(ValueError, match="TROT_RIGHT_ENVS"):
+        step()
+
+
+def _gathered_operator(gather, dw, trial_side):
+    """The operator (w, p, q, v) a site's gather table applies, w and v in the gathers' channel order: an output
+    (x, v) from the source column 4 w + y is (p, q) = (x, y) for the trial side, (y, x) for the walker side."""
+    n1 = gather.single_src.shape[-1]
+    out = np.zeros((dw, 4, 4, n1 + gather.multi_src.shape[-1]))
+    for src, coef, shift in ((gather.single_src[None], gather.single_coef[None], 0),
+                             (gather.multi_src, gather.multi_coef, n1)):
+        src, coef = np.asarray(src), np.asarray(coef)
+        for t, x, j in np.argwhere(coef != 0):
+            w, y = divmod(int(src[t, x, j]), 4)
+            p, q = (x, y) if trial_side else (y, x)
+            out[w, p, q, shift + j] += coef[t, x, j]
+    return out
+
+
+def test_walker_side_mpo_gathers_apply_the_same_operator_in_the_same_channel_order(model):
+    """mpo_gathers(side="walker"): per site the same single and multi channels (so the environments of both kernels
+    are the same arrays) and the same operator W[w, p, q, v] as the trial-side tables, every term once; a wrong side is
+    refused."""
+    mpo = _site_tensors(model)
+    trial_side = dense_engine.mpo_gathers(mpo, device=False)
+    walker_side = dense_engine.mpo_gathers(mpo, device=False, side="walker")
+    for W, g, h in zip(mpo, trial_side, walker_side):
+        assert isinstance(h, dense_engine.WalkerMpoGather) and dense_engine.is_mpo_gather(h)
+        assert h.single_src.shape == g.single_src.shape and h.multi_src.shape[1:] == g.multi_src.shape[1:]
+        np.testing.assert_array_equal(_gathered_operator(h, W.shape[0], False),
+                                      _gathered_operator(g, W.shape[0], True))
+        assert np.count_nonzero(h.single_coef) + np.count_nonzero(h.multi_coef) == \
+            np.count_nonzero(g.single_coef) + np.count_nonzero(g.multi_coef)
+    with pytest.raises(ValueError, match="side"):
+        dense_engine.mpo_gathers(mpo, side="both")
+
+
+@pytest.mark.parametrize("layout", ["sector", "dense"])
+@pytest.mark.parametrize("trial_kind", ["sz", "number", "sd"])
+def test_walker_first_mpo_contraction_equals_the_trial_first_one(model, monkeypatch, trial_kind, layout):
+    """TROT_MPO_KERNEL=walker (walker-side gathers in the context, _forward_mpo_walker) gives the default gathers' local
+    energies, and per truncated walker mpo_contract's overlap and numerator, for the trial in sector blocks or as full
+    matrices."""
+    plan = make_dense_walker_plan(*model.reference, model.plans["exact"].orbital_plans,
+                                  dc.DenseSpec(CHI_TRUNC, trial=layout), walker_qr="native")
+    trial = model.trials[trial_kind]
+    gathered = build_mps_meas_ctx(model.ham, trial, plan=plan, kernel="mpo")
+    monkeypatch.setattr(dense_engine, "MPO_KERNEL", "walker")
+    walker = build_mps_meas_ctx(model.ham, trial, plan=plan, kernel="mpo")
+    assert all(isinstance(g, dense_engine.WalkerMpoGather) for g in walker.data().htrial)
+    ca, cb = _batch(model)
+    energies = jax.jit(gathered.kernels.energies)
+    want = np.asarray(energies(ca, cb, gathered.data()))
+    np.testing.assert_allclose(np.asarray(energies(ca, cb, walker.data())), want, rtol=1e-10)
+    convert, trial_layout = dense_engine.dense_converter(plan, signed=True), gathered.kernels.overlap_plan.layout
+
+    @jax.jit
+    def contract(a, b, data):
+        alpha, beta, signs, _ = convert(qr_with_det(a)[0], qr_with_det(b)[0])
+        return dense_engine.mpo_contract(alpha, beta, signs, data.trial, data.htrial, trial_layout)
+
+    for a, b in zip(ca, cb):
+        _assert_trees_close(contract(a, b, walker.data()), contract(a, b, gathered.data()), rtol=1e-10)
+
+
+def _check_grouped(X, qa, qb, offsets, sectors, spec, matrices, entries, out_widths):
+    """One trial GEMM of a real environment X (Da, Db[, Dw], Dt) with the walker's bond labels qa, qb (and the MPO
+    channels' offsets): every entry outside its row's sector (n_a + n_b [+ offset_w]) is exactly 0.0, and the grouped
+    kernel gives _trial_apply's output."""
+    X = jnp.reshape(X, (-1, X.shape[-1]))
+    n = np.rint(np.asarray(qa)).astype(int)[:, None] + np.rint(np.asarray(qb)).astype(int)[None, :]
+    if offsets is not None:
+        n = n[:, :, None] + np.asarray(offsets)[None, None, :]
+    n, Xn = n.reshape(-1), np.asarray(X)
+    inside = np.zeros(Xn.shape, bool)
+    for N, start, stop in sectors:
+        inside[n == N, start:stop] = True
+    assert np.all(Xn[~inside] == 0.0), f"{np.count_nonzero(Xn[~inside])} entries outside their row's sector"
+    g = grouped_gemm.row_sectors(jnp.asarray(qa), jnp.asarray(qb), spec, offsets)
+    want = np.asarray(dense_engine._trial_apply(X, matrices, entries, out_widths))
+    got = grouped_gemm.grouped_trial_apply(X, g, spec, grouped_gemm.pack_blocks(matrices), R=16, BK=16, BN=16)
+    np.testing.assert_allclose(np.asarray(got), want, rtol=1e-12, atol=1e-12 * np.abs(want).max(initial=0.0))
+
+
+@pytest.mark.parametrize("trial_kind", ["number", "sd"])
+def test_grouped_trial_gemm_on_converted_walkers(model, trial_kind):
+    """trot.gmps.grouped_gemm on the environments of a truncated dense walker (bond CHI_TRUNC, the trial in sector
+    blocks), at every site: the premise, an entry outside its row's sector (the walker's labels n_a + n_b, plus the
+    MPO channel's offset from mpo_channel_offsets) is exactly 0.0, and the grouped kernel (Pallas' interpreter on a
+    CPU) against _trial_apply, for the overlap's and the MPO energy's left environments (forward blocks) and the right
+    environments (backward blocks)."""
+    plan = make_dense_walker_plan(*model.reference, model.plans["exact"].orbital_plans,
+                                  dc.DenseSpec(CHI_TRUNC, trial="sector"), walker_qr="native")
+    ctx = build_mps_meas_ctx(model.ham, model.trials[trial_kind], plan=plan, kernel="mpo")
+    data, layout = ctx.data(), ctx.kernels.overlap_plan.layout
+    dense_engine.dense_converter(plan)  # builds the channel converters
+    conv_a, conv_b = plan.caches["dense_channel_converters"]
+    offsets = grouped_gemm.mpo_channel_offsets(data.htrial)
+    forward, backward = grouped_gemm.forward_specs(layout), grouped_gemm.backward_specs(layout)
+    ca, cb = _batch(model, mix=False)
+    alpha, qa, _ = conv_a.convert(qr_with_det(ca[1])[0])
+    beta, qb, _ = conv_b.convert(qr_with_det(cb[1])[0])
+    signs = [dense_engine._parity_signs(q) for q in qb[:-1]]
+    dressed = [dense_engine._dressed(B, s) for B, s in zip(beta, signs)]
+    E_overlap, E_mpo = jnp.ones((1, 1, 1)), jnp.ones((1, 1, 1, 1))
+    for i, site in enumerate(layout.sites):
+        T = data.trial[i]
+        for E, channels in ((E_overlap, None), (E_mpo, offsets[i])):
+            _check_grouped(E, qa[i], qb[i], channels, layout.sectors[i], forward[i], T[0], site.forward,
+                           site.right_widths)
+        E_overlap = dense_engine._forward(E_overlap, T, alpha[i], dressed[i], site).sum(axis=2)
+        E_mpo = dense_engine._forward_mpo_gather(E_mpo, T, alpha[i], beta[i], signs[i], data.htrial[i], site)
+    right = jnp.ones((1, 1, 1))
+    for i in reversed(range(len(layout.sites))):
+        site, T = layout.sites[i], data.trial[i]
+        _check_grouped(right, qa[i + 1], qb[i + 1], None, layout.sectors[i + 1], backward[i], T[1], site.backward,
+                       site.left_widths)
+        right = dense_engine._backward(right, T, alpha[i], dressed[i], site).sum(axis=2)
+    np.testing.assert_allclose(float(right[0, 0, 0]), float(E_overlap[0, 0, 0]), rtol=1e-10)
 
 
 def test_dense_half_steps_run_in_a_scan(model):

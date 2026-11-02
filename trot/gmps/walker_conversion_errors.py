@@ -24,7 +24,9 @@ and the infidelity needs <walker|W>.
   the host), as in the notebook.
 - 8x8 (28 per spin): 2**28 subsets per bond state, out of reach. The walkers and the trial determinants are therefore
   converted at the bond --reference-chi (default 1024; dense own Schmidt states, rank_exact gates, on the GPU), and the
-  transitions are MPS-MPS contractions against those references.
+  transitions are MPS-MPS contractions against those references. They are built one channel at a time; the walkers'
+  are kept on the host and moved to the GPU one at a time, the trial determinants' stay on the GPU. At bond 4096 an
+  8x8 reference is ~11 GB, so --mem must hold 2 x --walkers of them on top of the compiles (81.6 GB peak at 2048).
 - reference_* in the npz check that reference against exact quantities of the original walkers: the trial overlap
   (exact Slater algebra) and the local energy.
 - --reference-chi on 4x4 or 6x6 runs the reference path there too, to compare it with the exact one.
@@ -327,26 +329,53 @@ def mps_transitions(bra, ket):
     return left[0, 0], jnp.stack(density)
 
 
+def mps_overlap(bra, ket):
+    """<bra|ket> of two real d=2 MPS, lists of (Dl, 2, Dr) tensors, without their gauges (one environment alive)."""
+    left = jnp.ones((1, 1))
+    for A, Bt in zip(bra, ket):
+        left = jnp.einsum("ab,apc,bpd->cd", left, A, Bt)
+    return left[0, 0]
+
+
 fixed_bra_transitions = jax.jit(jax.vmap(mps_transitions, in_axes=(None, 0)))  # one bra, the batch of kets
-paired_transitions = jax.jit(jax.vmap(mps_transitions))  # a bra per walker
+single_transitions = jax.jit(mps_transitions)  # one pair: the reference check, a walker's reference as the ket
+pair_overlap = jax.jit(mps_overlap)  # one pair: a walker's reference against its converted channel
+
+
+def on_device(tensors):
+    return [jnp.asarray(A) for A in tensors]
 
 
 def reference_mps(Cs, plan):
-    """The dense conversion of orthonormal channels Cs (batch, L, N) at REFERENCE_CHI with the rank_exact gates of
-    `plan`: (tensors, scale, norm loss), where scale is the gauge divided by the norm, so that scale * tensors
-    approximates the normalized determinant."""
+    """The dense conversions of orthonormal channels Cs (batch, L, N) at REFERENCE_CHI with the rank_exact gates of
+    `plan`: (tensors, scale, norm loss), tensors[w] the host list of channel w's (Dl, 2, Dr) site tensors and scale the
+    gauge divided by the norm, so that scale * tensors approximates the normalized determinant. One channel at a time,
+    each copied to the host: an 8x8 reference at bond 4096 is ~11 GB (40 sites of 4096 x 2 x 4096), so a batch of
+    them does not fit on the GPU."""
     converter = dc.make_dense_converter(plan, REFERENCE_CHI, move="gram", snap=True)
-    tensors, _, gauge = jax.jit(jax.vmap(lambda Q: converter.convert(Q)))(jnp.asarray(Cs))
-    norm2 = gauge ** 2 * paired_transitions(tensors, tensors)[0]
-    return tensors, gauge / jnp.sqrt(norm2), np.asarray(1 - norm2)
+
+    @jax.jit
+    def convert(Q):
+        A, _, gauge = converter.convert(Q)
+        return A, gauge ** 2 * dc.mps_norm2(A), gauge
+
+    tensors, scales, losses = [], [], []
+    for Q in Cs:
+        A, norm2, gauge = convert(jnp.asarray(Q))
+        tensors.append([np.asarray(x) for x in A])  # blocks: the next channel starts on a free device
+        norm2 = float(norm2)
+        scales.append(float(gauge) / np.sqrt(norm2))
+        losses.append(1 - norm2)
+        del A
+    return tensors, np.array(scales), np.array(losses)
 
 
 def walker_overlaps(r):
     """(2, BATCH): <walker channel|converted channel>, the converted channel's gauge included."""
     gauges = np.asarray(r["out"][2])
-    if REFERENCE_CHI:
-        return np.stack([np.asarray(paired_transitions(walker_refs[spin][0], r["out"][spin])[0])
-                         * np.asarray(walker_refs[spin][1]) * gauges[spin] for spin in (0, 1)])
+    if REFERENCE_CHI:  # one walker's reference on the device at a time (float() waits for it)
+        return np.array([[float(pair_overlap(on_device(walker_refs[spin][0][w]), [A[w] for A in r["out"][spin]]))
+                          * walker_refs[spin][1][w] * gauges[spin, w] for w in range(BATCH)] for spin in (0, 1)])
     return np.array([[determinant_mps_transition(Q, *channel_data(r, spin, w), with_density=False)[0]
                       for w, Q in enumerate(channel)] for spin, channel in enumerate((up, dn))])
 
@@ -359,7 +388,11 @@ def trial_transitions(r):
         for i, D in enumerate(measurement_dets[spin]):
             if REFERENCE_CHI:
                 tensors, scale = trial_refs[spin][i]
-                o, d = fixed_bra_transitions(tensors, r["out"][spin])
+                if r.get("references"):  # the walkers' own references (host): one on the device at a time
+                    pairs = [jax.device_get(single_transitions(tensors, on_device(ket))) for ket in r["out"][spin]]
+                    o, d = np.array([p[0] for p in pairs]), np.stack([p[1] for p in pairs])
+                else:
+                    o, d = fixed_bra_transitions(tensors, r["out"][spin])
                 ovs[spin, i] = np.asarray(o) * scale * gauges[spin]
                 dens[spin, i] = np.asarray(d) * (scale * gauges[spin])[:, None]
             else:
@@ -382,10 +415,11 @@ if REFERENCE_CHI:
     for spin in (0, 1):
         for i, D in enumerate(measurement_dets[spin]):
             tensors, scale, loss = reference_mps(D[None], utils.make_orbital_plan(D, "rank_exact"))
-            trial_refs[spin].append(([A[0] for A in tensors], float(scale[0])))
+            trial_refs[spin].append((on_device(tensors[0]), float(scale[0])))  # these stay on the device
             trial_ref_losses[spin, i] = loss[0]
     # the references against exact quantities of the original walkers: trial overlap and local energy
-    reference_r = dict(out=(walker_refs[0][0], walker_refs[1][0], (walker_refs[0][1], walker_refs[1][1])))
+    reference_r = dict(out=(walker_refs[0][0], walker_refs[1][0], (walker_refs[0][1], walker_refs[1][1])),
+                       references=True)
     reference_energies, reference_overlaps = local_energies(reference_r)
     reference_checks = dict(reference_walker_norm_loss=np.stack([walker_refs[0][2], walker_refs[1][2]]),
                             reference_trial_norm_loss=trial_ref_losses,
